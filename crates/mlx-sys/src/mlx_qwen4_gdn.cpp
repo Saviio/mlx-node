@@ -137,12 +137,16 @@ extern "C" bool mlx_qwen4_gdn_prepare(mlx_array *qkv, mlx_array *a,
         in[5].size() != 48 || in[5].dtype() != mlx::core::float32 ||
         in[6].size() != 48 || in[6].dtype() != mlx::core::float32)
       return false;
+    // The kernel indexes conv/scale/dt flat; qkv/a/b/history go by strides.
+    for (int i : {3, 5, 6})
+      if (!in[i].is_available() || !in[i].flags().row_contiguous)
+        in[i] = mlx::core::contiguous(in[i]);
     static auto fn = mlx::core::fast::metal_kernel(
         "qwen4_gdn_prepare",
         {"qkv", "a", "b", "conv", "history", "scale", "dt"},
         {"q", "k", "v", "decay", "beta", "next_history"},
 #include "metal/qwen4/gdn_prepare.metal.inc"
-        , complete_gdn_header);
+        , complete_gdn_header, /*ensure_row_contiguous=*/false);
     auto result = fn(in,
                      {{1, t, 16, 128},
                       {1, t, 16, 128},
@@ -237,8 +241,7 @@ mlx_qwen4_complete_gdn(mlx_array *qkv, mlx_array *z, mlx_array *a, mlx_array *b,
     auto setting = qwen4_env("MLX_QWEN4_COMPLETE_GDN_METAL");
     auto rows = qwen4_env("MLX_QWEN4_GDN_4ROWS");
     bool fused = arch >= 17 && (!setting || std::string(setting) != "0") &&
-                 (!rows || std::string(rows) != "0") &&
-                 qwen4_env("MLX_DISABLE_E47_GDN_2VCOL") == nullptr;
+                 (!rows || std::string(rows) != "0");
     static auto compiled_metal = mlx::core::compile(complete_gdn_metal<false>);
     static auto compiled_prefetch = mlx::core::compile(complete_gdn_metal<true>);
     const auto pf = qwen4_env("MLX_QWEN4_GDN_DECODE_PREFETCH");

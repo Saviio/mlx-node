@@ -152,6 +152,30 @@ pub(crate) fn erase_compiled_graphs_matching(mask: u64, value: u64) {
     unsafe { sys::mlx_compiled_graph_erase_matching(mask, value) }
 }
 
+/// Primitive nodes in the graph of `outputs` that depend on none of `inputs`,
+/// as (count, comma-separated names). On a compiled replay these are lazy
+/// constants baked into the tape, recomputed by every replay.
+#[cfg(test)]
+pub(crate) fn input_free_ops(outputs: &[&MxArray], inputs: &[&MxArray]) -> (usize, String) {
+    let outs: Vec<*const sys::mlx_array> =
+        outputs.iter().map(|a| a.as_raw_ptr() as *const _).collect();
+    let ins: Vec<*const sys::mlx_array> =
+        inputs.iter().map(|a| a.as_raw_ptr() as *const _).collect();
+    let mut names = vec![0u8; 4096];
+    let count = unsafe {
+        sys::mlx_graph_count_input_free_ops(
+            outs.as_ptr(),
+            outs.len(),
+            ins.as_ptr(),
+            ins.len(),
+            names.as_mut_ptr() as *mut std::ffi::c_char,
+            names.len(),
+        )
+    };
+    let end = names.iter().position(|&b| b == 0).unwrap_or(names.len());
+    (count, String::from_utf8_lossy(&names[..end]).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +245,67 @@ mod tests {
             .expect("shapeless hit");
         out[0].eval();
         assert_eq!(out[0].to_float32().unwrap().as_ref(), [20.0, 24.0]);
+    }
+
+    /// MLX keys compile-cache entries by the thread's default stream, so the
+    /// stream each turn runs on decides whether the turn replays or re-traces.
+    #[test]
+    fn generation_stream_replays_compiled_graph_across_turns() {
+        use crate::stream::{DeviceType, Stream, StreamContext};
+        let _guard = COMPILE_MODE_LOCK.lock().unwrap();
+        assert!(
+            std::env::var_os("MLX_DISABLE_COMPILE").is_none(),
+            "compile replay requires MLX_DISABLE_COMPILE to be unset"
+        );
+        let id = fn_id();
+        let calls = std::cell::Cell::new(0usize);
+        let mut builder = |inputs: &[MxArray]| -> Result<Vec<MxArray>> {
+            calls.set(calls.get() + 1);
+            Ok(vec![inputs[0].mul(&inputs[1])?.add(&inputs[0])?])
+        };
+        let mut turn = |stream: Stream, len: usize| -> Vec<u32> {
+            let _ctx = StreamContext::new(stream);
+            let a: Vec<f32> = (0..len).map(|i| i as f32 + 1.0).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i % 5) as f32 - 2.0).collect();
+            let a = MxArray::from_float32(&a, &[len as i64]).unwrap();
+            let b = MxArray::from_float32(&b, &[len as i64]).unwrap();
+            let out = invoke_compiled_graph(id, &[&a, &b], 1, true, &mut builder)
+                .unwrap()
+                .expect("compiled invoke");
+            out[0].eval();
+            out[0]
+                .to_float32()
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect()
+        };
+        let expected = |len: usize| -> Vec<u32> {
+            (0..len)
+                .map(|i| {
+                    let a = i as f32 + 1.0;
+                    (a * ((i % 5) as f32 - 2.0) + a).to_bits()
+                })
+                .collect()
+        };
+        for len in 1..=16 {
+            assert_eq!(turn(Stream::generation(), len), expected(len));
+        }
+        assert_eq!(
+            calls.get(),
+            1,
+            "one trace across every turn on the generation stream"
+        );
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        // A different default stream is a different cache key.
+        assert_eq!(turn(Stream::default(DeviceType::Gpu), 3), expected(3));
+        assert_eq!(calls.get(), 2);
+        for len in [3, 9, 1, 16] {
+            assert_eq!(turn(Stream::generation(), len), expected(len));
+        }
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

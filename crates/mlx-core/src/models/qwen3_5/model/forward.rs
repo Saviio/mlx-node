@@ -14,6 +14,22 @@ pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 /// unload releases the tapes' captured weights.
 pub(crate) const COMPILED_VERIFY_TAG: u64 = 0xD51A_3500_0000_0000;
 
+#[cfg(test)]
+thread_local! {
+    // Completed compiled-path calls and Rust builder entries on the model's
+    // owner thread. Counting both distinguishes cached replay from the raw
+    // closure that MLX returns when compilation is disabled.
+    static DFLASH2_COMPILED_TEST_COUNTS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+impl Qwen35Inner {
+    pub(crate) fn take_dflash2_compiled_test_counts() -> (usize, usize) {
+        DFLASH2_COMPILED_TEST_COUNTS.with(|counts| counts.replace((0, 0)))
+    }
+}
+
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
 pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<()> {
@@ -69,9 +85,6 @@ pub(super) fn chunked_prefill_with_size(
     chunk_size: i64,
     turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
-    // `MLX_PREFILL_SYNC_BETWEEN_CHUNKS` forces synchronous `eval_layer_caches`
-    // between chunks instead of the async default.
-    let chunk_async = std::env::var("MLX_PREFILL_SYNC_BETWEEN_CHUNKS").is_err();
     let mut ctx = (embedding, layers, caches, final_norm, lm_head);
     fwd::chunked_prefill(
         &mut ctx,
@@ -89,11 +102,7 @@ pub(super) fn chunked_prefill_with_size(
             }
         },
         |ctx| {
-            if chunk_async {
-                fwd::async_eval_layer_caches(&*ctx.2);
-            } else {
-                fwd::eval_layer_caches(&*ctx.2)?;
-            }
+            fwd::async_eval_layer_caches(&*ctx.2);
             crate::array::clear_cache();
             Ok(())
         },
@@ -542,13 +551,11 @@ fn forward_dflash2_compiled(
         Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
     )>,
 > {
-    use crate::models::qwen3_5::decoder_layer::LayerVerifyIo;
+    use crate::models::qwen3_5::decoder_layer::{DecoderLayer, LayerVerifyIo, VerifyResidual};
     use crate::models::qwen3_5::gated_delta::GdnKernelTape;
     use crate::models::qwen3_5::gated_delta_net::GdnLayerTape;
 
-    if inner.dflash2_compiled_verify_disabled
-        || std::env::var("MLX_DISABLE_DFLASH2_COMPILED_VERIFY").is_ok()
-    {
+    if inner.dflash2_compiled_verify_disabled {
         return Ok(None);
     }
     if tap_layers.is_empty() || tap_layers.iter().any(|&l| l >= inner.layers.len()) {
@@ -624,6 +631,18 @@ fn forward_dflash2_compiled(
     // the builder (SDPA verify-split geometry), while the prefix length stays
     // shapeless. The high tag namespaces these ids away from the C++-side
     // pointer-derived ids and the test range.
+    let shapeless_verify = inner.layers.iter().all(|layer| match &layer.attn {
+        crate::models::qwen3_5::decoder_layer::AttentionType::Linear(_) => true,
+        crate::models::qwen3_5::decoder_layer::AttentionType::Full(attention) => {
+            attention.verify_can_be_shapeless(seq_len)
+        }
+    });
+    if !shapeless_verify {
+        // Unfused causal attention bakes prefix-sized mask constants. Reusing
+        // that graph as the prefix grows is invalid; specializing every prefix
+        // would retain an unbounded set of full-model traces. Use eager verify.
+        return Ok(None);
+    }
     let fn_id =
         COMPILED_VERIFY_TAG | ((inner.model_id & 0x00FF_FFFF) << 8) | (seq_len as u64 & 0xFF);
 
@@ -632,13 +651,32 @@ fn forward_dflash2_compiled(
     let final_norm = &inner.final_norm;
     let lm_head = &inner.lm_head;
     let mut builder = move |graph_inputs: &[MxArray]| -> Result<Vec<MxArray>> {
+        #[cfg(test)]
+        DFLASH2_COMPILED_TEST_COUNTS.with(|counts| {
+            let (completed, builds) = counts.get();
+            counts.set((completed, builds + 1));
+        });
         let ids = &graph_inputs[0];
         let rope_offsets = &graph_inputs[1];
         let mut cursor = 2usize;
-        let mut hidden = embedding.forward(ids)?;
+        let embedded = embedding.forward(ids)?;
+        // Layer i's output h + mlp_out is summed inside layer i+1's input norm
+        // (or the final norm); that fused sum is also the tap for layer i.
+        let mut pending: Option<(MxArray, MxArray)> = None;
         let mut taps: Vec<Option<MxArray>> = vec![None; tap_layers.len()];
+        let mut capture = |layer: usize, hidden: &MxArray| {
+            for (slot, &tap_layer) in tap_layers.iter().enumerate() {
+                if tap_layer == layer {
+                    taps[slot] = Some(hidden.clone());
+                }
+            }
+        };
         let mut extras: Vec<MxArray> = Vec::with_capacity(6 * n_linear + 2 * n_fa);
         for (index, layer) in layers.iter_mut().enumerate() {
+            let input = match &pending {
+                Some((h, delta)) => VerifyResidual::Pending { h, delta },
+                None => VerifyResidual::Hidden(&embedded),
+            };
             let mut tape_slot: Option<GdnLayerTape> = None;
             if layer.is_linear() {
                 // Detached cache seeded with the graph-input states: the
@@ -648,7 +686,12 @@ fn forward_dflash2_compiled(
                 detached.set(0, graph_inputs[cursor].clone())?;
                 detached.set(1, graph_inputs[cursor + 1].clone())?;
                 let mut io = LayerVerifyIo::Linear(&mut detached);
-                hidden = layer.forward_verify(&hidden, &mut io, true, Some(&mut tape_slot))?;
+                let (x, h, delta) =
+                    layer.forward_verify(input, &mut io, true, Some(&mut tape_slot))?;
+                if index > 0 {
+                    capture(index - 1, &x);
+                }
+                pending = Some((h, delta));
                 let tape = tape_slot.ok_or_else(|| {
                     Error::from_reason("compiled verify: GDN layer produced no tape")
                 })?;
@@ -666,7 +709,12 @@ fn forward_dflash2_compiled(
                             out_kv: &mut out_kv,
                         },
                     );
-                    hidden = layer.forward_verify(&hidden, &mut io, true, Some(&mut tape_slot))?;
+                    let (x, h, delta) =
+                        layer.forward_verify(input, &mut io, true, Some(&mut tape_slot))?;
+                    if index > 0 {
+                        capture(index - 1, &x);
+                    }
+                    pending = Some((h, delta));
                 }
                 let (new_k, new_v) = out_kv.ok_or_else(|| {
                     Error::from_reason("compiled verify: attention layer produced no kv block")
@@ -675,13 +723,11 @@ fn forward_dflash2_compiled(
                 extras.push(new_v);
             }
             cursor += 2;
-            for (slot, &tap_layer) in tap_layers.iter().enumerate() {
-                if tap_layer == index {
-                    taps[slot] = Some(hidden.clone());
-                }
-            }
         }
-        let normalized = final_norm.forward(&hidden)?;
+        let (h, delta) =
+            pending.ok_or_else(|| Error::from_reason("compiled verify: model has no layers"))?;
+        let (hidden, normalized) = DecoderLayer::add_residual_norm(final_norm, &h, &delta)?;
+        capture(layers.len() - 1, &hidden);
         let logits = project_logits_from_hidden(&normalized, lm_head, embedding)?;
         let mut outputs = Vec::with_capacity(n_outputs);
         outputs.push(logits);
@@ -783,6 +829,11 @@ fn forward_dflash2_compiled(
             return Err(e);
         }
     }
+    #[cfg(test)]
+    DFLASH2_COMPILED_TEST_COUNTS.with(|counts| {
+        let (completed, builds) = counts.get();
+        counts.set((completed + 1, builds));
+    });
     Ok(Some((logits, taps, tape)))
 }
 
