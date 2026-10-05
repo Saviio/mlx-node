@@ -27,9 +27,9 @@
 //      most recently (`invoked.timestamp` / build-script `output` /
 //      metallib mtime).
 //   3. Content gates run on the chosen metallib either way: minimum size +
-//      expected kernel names (including the current pin's NAX kernels on
-//      hosts where MLX builds them), plus a min-OS stamp check against the
-//      intended deployment floor. Failures abort the build loudly instead
+//      expected kernel names (the NAX kernels included: every Metal build
+//      carries them), plus a min-OS stamp check against the intended
+//      deployment floor. Failures abort the build loudly instead
 //      of shipping a broken pairing.
 //
 // Stale dirs are deliberately NOT deleted: they are live cargo cache for
@@ -46,33 +46,79 @@ export interface MetallibCandidate {
   rankMtimeMs: number;
 }
 
+/** `MACOS_DEPLOYMENT_TARGET_FLOOR` of `crates/mlx-sys/build.rs`. */
+export const MACOS_DEPLOYMENT_FLOOR = '26.2';
+
 /** Smallest healthy mlx.metallib observed is ~154 MB; anything far below is truncated. */
 export const MIN_METALLIB_BYTES = 100 * 1024 * 1024;
 
 /**
- * Every healthy paged_attn.metallib observed to date (8 samples across
- * debug/release profiles and old/new MLX pins) is exactly 19,490,342 bytes
- * (~19.5 MB) — the kernel set is ours (crates/mlx-paged-attn) and stable.
+ * paged_attn.metallib holds the paged-attention kernels (~19.5 MB) and the
+ * prebuilt bridge kernels (K-quant ~12 MB with NAX, segmented SDPA and mixed
+ * affine ~70 KB); a healthy build is ~31.9 MB.
  * A 4 MiB floor keeps generous headroom for future kernel trimming while
  * still catching a truncated or interrupted write.
  */
 export const MIN_PAGED_METALLIB_BYTES = 4 * 1024 * 1024;
 
-/** Kernel names present in every healthy mlx.metallib from the vendored MLX. */
-export const BASE_KERNEL_MARKERS = [
-  'steel_attention',
-  'sdpa_vector',
-  'sdpa_vector_segmented_verify_2pass_1',
-  'affine_qmv_wide_mixed',
-  'qmv_sg8',
+/**
+ * K-quant kernels mlx_kquant_metal.cpp loads from paged_attn.metallib (it has
+ * no JIT fallback): one per dtype, plus the function-constant sorted gather and
+ * the bfloat16-only sg8 pair. A metallib without them builds fine and then
+ * throws on the first GGUF K-quant matmul.
+ */
+export const KQUANT_KERNEL_MARKERS = [
+  'q4k_qmv_fast_float_gs_32_b_4_batch_0',
+  'q6k_qmm_t_float16_t_gs_16_b_6_alN_true_batch_0',
+  'iq3s_dequantize_bfloat16_t_gs_32_b_8',
+  'q5k_gather_qmm_rhs_nt_bfloat16_t_gs_32_b_5_bm_16_bn_32_bk_32_wm_1_wn_2',
+  'q4k_qmv_sg8_bfloat16_t_gs_32_b_4',
+  'kquant_qmv_sg8_prep_bfloat16_t_gs_16',
 ] as const;
 
 /**
- * Kernel names introduced by the current MLX pin (e9463bbf): the NAX gen-17
- * family. Absent from the previous pin (a8776b7b), so their absence on a
- * NAX-building host means a stale metallib was selected.
+ * Segmented SDPA (mlx_segmented_sdpa.cpp) and mixed BF16 x F32-sidecar affine
+ * `qmv_wide` (mlx_affine_mixed_qmm.cpp) kernels, also loaded from
+ * paged_attn.metallib with no JIT fallback: every one either dispatcher can
+ * request.
  */
-export const NAX_KERNEL_MARKERS = ['affine_qmv_wide', 'steel_gemm_segmented_nax'] as const;
+export const BRIDGE_KERNEL_MARKERS = [
+  'mlx_node_sdpa_segmented_bf16_256',
+  'mlx_node_sdpa_segmented_2pass_1_bf16_256',
+  'mlx_node_sdpa_segmented_verify_2pass_1_bf16_256',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv2',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv3',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv4',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv5',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv6',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv7',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv8',
+] as const;
+
+/** The K-quant NAX kernels. */
+export const KQUANT_NAX_KERNEL_MARKERS = [
+  'q4k_qmm_t_nax_bfloat16_t_gs_32_b_4_bm64_bn64_bk64_wm2_wn2_alN_true_batch_0',
+  'q6k_qmm_t_nax_float_gs_16_b_6_bm64_bn64_bk64_wm2_wn2_alN_false_batch_1',
+] as const;
+
+/**
+ * Kernel names present in every healthy mlx.metallib from the vendored MLX.
+ * `sdpa_blocked_scale_copy` and `seq_gated_delta` are absent from the previous
+ * pin (053e43fe), so a stale metallib from that pin fails here.
+ */
+export const BASE_KERNEL_MARKERS = [
+  'steel_attention',
+  'sdpa_vector',
+  'sdpa_blocked_scale_copy',
+  'seq_gated_delta',
+] as const;
+
+/**
+ * NAX gen-17 kernel names of the current MLX pin (e091d6784). Their absence
+ * means a stale or NAX-less metallib was selected; `steel_attention_dsplit` is
+ * absent from the previous pin (053e43fe).
+ */
+export const NAX_KERNEL_MARKERS = ['affine_qmv_wide', 'steel_gemm_segmented_nax', 'steel_attention_dsplit'] as const;
 
 export function hostAppleTriple(arch: string = process.arch): string {
   return arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
@@ -377,18 +423,18 @@ export function selectPagedMetallib(opts: {
 
 /**
  * Hard gate before paged_attn.metallib is copied anywhere, mirroring
- * `assertMetallibIntegrity`: a truncated file or a non-metallib container
- * must fail the build loudly. There is no kernel-name inventory here — the
- * paged-attn kernel set is small and ours — so the gate is the size floor
- * plus the MTLB container magic.
+ * `assertMetallibIntegrity`: a truncated file (size floor and
+ * {@link assertMetallibComplete}), a non-metallib container or a
+ * library without the K-quant kernels (NAX included) or the segmented SDPA /
+ * mixed-affine kernels must fail the build loudly.
  */
 export function assertPagedMetallibIntegrity(metallib: Buffer, opts: { path: string; minBytes?: number }): void {
   const minBytes = opts.minBytes ?? MIN_PAGED_METALLIB_BYTES;
   if (metallib.byteLength < minBytes) {
     throw new Error(
       `[build.ts metallib gate] ${opts.path} is ${metallib.byteLength} bytes, below the ` +
-        `${minBytes}-byte floor of a healthy paged_attn.metallib (every observed healthy ` +
-        `build is ~19.5 MB) — the file is truncated or the build was interrupted. Re-run ` +
+        `${minBytes}-byte floor of a healthy paged_attn.metallib (a healthy build is ` +
+        `~31.9 MB) — the file is truncated or the build was interrupted. Re-run ` +
         `the native build; if it persists, remove the containing mlx-sys-*/out dir.`,
     );
   }
@@ -398,6 +444,65 @@ export function assertPagedMetallibIntegrity(metallib: Buffer, opts: { path: str
         `this is not a Metal library. Re-run the native build; if it persists, remove the ` +
         `containing mlx-sys-*/out dir.`,
     );
+  }
+  assertMetallibComplete(metallib, opts.path);
+  const missing = [...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS].filter((name) => !metallib.includes(name));
+  if (missing.length > 0) {
+    throw new Error(
+      `[build.ts metallib gate] ${opts.path} is missing K-quant kernel(s) ${missing.join(', ')} — ` +
+        `mlx_kquant_metal.cpp loads them from this library and has no JIT fallback. It was built ` +
+        `by an older mlx-sys/build.rs. Re-run the native build; if it persists, remove the ` +
+        `containing mlx-sys-*/out dir.`,
+    );
+  }
+  const missingBridge = BRIDGE_KERNEL_MARKERS.filter((name) => !metallib.includes(name));
+  if (missingBridge.length > 0) {
+    throw new Error(
+      `[build.ts metallib gate] ${opts.path} is missing segmented SDPA / mixed-affine kernel(s) ` +
+        `${missingBridge.join(', ')} — mlx_segmented_sdpa.cpp and mlx_affine_mixed_qmm.cpp load ` +
+        `them from this library and have no JIT fallback. It was built by an older ` +
+        `mlx-sys/build.rs. Re-run the native build; if it persists, remove the containing ` +
+        `mlx-sys-*/out dir.`,
+    );
+  }
+}
+
+/**
+ * Function-name prefixes that only MLX's NAX kernel files instantiate
+ * (`steel_gemm_fused_nax.metal`, `quantized_nax.metal`,
+ * `steel_attention_nax.metal`). MLX compiles those files only under its NAX
+ * condition, and no other MLX kernel file mentions `nax`.
+ */
+export const MLX_NAX_ONLY_MARKERS = ['steel_gemm_fused_nax_', 'affine_qmm_t_nax_', 'steel_attention_dsplit_'] as const;
+
+/**
+ * A built mlx.metallib must carry MLX's NAX kernels: with the 26.2 deployment
+ * floor every macOS Metal build compiles them, so their absence means MLX fell
+ * back to MLX_METAL_NO_NAX (a deployment target or SDK below 26.2) and the
+ * library would run without them on M5-class GPUs.
+ */
+export function assertMlxMetallibCarriesNax(metallib: Buffer, path: string): void {
+  const fail = (why: string) =>
+    new Error(
+      `[metallib gate] ${path} ${why}. Re-run the native build; if it persists, remove the ` +
+        `containing mlx-sys-*/out dir.`,
+    );
+  if (metallib.toString('latin1', 0, 4) !== 'MTLB') {
+    throw fail('does not start with the MTLB container magic');
+  }
+  const missingBase = BASE_KERNEL_MARKERS.filter((name) => !metallib.includes(name));
+  if (missingBase.length > 0) {
+    throw fail(`is missing the base MLX kernel(s) ${missingBase.join(', ')}`);
+  }
+  const missingNax = MLX_NAX_ONLY_MARKERS.filter((name) => !metallib.includes(name));
+  if (missingNax.length === MLX_NAX_ONLY_MARKERS.length) {
+    throw fail(
+      `has no NAX kernels (${MLX_NAX_ONLY_MARKERS.join(', ')}): MLX built it as MLX_METAL_NO_NAX, ` +
+        `which happens only below a 26.2 deployment target or macOS SDK`,
+    );
+  }
+  if (missingNax.length > 0) {
+    throw fail(`is missing NAX kernel(s) ${missingNax.join(', ')}`);
   }
 }
 
@@ -415,31 +520,6 @@ export function compareVersions(a: string, b: string): number {
     if (diff !== 0) return diff;
   }
   return 0;
-}
-
-/**
- * Mirror of the NAX condition in the vendored MLX's
- * `mlx/backend/metal/kernels/CMakeLists.txt` as configured by
- * `crates/mlx-sys/build.rs`. mlx-sys always passes `-DMLX_METAL_FORCE_NAX=ON`
- * (fork branch `nax-macos-26-0-floor`), which drops upstream's
- * deployment-target >= 26.2 clause, so NAX kernels are compiled iff the macOS
- * SDK is >= 26.2 AND the effective `CMAKE_OSX_DEPLOYMENT_TARGET` is >= 26.0
- * (below 26.0 the Metal language version falls under MSL 4.0 and the gate's
- * `MLX_METAL_VERSION GREATER_EQUAL 400` clause fails). The deployment target
- * defaults to the build host's macOS version when `MACOSX_DEPLOYMENT_TARGET`
- * is not set. The force-built NAX kernels internally compile against the
- * macOS 26.2 tensor-ops ABI while the metallib links (and load-gates) at the
- * floor; runtime dispatch still requires macOS 26.2 — kernel presence and
- * dispatch are deliberately decoupled so one 26.0-floor artifact serves
- * every macOS 26 host.
- */
-export function shouldExpectNaxKernels(
-  sdkVersion: string,
-  hostVersion: string,
-  deploymentTargetEnv: string | undefined,
-): boolean {
-  const effectiveTarget = deploymentTargetEnv && deploymentTargetEnv !== '' ? deploymentTargetEnv : hostVersion;
-  return compareVersions(sdkVersion, '26.2') >= 0 && compareVersions(effectiveTarget, '26.0') >= 0;
 }
 
 /**
@@ -492,13 +572,11 @@ export function collectMetallibCandidates(targetRoot: string, triple: string, pr
 }
 
 /**
- * Hard gate before the metallib is copied anywhere: a truncated file or a
- * stale-pin kernel inventory must fail the build loudly, not ship to npm.
+ * Hard gate before the metallib is copied anywhere: a truncated file (size
+ * floor and {@link assertMetallibComplete}) or a stale-pin kernel inventory
+ * must fail the build loudly, not ship to npm.
  */
-export function assertMetallibIntegrity(
-  metallib: Buffer,
-  opts: { path: string; expectNax: boolean; minBytes?: number },
-): void {
+export function assertMetallibIntegrity(metallib: Buffer, opts: { path: string; minBytes?: number }): void {
   const minBytes = opts.minBytes ?? MIN_METALLIB_BYTES;
   if (metallib.byteLength < minBytes) {
     throw new Error(
@@ -508,6 +586,7 @@ export function assertMetallibIntegrity(
         `containing mlx-sys-*/out dir to force a clean MLX kernel build.`,
     );
   }
+  assertMetallibComplete(metallib, opts.path);
   const missing = (markers: readonly string[]) => markers.filter((name) => !metallib.includes(name));
   const missingBase = missing(BASE_KERNEL_MARKERS);
   if (missingBase.length > 0) {
@@ -516,18 +595,16 @@ export function assertMetallibIntegrity(
         `this is not a healthy MLX kernel library for the vendored pin.`,
     );
   }
-  if (opts.expectNax) {
-    const missingNax = missing(NAX_KERNEL_MARKERS);
-    if (missingNax.length > 0) {
-      throw new Error(
-        `[build.ts metallib gate] ${opts.path} is missing NAX kernel(s) ${missingNax.join(', ')} ` +
-          `although this host builds them (SDK and deployment target >= 26.2). The metallib is ` +
-          `stale — most likely from an out-of-date mlx-sys-*/out dir of a previous MLX pin. ` +
-          `Re-run the native build; if it persists, remove the stale mlx-sys-* dirs under ` +
-          `target/*/release/build/.`,
-      );
-    }
+  const missingNax = missing(NAX_KERNEL_MARKERS);
+  if (missingNax.length > 0) {
+    throw new Error(
+      `[build.ts metallib gate] ${opts.path} is missing NAX kernel(s) ${missingNax.join(', ')}. ` +
+        `The metallib is stale — most likely from an out-of-date mlx-sys-*/out dir of a previous ` +
+        `MLX pin. Re-run the native build; if it persists, remove the stale mlx-sys-* dirs under ` +
+        `target/*/release/build/.`,
+    );
   }
+  assertMlxMetallibCarriesNax(metallib, opts.path);
 }
 
 /**
@@ -557,11 +634,7 @@ export function assertMetallibIntegrity(
  * `xcrun air-vtool -show`, which prints PlatformMajor/Minor/Update.
  */
 export function parseMetallibMinOs(metallib: Buffer): string | undefined {
-  if (metallib.byteLength < 16) return undefined;
-  if (metallib.toString('latin1', 0, 4) !== 'MTLB') return undefined;
-  if (metallib.readUInt16LE(4) !== 0x8001) return undefined;
-  if (metallib.readUInt16LE(6) !== 2) return undefined;
-  if (metallib[10] !== 0x00 || metallib[11] !== 0x81) return undefined;
+  if (!isRecognizedMtlbHeader(metallib, 16)) return undefined;
   const major = metallib.readUInt16LE(12);
   const minor = metallib[14];
   const update = metallib[15];
@@ -569,6 +642,55 @@ export function parseMetallibMinOs(metallib: Buffer): string | undefined {
   // outside a generous bound means the offset no longer holds a version.
   if (major < 10 || major > 99) return undefined;
   return update === 0 ? `${major}.${minor}` : `${major}.${minor}.${update}`;
+}
+
+function isRecognizedMtlbHeader(metallib: Buffer, minBytes: number): boolean {
+  return (
+    metallib.byteLength >= minBytes &&
+    metallib.toString('latin1', 0, 4) === 'MTLB' &&
+    metallib.readUInt16LE(4) === 0x8001 &&
+    metallib.readUInt16LE(6) === 2 &&
+    metallib[10] === 0x00 &&
+    metallib[11] === 0x81
+  );
+}
+
+/**
+ * The total file size the MTLB container header declares: u64 LE at offset
+ * 16, in the layout {@link parseMetallibMinOs} recognizes. Validated equal to
+ * the file size on the shipped mlx.metallib (205,904,480 B) and
+ * paged_attn.metallib (31,863,042 B), the previous paged library, and small
+ * `xcrun metallib` builds at 15.0 / 26.0 / 26.2 floors. Undefined for any
+ * other layout.
+ */
+export function parseMetallibDeclaredSize(metallib: Buffer): number | undefined {
+  if (!isRecognizedMtlbHeader(metallib, 24)) return undefined;
+  const size = metallib.readBigUInt64LE(16);
+  return size <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(size) : undefined;
+}
+
+/**
+ * A metallib cut short after its function-name table still has the magic, a
+ * size above any floor and every kernel name, and Metal rejects it as a
+ * truncated module. The header's declared size must equal the file size; a
+ * header layout this gate does not know fails closed.
+ */
+export function assertMetallibComplete(metallib: Buffer, path: string): void {
+  const declared = parseMetallibDeclaredSize(metallib);
+  if (declared === undefined) {
+    throw new Error(
+      `[metallib gate] ${path}: unrecognized MTLB header layout, so its completeness cannot be ` +
+        `checked. The container format changed (new toolchain?); update ` +
+        `parseMetallibDeclaredSize to recognize the new layout.`,
+    );
+  }
+  if (declared !== metallib.byteLength) {
+    throw new Error(
+      `[metallib gate] ${path} is ${metallib.byteLength} bytes but its header declares ` +
+        `${declared} — the file is truncated or was not fully written. Re-run the native ` +
+        `build; if it persists, remove the containing mlx-sys-*/out dir.`,
+    );
+  }
 }
 
 /**
@@ -609,6 +731,70 @@ export function assertMetallibFloor(
         `${opts.deploymentFloor} hosts. It was linked under a different ` +
         `MACOSX_DEPLOYMENT_TARGET; re-run the native build with the intended floor ` +
         `(if it persists, purge the containing mlx-sys-*/out dir).`,
+    );
+  }
+}
+
+const MH_MAGIC_64 = 0xfeedfacf;
+const MACH_HEADER_64_BYTES = 32;
+const LC_BUILD_VERSION = 0x32;
+const PLATFORM_MACOS = 1;
+
+/**
+ * The minimum macOS of a thin 64-bit little-endian Mach-O: the `minos` of its
+ * one macOS `LC_BUILD_VERSION` (u32 at offset 12 of the command, nibbles
+ * `xxxx.yy.zz`), the same field `otool -l` and dyld read. Undefined for any
+ * other layout: another magic (a fat binary included), a load-command table
+ * that overruns the header's `sizeofcmds` or the buffer, or zero or several
+ * `LC_BUILD_VERSION` commands.
+ */
+export function parseMachOMinOs(binary: Buffer): string | undefined {
+  if (binary.byteLength < MACH_HEADER_64_BYTES || binary.readUInt32LE(0) !== MH_MAGIC_64) return undefined;
+  const ncmds = binary.readUInt32LE(16);
+  const end = MACH_HEADER_64_BYTES + binary.readUInt32LE(20);
+  if (end > binary.byteLength) return undefined;
+  let minos: number | undefined;
+  let offset = MACH_HEADER_64_BYTES;
+  for (let i = 0; i < ncmds; i++) {
+    if (offset + 8 > end) return undefined;
+    const cmd = binary.readUInt32LE(offset);
+    const cmdsize = binary.readUInt32LE(offset + 4);
+    if (cmdsize < 8 || cmdsize % 8 !== 0 || offset + cmdsize > end) return undefined;
+    if (cmd === LC_BUILD_VERSION) {
+      if (minos !== undefined || cmdsize < 24 || binary.readUInt32LE(offset + 8) !== PLATFORM_MACOS) {
+        return undefined;
+      }
+      minos = binary.readUInt32LE(offset + 12);
+    }
+    offset += cmdsize;
+  }
+  if (minos === undefined) return undefined;
+  const major = minos >>> 16;
+  const minor = (minos >>> 8) & 0xff;
+  const update = minos & 0xff;
+  return update === 0 ? `${major}.${minor}` : `${major}.${minor}.${update}`;
+}
+
+/**
+ * MLX's own macOS 26.2 availability checks compile to "always true" at a 26.2
+ * deployment target, so an addon whose `minos` is lower would load on macOS
+ * 26.1 and older and take paths those systems do not have — and the desktop
+ * packager would advertise that lower floor. A header this gate cannot read
+ * fails closed.
+ */
+export function assertAddonMinOs(addon: Buffer, path: string): void {
+  const minOs = parseMachOMinOs(addon);
+  if (minOs === undefined) {
+    throw new Error(
+      `[native addon gate] ${path}: not a thin 64-bit Mach-O with one macOS LC_BUILD_VERSION, so its ` +
+        `minimum macOS cannot be checked against ${MACOS_DEPLOYMENT_FLOOR}.`,
+    );
+  }
+  if (compareVersions(minOs, MACOS_DEPLOYMENT_FLOOR) < 0) {
+    throw new Error(
+      `[native addon gate] ${path} has minos ${minOs}, below mlx-node's macOS floor ` +
+        `${MACOS_DEPLOYMENT_FLOOR}. Rebuild with MACOSX_DEPLOYMENT_TARGET unset (.cargo/config.toml ` +
+        `sets ${MACOS_DEPLOYMENT_FLOOR}) or at ${MACOS_DEPLOYMENT_FLOOR} or newer.`,
     );
   }
 }

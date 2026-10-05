@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import { readFile, writeFile, copyFile, stat, mkdir, rm } from 'node:fs/promises';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,15 +7,16 @@ import { format } from 'vite-plus/fmt';
 
 import viteConfig from '../../vite.config';
 import {
+  assertAddonMinOs,
   assertMetallibFloor,
   assertMetallibIntegrity,
   assertPagedMetallibIntegrity,
   hostAppleTriple,
+  MACOS_DEPLOYMENT_FLOOR,
   profileDirName,
   resolveTargetRoot,
   selectMetallib,
   selectPagedMetallib,
-  shouldExpectNaxKernels,
 } from './metallib-select';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -71,6 +71,13 @@ for (const output of outputs) {
 
 await assertDeclarationCopiesMatch('after native generation');
 
+const metalBuild = process.platform === 'darwin' && process.env.MLX_DISABLE_METAL == null;
+if (metalBuild) {
+  const nodeOutput = outputs.find((output) => output.kind === 'node');
+  if (nodeOutput) {
+    assertAddonMinOs(await readFile(nodeOutput.path), nodeOutput.path);
+  }
+}
 await copyNativeAddon(outputs);
 // Copy mlx.metallib for colocated Metal shader loading
 // MLX looks for metallib next to the binary, so we copy it here.
@@ -93,7 +100,9 @@ await copyNativeAddon(outputs);
 // MLX kernels, `paged_attn.metallib` for the paged-attention
 // dispatch path used by `Qwen3Model` (where `use_paged_attention`
 // is on by default for the legacy `PagedKVCache` route and by
-// `use_block_paged_cache` on by default for the new vLLM-style path).
+// `use_block_paged_cache` on by default for the new vLLM-style path)
+// and for every GGUF K-quant, segmented SDPA and mixed-affine kernel
+// (prebuilt, no JIT fallback).
 // We FAIL the build if either is missing so a packaging regression
 // surfaces immediately rather than as a runtime throw at first use
 // in a published install.
@@ -101,7 +110,7 @@ await copyNativeAddon(outputs);
 // The metallibs exist only on macOS (the Metal build). On the CUDA/Linux
 // build there is no Metal toolchain and no metallib to copy, so skip the
 // whole step (and its presence assert) on non-darwin platforms.
-if (process.platform === 'darwin' && process.env.MLX_DISABLE_METAL == null) {
+if (metalBuild) {
   await copyMetallibs(outputs);
 } else if (process.platform === 'darwin') {
   await removeMetallibsForCpuOnlyBuild();
@@ -162,20 +171,6 @@ async function copyNativeAddon(outputs: Awaited<typeof task>) {
   console.log(`Copied ${expectedName} -> ${dst}`);
 }
 
-// Probe the same inputs MLX's kernel CMake uses to decide whether the NAX
-// (M5 tensor-core) kernels are compiled on this host; the metallib gate then
-// requires them to be present. Any probe failure downgrades to the base gate
-// only — a broken Metal toolchain already fails the native build itself.
-function detectExpectNax(): boolean {
-  try {
-    const sdkVersion = execFileSync('xcrun', ['-sdk', 'macosx', '--show-sdk-version'], { encoding: 'utf-8' }).trim();
-    const hostVersion = execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf-8' }).trim();
-    return shouldExpectNaxKernels(sdkVersion, hostVersion, process.env.MACOSX_DEPLOYMENT_TARGET);
-  } catch {
-    return false;
-  }
-}
-
 // Publish/release fail-closed switch (set as `MLX_METALLIB_STRICT=1` in the
 // CI workflow env — see .github/workflows/ci.yml). In strict mode the metallib
 // gates FAIL CLOSED: a Metal-enabled addon that bakes no METAL_PATH aborts the
@@ -188,19 +183,12 @@ function metallibStrictMode(): boolean {
   return v === '1' || v === 'true';
 }
 
-// The intended min-OS load floor for the artifacts we ship: an explicit
-// MACOSX_DEPLOYMENT_TARGET (what build.rs forwards to the MLX cmake build and
-// the paged-attn metal link), else the build host's macOS version (MLX's
-// cmake default). Undefined skips the floor gate — a broken sw_vers probe
-// must not fail an otherwise healthy build.
-function detectDeploymentFloor(): string | undefined {
+// The min-OS load floor build.rs compiled the metallibs for: an explicit
+// MACOSX_DEPLOYMENT_TARGET, else MACOS_DEPLOYMENT_FLOOR (a Metal build below
+// it fails in build.rs, so no lower floor reaches this gate).
+function detectDeploymentFloor(): string {
   const env = process.env.MACOSX_DEPLOYMENT_TARGET;
-  if (env !== undefined && env !== '') return env;
-  try {
-    return execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf-8' }).trim();
-  } catch {
-    return undefined;
-  }
+  return env !== undefined && env !== '' ? env : MACOS_DEPLOYMENT_FLOOR;
 }
 
 async function copyMetallibs(outputs: Awaited<typeof task>) {
@@ -244,15 +232,13 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
   // would refuse to load on floor machines).
   const deploymentFloor = detectDeploymentFloor();
   const metallib = await readFile(picked.metallibPath);
-  assertMetallibIntegrity(metallib, { path: picked.metallibPath, expectNax: detectExpectNax() });
-  if (deploymentFloor !== undefined) {
-    assertMetallibFloor(metallib, {
-      path: picked.metallibPath,
-      deploymentFloor,
-      strict,
-      warn: (msg) => console.warn(msg),
-    });
-  }
+  assertMetallibIntegrity(metallib, { path: picked.metallibPath });
+  assertMetallibFloor(metallib, {
+    path: picked.metallibPath,
+    deploymentFloor,
+    strict,
+    warn: (msg) => console.warn(msg),
+  });
 
   for (const dest of destDirs) {
     const dst = join(dest, 'mlx.metallib');
@@ -270,14 +256,12 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
     warn: (msg) => console.warn(msg),
   });
   assertPagedMetallibIntegrity(paged.contents, { path: paged.path });
-  if (deploymentFloor !== undefined) {
-    assertMetallibFloor(paged.contents, {
-      path: paged.path,
-      deploymentFloor,
-      strict,
-      warn: (msg) => console.warn(msg),
-    });
-  }
+  assertMetallibFloor(paged.contents, {
+    path: paged.path,
+    deploymentFloor,
+    strict,
+    warn: (msg) => console.warn(msg),
+  });
   for (const dest of destDirs) {
     const dst = join(dest, 'paged_attn.metallib');
     await copyFile(paged.path, dst);

@@ -1,18 +1,16 @@
 /**
  * The macOS floor the bundle has to advertise.
  *
- * Release builds set `MACOSX_DEPLOYMENT_TARGET=26.0`, so the addon's
- * `LC_BUILD_VERSION` carries `minos 26.0` and dyld refuses to map it on anything
+ * Builds default to `MACOSX_DEPLOYMENT_TARGET=26.2` (`.cargo/config.toml`), so the addon's
+ * `LC_BUILD_VERSION` carries `minos 26.2` and dyld refuses to map it on anything
  * older. `@electron/packager` writes whatever Electron's own Info.plist template
  * says — 12.0, verified on a real build — so without this the app LAUNCHES on
- * macOS 12-15 and only then fails to load the addon. The supervisor reads that as
+ * macOS 12-26.1 and only then fails to load the addon. The supervisor reads that as
  * a crashed sidecar and restarts it, forever, with no message naming the cause.
  *
  * Measured off the Mach-O headers rather than read from `MACOSX_DEPLOYMENT_TARGET`:
  * the env var is an intent that a build can ignore, `LC_BUILD_VERSION` is what
- * actually shipped, and only the second one is what dyld enforces. It also means a
- * local build (addon `minos 11.0`) honestly advertises Electron's 12.0 instead of
- * a release floor it does not have.
+ * actually shipped, and only the second one is what dyld enforces.
  */
 
 /**

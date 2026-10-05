@@ -3,114 +3,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Port the reference's Metal residency and custom-kernel cache without changing
-/// the MLX gitlink. Derived host files live in OUT_DIR; the narrow replacements fail
-/// loudly if a future MLX update changes their integration points.
-#[deny(clippy::unwrap_used, clippy::expect_used)]
-fn metal_residency_overlay(manifest: &Path, mlx: &Path, out_dir: &Path) -> io::Result<PathBuf> {
-    let write_changed = |path: PathBuf, bytes: &[u8]| -> io::Result<()> {
-        match std::fs::read(&path) {
-            Ok(existing) if existing == bytes => return Ok(()),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(build_file_error("read overlay", &path, error)),
-        }
-        std::fs::write(&path, bytes)
-            .map_err(|error| build_file_error("write overlay", &path, error))
-    };
-    let root = out_dir.join("metal-residency");
-    let output = root.join("mlx/backend/metal");
-    std::fs::create_dir_all(&output)
-        .map_err(|error| build_file_error("create overlay directory", &output, error))?;
-    let source = mlx.join("mlx/backend/metal");
-    let port = manifest.join("metal-residency");
-    let replace = |text: &mut String, from: &str, to: &str| -> io::Result<()> {
-        if text.matches(from).count() != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("MLX residency integration drift: {from}"),
-            ));
-        }
-        *text = text.replacen(from, to, 1);
-        Ok(())
-    };
-    for name in ["resident.h", "resident.cpp", "overlay.cmake"] {
-        println!("cargo:rerun-if-changed={}", port.join(name).display());
-    }
-    for name in ["resident.h", "resident.cpp"] {
-        let path = port.join(name);
-        let bytes = std::fs::read(&path)
-            .map_err(|error| build_file_error("read residency source", &path, error))?;
-        write_changed(output.join(name), &bytes)?;
-    }
-    for name in ["device.h", "device.cpp"] {
-        println!("cargo:rerun-if-changed={}", source.join(name).display());
-        let mut text = read_build_source(&source.join(name))?;
-        if name == "device.h" {
-            replace(
-                &mut text,
-                "  Device& device_;",
-                "  Device& device_;\n  ResidencySet& residency_set_;\n  uint64_t sets_attached_{0};",
-            )?;
-        } else {
-            replace(
-                &mut text,
-                "    : device_(d) {",
-                "    : device_(d), residency_set_(residency_set) {",
-            )?;
-            replace(
-                &mut text,
-                "  if (residency_set.mtl_residency_set()) {\n    queue_->addResidencySet(residency_set.mtl_residency_set());\n  }",
-                "  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
-            )?;
-            replace(
-                &mut text,
-                "void CommandEncoder::commit(\n    std::function<void()> completion,\n    const char* reason) {",
-                "void CommandEncoder::commit(\n    std::function<void()> completion,\n    const char* reason) {\n  // Metal fixes residency at commit, including sets created after this queue.\n  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
-            )?;
-        }
-        write_changed(output.join(name), text.as_bytes())?;
-    }
-    // The reference keys custom libraries by name, source and compile options.
-    // Compute that immutable key with the primitive, so cached graphs do not
-    // rescan the complete Metal source on every dispatch. Every CMake/bridge
-    // translation unit must see this same generated class layout.
-    let header = mlx.join("mlx/fast_primitives.h");
-    println!("cargo:rerun-if-changed={}", header.display());
-    let mut text = read_build_source(&header)?;
-    replace(
-        &mut text,
-        "#include <optional>",
-        "#include <cstdlib>\n#include <functional>\n#include <optional>",
-    )?;
-    replace(
-        &mut text,
-        "        compile_options_(compile_options) {}",
-        "        compile_options_(compile_options),\n        library_name_(hash_cache_enabled() ? name_ + \"_mlx_node_\" +\n            std::to_string(std::hash<std::string>{}(source_)) + \"_\" +\n            std::to_string(compile_options_) : std::string{}) {}",
-    )?;
-    replace(
-        &mut text,
-        "  CompileOptions::Data compile_options_;",
-        "  CompileOptions::Data compile_options_;\n  std::string library_name_;\n  static bool hash_cache_enabled() {\n    static const bool enabled = [] {\n      const char* value = std::getenv(\"MLX_METAL_HASH_KERNEL_CACHE\");\n      return value && std::string(value) == \"1\";\n    }();\n    return enabled;\n  }",
-    )?;
-    write_changed(root.join("mlx/fast_primitives.h"), text.as_bytes())?;
-    let kernel = source.join("custom_kernel.cpp");
-    println!("cargo:rerun-if-changed={}", kernel.display());
-    let mut text = read_build_source(&kernel)?;
-    replace(
-        &mut text,
-        "  {\n    // Clear kernels from the device library cache if needed",
-        "  // Process-start experiment; an empty key retains the original cache.\n  const bool hashed = !library_name_.empty();\n  if (!hashed) {\n    // Clear kernels from the device library cache if needed",
-    )?;
-    replace(
-        &mut text,
-        "      name_, compile_options_, [this] { return metal::utils() + source_; });",
-        "      hashed ? library_name_ : name_, compile_options_,\n      [this] { return metal::utils() + source_; });",
-    )?;
-    write_changed(output.join("custom_kernel.cpp"), text.as_bytes())?;
-    Ok(root)
-}
-
 fn build_file_error(action: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
         error.kind(),
@@ -131,27 +23,22 @@ fn metal_toolchain_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Deployment-target floor for the macOS build products when
-/// `MACOSX_DEPLOYMENT_TARGET` is unset.
+/// macOS deployment-target floor of the Metal build products.
 ///
-/// The project's floor is macOS 26.0: one published artifact carries the NAX
-/// kernels behind a runtime gate while the metallib links at the floor (see
-/// the `MLX_METAL_FORCE_NAX` block below). Leaving the default to the
-/// toolchains breaks that promise silently — MLX's CMake and `xcrun metal`
-/// both target the BUILD HOST, so a build on macOS 27 emits `air64_v29`
-/// shaders ("language version 4.1") that a macOS 26 host refuses to load at
-/// runtime while the rest of the app launches fine (measured: default
-/// `xcrun metal` = `air64_v29-apple-macosx27.0.0`,
-/// `-mmacosx-version-min=26.0` = `air64_v28-apple-macosx26.0.0`). This MLX
-/// revision's kernels also fail to COMPILE against the newer default
-/// language version, so the floor is a build requirement, not a preference.
-const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.0";
+/// MLX builds its NAX (gen-17 tensor-core) kernels only at a deployment target
+/// of 26.2 or newer (`mlx/backend/metal/kernels/CMakeLists.txt`); below that it
+/// defines MLX_METAL_NO_NAX and silently ships without them, so a Metal build
+/// below the floor fails (`assert_nax_buildable`). The toolchains' own default
+/// is the BUILD HOST, which is never used: a build on macOS 27 emits
+/// `air64_v29` shaders ("language version 4.1") that a macOS 26 host refuses
+/// to load at runtime while the rest of the app launches fine (measured:
+/// default `xcrun metal` = `air64_v29-apple-macosx27.0.0`,
+/// `-mmacosx-version-min=26.2` = `air64_v28-apple-macosx26.2.0`).
+const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.2";
 
 /// The build host's macOS version as `(major, minor)`, via `sw_vers`.
 fn host_macos_version() -> Option<(u64, u64)> {
-    // The absolute path survives build environments with a stripped PATH —
-    // a PATH lookup that fails here would silently drop the floor back to
-    // the toolchain default (the air64_v29 problem above).
+    // The absolute path survives build environments with a stripped PATH.
     let output = Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
         .output()
@@ -166,44 +53,228 @@ fn host_macos_version() -> Option<(u64, u64)> {
     Some((major, minor))
 }
 
-/// The floor applied when `MACOSX_DEPLOYMENT_TARGET` is unset: the project
-/// floor, never ABOVE the build host's own version. A local source build is
-/// documented to work on macOS 14 or newer — pinning 26.0 there emits
-/// binaries the host cannot run, and an older SDK can reject the future
-/// `-mmacosx-version-min` outright. The floor only matters on hosts NEWER
-/// than it (the air64_v29 case above), so capping the unset fallback at the
-/// host version loses nothing: macOS 27+ still gets 26.0, older hosts get
-/// exactly what their toolchain would have produced anyway.
-fn default_macos_deployment_target() -> Option<String> {
-    let (major, minor) = host_macos_version()?;
-    if (major, minor) > (26, 0) {
-        Some(MACOS_DEPLOYMENT_TARGET_FLOOR.to_string())
-    } else {
-        Some(format!("{major}.{minor}"))
+/// The deployment target of the macOS build products: `MACOSX_DEPLOYMENT_TARGET`
+/// when set (rustc and cc honor it for the Rust side too), else the floor —
+/// capped at an older build host's own version, so a CPU-only build
+/// (`MLX_DISABLE_METAL=1`) there still emits binaries the host can run. A Metal
+/// build on such a host then fails in `assert_nax_buildable`.
+fn macos_deployment_target() -> String {
+    if let Some(target) = env::var("MACOSX_DEPLOYMENT_TARGET")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        return target;
+    }
+    match host_macos_version().map(|(major, minor)| format!("{major}.{minor}")) {
+        Some(host) if !version_at_least(&host, MACOS_DEPLOYMENT_TARGET_FLOOR) => host,
+        _ => MACOS_DEPLOYMENT_TARGET_FLOOR.to_string(),
     }
 }
 
-/// Explicit deployment-target floor for the macOS build products. Setting
-/// `MACOSX_DEPLOYMENT_TARGET` (already honored by rustc and cc for the Rust
-/// side) overrides it for the CMake and metallib products too.
-fn macos_deployment_target() -> Option<String> {
-    env::var("MACOSX_DEPLOYMENT_TARGET")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(default_macos_deployment_target)
+/// Fails the build unless MLX's own NAX condition holds
+/// (`mlx/backend/metal/kernels/CMakeLists.txt`): deployment target >= 26.2,
+/// macOS SDK >= 26.2, and Metal language >= 4.0 at that target. When it does
+/// not, MLX defines MLX_METAL_NO_NAX and builds a working library without the
+/// NAX kernels, which nothing downstream would notice.
+fn assert_nax_buildable(deployment_target: &str) {
+    if !version_at_least(deployment_target, MACOS_DEPLOYMENT_TARGET_FLOOR) {
+        let source = if env::var("MACOSX_DEPLOYMENT_TARGET").is_ok_and(|v| !v.is_empty()) {
+            "MACOSX_DEPLOYMENT_TARGET"
+        } else {
+            "the build host's macOS version (MACOSX_DEPLOYMENT_TARGET is unset)"
+        };
+        panic!(
+            "macOS deployment target {deployment_target} (from {source}) is below mlx-node's \
+             floor {MACOS_DEPLOYMENT_TARGET_FLOOR}. MLX builds its NAX kernels only at \
+             {MACOS_DEPLOYMENT_TARGET_FLOOR} or newer and would otherwise build without them \
+             (MLX_METAL_NO_NAX). Set MACOSX_DEPLOYMENT_TARGET={MACOS_DEPLOYMENT_TARGET_FLOOR} \
+             (or newer), or MLX_DISABLE_METAL=1 for a CPU-only build."
+        );
+    }
+    let sdk = command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "--show-sdk-version"]));
+    if !sdk
+        .as_deref()
+        .is_some_and(|v| version_at_least(v, MACOS_DEPLOYMENT_TARGET_FLOOR))
+    {
+        panic!(
+            "macOS SDK {} is below {MACOS_DEPLOYMENT_TARGET_FLOOR}: MLX would build without its \
+             NAX kernels (MLX_METAL_NO_NAX). Select an Xcode with the macOS \
+             {MACOS_DEPLOYMENT_TARGET_FLOOR} SDK or newer (`xcode-select`, `SDKROOT`).",
+            sdk.as_deref().unwrap_or("<unknown>")
+        );
+    }
+    let metal_version = (|| {
+        let mut child = Command::new("xcrun")
+            .args(["-sdk", "macosx", "metal", "-E", "-x", "metal", "-P", "-"])
+            .arg(format!("-mmacosx-version-min={deployment_target}"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        {
+            use std::io::Write;
+            child.stdin.take()?.write_all(b"__METAL_VERSION__\n").ok()?;
+        }
+        let output = child.wait_with_output().ok()?;
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .and_then(|line| line.trim().parse::<u32>().ok())
+    })();
+    if !metal_version.is_some_and(|version| version >= 400) {
+        panic!(
+            "Metal language version {metal_version:?} at -mmacosx-version-min={deployment_target} \
+             is below 4.0: MLX would build without its NAX kernels (MLX_METAL_NO_NAX)."
+        );
+    }
 }
 
-/// Compile the paged-attention `.metal` sources into
-/// `<out_dir>/paged_attn.metallib`. The kernels live in
-/// `crates/mlx-paged-attn/metal/`. mlx-sys's own
-/// `mlx_paged_dispatch.cpp` resolves this metallib at runtime by
-/// looking next to the loaded binary (the .node addon copies it
-/// alongside `mlx.metallib` during the package-build step).
+/// One `.metal` → `.air` compile. `args` are every flag except the input,
+/// output and dependency-file paths.
+struct AirJob {
+    src: PathBuf,
+    air: PathBuf,
+    args: Vec<String>,
+}
+
+/// FNV-1a: stable across Rust releases, unlike `DefaultHasher`, so a stamp
+/// written by one toolchain still reads correctly under the next.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+fn command_stdout(cmd: &mut Command) -> Option<String> {
+    let output = cmd.output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Paths listed in a Make-format dependency file (`-MD -MF`), target excluded.
+fn depfile_paths(text: &str) -> Vec<PathBuf> {
+    let joined = text.replace("\\\n", " ");
+    let body = joined.split_once(": ").map_or("", |(_, deps)| deps);
+    let mut paths = Vec::new();
+    let mut current = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&' ') {
+            current.push(' ');
+            chars.next();
+        } else if c.is_whitespace() {
+            if !current.is_empty() {
+                paths.push(PathBuf::from(std::mem::take(&mut current)));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        paths.push(PathBuf::from(current));
+    }
+    paths
+}
+
+/// The stamp a job's `.air` was built from: toolchain, flags, and the content
+/// hash of the source and every header it included.
+fn air_stamp(job: &AirJob, toolchain: &str, deps: &[PathBuf]) -> Option<String> {
+    let mut stamp = format!("toolchain {toolchain}\nargs {}\n", job.args.join(" "));
+    for dep in deps {
+        let bytes = std::fs::read(dep).ok()?;
+        stamp.push_str(&format!("{:016x} {}\n", fnv1a(&bytes), dep.display()));
+    }
+    Some(stamp)
+}
+
+fn air_is_current(job: &AirJob, toolchain: &str) -> bool {
+    let stamp_path = job.air.with_extension("air.stamp");
+    let (Ok(stamp), true) = (std::fs::read_to_string(&stamp_path), job.air.exists()) else {
+        return false;
+    };
+    let deps: Vec<PathBuf> = stamp
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split_once(' ').map(|(_, path)| PathBuf::from(path)))
+        .collect();
+    air_stamp(job, toolchain, &deps).as_deref() == Some(stamp.as_str())
+}
+
+fn compile_air(job: &AirJob, toolchain: &str) {
+    if air_is_current(job, toolchain) {
+        return;
+    }
+    let depfile = job.air.with_extension("air.d");
+    let stamp_path = job.air.with_extension("air.stamp");
+    let _ = std::fs::remove_file(&stamp_path);
+    let status = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal"])
+        .args(&job.args)
+        .arg("-c")
+        .arg(&job.src)
+        .arg("-o")
+        .arg(&job.air)
+        .arg("-MD")
+        .arg("-MF")
+        .arg(&depfile)
+        .status()
+        .expect("Failed to execute xcrun metal");
+    if !status.success() {
+        panic!(
+            "Metal compilation failed for {} ({}): exit code {:?}",
+            job.src.display(),
+            job.args.join(" "),
+            status.code()
+        );
+    }
+    // A missing stamp only costs a recompile next time.
+    if let Some(stamp) = std::fs::read_to_string(&depfile)
+        .ok()
+        .and_then(|text| air_stamp(job, toolchain, &depfile_paths(&text)))
+    {
+        let _ = std::fs::write(&stamp_path, stamp);
+    }
+}
+
+/// Dotted-version compare (`26.2` vs `26.0.1`), missing parts read as 0.
+fn version_at_least(version: &str, floor: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> { v.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    let (a, b) = (parse(version), parse(floor));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x > y;
+        }
+    }
+    true
+}
+
+/// Build `<out_dir>/paged_attn.metallib`: the paged-attention kernels
+/// (`crates/mlx-paged-attn/metal/`) and the prebuilt bridge kernels: K-quant
+/// (`src/metal/kquant/`), segmented SDPA (`src/metal/segmented_sdpa/`) and
+/// mixed affine `qmv_wide` (`src/metal/affine_mixed/`).
+/// `mlx_paged_dispatch.cpp` resolves it at runtime next to the loaded binary
+/// (the package build copies it beside `mlx.metallib`).
 ///
-/// Mirror of `crates/mlx-paged-attn/build.rs`'s metal-shader compile:
-/// same `xcrun -sdk macosx metal -O3 -ffast-math` invocation, same
-/// link step.
-fn compile_paged_attn_metallib(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
+/// The bridge `.air` files use MLX's own kernel flags (`-fno-fast-math`, no
+/// `-O`, no `-std`), which keep their bits equal to MLX's prebuilt kernels and
+/// to the JIT builds they replace; the paged-attention flags (`-O3
+/// -ffast-math`) would change them.
+fn compile_paged_attn_metallib(
+    manifest_dir: &Path,
+    mlx_dir: &Path,
+    out_dir: &Path,
+    deployment_target: &str,
+) -> PathBuf {
     let metal_src_dir = manifest_dir
         .parent()
         .expect("CARGO_MANIFEST_DIR has a parent")
@@ -222,60 +293,91 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
-    let metal_files = [
+    let min_os = format!("-mmacosx-version-min={deployment_target}");
+
+    let mut jobs = Vec::new();
+    for file in [
         "attention/paged_attention.metal",
         "cache/reshape_and_cache.metal",
         "cache/copy_blocks.metal",
-    ];
-
-    // Resolved once: it probes the host (`sw_vers`), not something per file.
-    let deployment_target = macos_deployment_target();
-
-    let mut air_files = Vec::new();
-    for file in &metal_files {
-        let src_path = metal_src_dir.join(file);
-        let air_name = file.replace('/', "_").replace(".metal", ".air");
-        let air_path = out_dir.join(&air_name);
-
-        let mut compile_cmd = Command::new("xcrun");
-        compile_cmd.args([
-            "-sdk",
-            "macosx",
-            "metal",
-            "-c",
-            src_path.to_str().unwrap(),
-            "-o",
-            air_path.to_str().unwrap(),
-            "-I",
-            metal_src_dir.to_str().unwrap(),
-            "-O3",
-            "-ffast-math",
-        ]);
-        // Pin the metallib's min-OS stamp when a floor is requested, matching
-        // what MLX's kernel CMake does for mlx.metallib. The metal driver
-        // reads MACOSX_DEPLOYMENT_TARGET from the environment too, but the
-        // explicit flag keeps the floor visible in the command line.
-        if let Some(target) = &deployment_target {
-            compile_cmd.arg(format!("-mmacosx-version-min={target}"));
-        }
-        let status = compile_cmd.status().expect("Failed to execute xcrun metal");
-        if !status.success() {
-            panic!(
-                "Metal compilation failed for {}: exit code {:?}",
-                file,
-                status.code()
-            );
-        }
-        air_files.push(air_path);
+    ] {
+        let args = vec![
+            "-I".to_string(),
+            metal_src_dir.display().to_string(),
+            "-O3".to_string(),
+            "-ffast-math".to_string(),
+            min_os.clone(),
+        ];
+        jobs.push(AirJob {
+            src: metal_src_dir.join(file),
+            air: out_dir.join(file.replace('/', "_").replace(".metal", ".air")),
+            args,
+        });
     }
+
+    let bridge_dir = manifest_dir.join("src").join("metal");
+    let kquant_jobs = |name: &str| -> Vec<AirJob> {
+        (0..3)
+            .map(|dtype| {
+                let args = vec![
+                    "-x".to_string(),
+                    "metal".to_string(),
+                    "-fno-fast-math".to_string(),
+                    format!("-DKQUANT_DTYPE={dtype}"),
+                    "-I".to_string(),
+                    mlx_dir.display().to_string(),
+                    min_os.clone(),
+                ];
+                AirJob {
+                    src: bridge_dir.join("kquant").join(format!("{name}.metal")),
+                    air: out_dir.join(format!("{name}_{dtype}.air")),
+                    args,
+                }
+            })
+            .collect()
+    };
+    jobs.extend(kquant_jobs("kquant"));
+    jobs.extend(kquant_jobs("kquant_nax"));
+    // Self-contained sources (no MLX headers), with the same flags.
+    for file in [
+        "segmented_sdpa/sdpa_segmented.metal",
+        "affine_mixed/affine_qmv_wide_mixed.metal",
+    ] {
+        let args = vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-fno-fast-math".to_string(),
+            min_os.clone(),
+        ];
+        jobs.push(AirJob {
+            src: bridge_dir.join(file),
+            air: out_dir.join(file.replace('/', "_").replace(".metal", ".air")),
+            args,
+        });
+    }
+
+    let toolchain = [
+        command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "metal", "--version"])),
+        command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "--show-sdk-path"])),
+        command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "--show-sdk-version"])),
+    ]
+    .map(|part| part.unwrap_or_default())
+    .join(" | ")
+    .replace('\n', " ");
+    std::thread::scope(|scope| {
+        for job in &jobs {
+            let toolchain = &toolchain;
+            scope.spawn(move || compile_air(job, toolchain));
+        }
+    });
 
     let metallib_path = out_dir.join("paged_attn.metallib");
     let mut link_cmd = Command::new("xcrun");
     link_cmd.args(["-sdk", "macosx", "metallib"]);
-    for air in &air_files {
-        link_cmd.arg(air.to_str().unwrap());
+    for job in &jobs {
+        link_cmd.arg(&job.air);
     }
-    link_cmd.args(["-o", metallib_path.to_str().unwrap()]);
+    link_cmd.arg("-o").arg(&metallib_path);
     let status = link_cmd.status().expect("Failed to execute xcrun metallib");
     if !status.success() {
         panic!(
@@ -415,26 +517,27 @@ fn main() -> io::Result<()> {
     // `paged_attn_metallib_path` lookup will throw if the metallib is
     // not findable.
     let out_dir_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // Resolved once: it probes the host (`sw_vers`).
+    let deployment_target = is_macos.then(macos_deployment_target);
     let paged_metallib_path = if build_metal {
-        Some(compile_paged_attn_metallib(&manifest_dir, &out_dir_path))
+        let deployment_target = deployment_target
+            .as_deref()
+            .expect("a Metal build targets macOS");
+        assert_nax_buildable(deployment_target);
+        Some(compile_paged_attn_metallib(
+            &manifest_dir,
+            &mlx_dir,
+            &out_dir_path,
+            deployment_target,
+        ))
     } else {
         None
     };
 
     let mut cfg = cmake::Config::new(&mlx_dir);
-    let residency_overlay = build_metal
-        .then(|| metal_residency_overlay(&manifest_dir, &mlx_dir, &out_dir_path))
-        .transpose()?;
-    if let Some(overlay) = &residency_overlay {
-        cfg.define("MLX_NODE_RESIDENCY_OVERLAY", overlay);
-        cfg.define(
-            "CMAKE_PROJECT_INCLUDE",
-            manifest_dir.join("metal-residency/overlay.cmake"),
-        );
-    } else {
-        // Clear a cached include if this build directory switches to CPU-only.
-        cfg.define("CMAKE_PROJECT_INCLUDE", "");
-    }
+    // CMakeCache.txt from an older mlx-sys may still name the deleted
+    // metal-residency/overlay.cmake; configure fails until it is cleared.
+    cfg.define("CMAKE_PROJECT_INCLUDE", "");
     cfg.define("MLX_BUILD_TESTS", "OFF")
         .define("MLX_BUILD_EXAMPLES", "OFF")
         .define("MLX_BUILD_BENCHMARKS", "OFF")
@@ -467,30 +570,12 @@ fn main() -> io::Result<()> {
                 "x86_64"
             },
         );
-        // Forward an explicit deployment-target floor as a -D define: a
-        // define overrides a stale CMAKE_OSX_DEPLOYMENT_TARGET already
-        // recorded in CMakeCache.txt (e.g. a CI-restored cargo cache),
-        // which the environment variable alone cannot. When unset, MLX's
-        // CMakeLists defaults the floor to the build host's macOS version.
-        if let Some(deployment_target) = macos_deployment_target() {
-            cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", &deployment_target);
+        // A -D define overrides a stale CMAKE_OSX_DEPLOYMENT_TARGET already
+        // recorded in CMakeCache.txt (e.g. a CI-restored cargo cache), which
+        // the environment variable alone cannot.
+        if let Some(deployment_target) = deployment_target.as_deref() {
+            cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", deployment_target);
         }
-        // Upstream MLX only builds the NAX (gen-17 tensor-core) kernels when
-        // the deployment floor is >= 26.2 and otherwise compiles the dispatch
-        // out via MLX_METAL_NO_NAX. The vendored fork branch
-        // (mlx-node/mlx#nax-macos-26-0-floor) adds MLX_METAL_FORCE_NAX to
-        // decouple kernel presence from the floor, so one published artifact
-        // can keep a macOS 26.0 floor AND carry the NAX kernels. The NAX
-        // kernels themselves still compile at -mmacosx-version-min=26.2 —
-        // they need the 26.2 tensor-ops ABI (lower targets select MPP's
-        // pre-26.2 compatibility intrinsics, which miscompute) — while the
-        // metallib links at the floor, so it loads on all of macOS 26.
-        // Runtime dispatch (`is_nax_available`: gpu gen >= 17 && macOS >=
-        // 26.2) keeps pre-26.2 machines from ever instantiating the
-        // 26.2-targeted functions. The option is inert when the floor is
-        // already >= 26.2 and when the SDK cannot build NAX (SDK < 26.2 or
-        // MSL < 4.0).
-        cfg.define("MLX_METAL_FORCE_NAX", "ON");
     }
 
     if target_os == "macos" {
@@ -714,11 +799,6 @@ fn main() -> io::Result<()> {
     let include_generated = dst.join("include");
 
     let mut bridge = cc::Build::new();
-    if let Some(overlay) = &residency_overlay {
-        // Device contains ResidencySet by value: all bridge code must see the
-        // same class layout as libmlx, before the original vendor headers.
-        bridge.include(overlay);
-    }
     bridge
         .cpp(true)
         .warnings(false)
@@ -736,19 +816,16 @@ fn main() -> io::Result<()> {
     // the CMake build above actually enabled them.
     if build_metal {
         bridge.define("MLX_NODE_METAL_ENABLED", None);
-        // Custom quantized kernels reuse the vendored K-quant arithmetic even
-        // in the normal precompiled-metallib build, where MLX does not export
-        // its optional JIT preambles. Generate private copies from source so
-        // the helper kernels cannot drift from the linked quantization code.
+        // JIT-built bridge kernels need MLX's kernel headers as source text,
+        // which the precompiled-metallib build does not export. Generate
+        // private copies from the linked sources so they cannot drift.
         let preambles = out_dir_path.join("quantized-preambles");
         let script = mlx_dir.join("mlx/backend/metal/make_compiled_preamble.sh");
         for (source_name, name) in [
             ("utils", "utils"),
             ("steel/gemm/gemm", "gemm"),
             ("quantized_utils", "quantized_utils"),
-            ("kquant", "kquant"),
             ("steel/gemm/nax", "nax"),
-            ("kquant_nax", "kquant_nax"),
             ("steel/attn/kernels/steel_attention", "steel_attention"),
         ] {
             let status = Command::new("bash")
@@ -765,27 +842,10 @@ fn main() -> io::Result<()> {
                 )));
             }
             let path = preambles.join(format!("{name}.cpp"));
-            let mut source = read_build_source(&path)?.replace(
+            let source = read_build_source(&path)?.replace(
                 "namespace mlx::core::metal",
                 "namespace mlx::core::quantized_preamble",
             );
-            if name == "steel_attention" {
-                // Backport the wide-head V-tile synchronization fix from
-                // ml-explore/mlx#4185 into this private kernel only. The
-                // pinned vendor template guards both barriers with BD==128,
-                // which omits the D256 instantiation added by our bridge.
-                // Fail visibly if a vendor update changes these sites.
-                let legacy = "if constexpr (BD == 128)";
-                let fixed = "if constexpr (BD >= 128)";
-                match (
-                    source.matches(legacy).count(),
-                    source.matches(fixed).count(),
-                ) {
-                    (2, 0) => source = source.replace(legacy, fixed),
-                    (0, 2) => {} // A future vendor update already contains the fix.
-                    _ => return Err(io::Error::other("Review Steel attention V-tile barriers")),
-                }
-            }
             std::fs::write(&path, source).map_err(|error| {
                 build_file_error("write private quantized preamble", &path, error)
             })?;
@@ -796,6 +856,37 @@ fn main() -> io::Result<()> {
                     .join(format!("mlx/backend/metal/kernels/{source_name}.h"))
                     .display()
             );
+        }
+        // The K-quant headers as source text, for the custom kernels that
+        // reuse their decoders (the K-quant ops themselves run from the
+        // prebuilt paged_attn.metallib). They include no project headers, so
+        // the preamble is the file itself, in the generator's format.
+        for name in ["kquant", "kquant_nax"] {
+            let header = src_dir.join(format!("metal/kquant/{name}.h"));
+            let body: String = read_build_source(&header)?
+                .lines()
+                .filter(|line| {
+                    let line = line.trim_start();
+                    !(line.starts_with("#pragma once")
+                        || (line.starts_with("#include \"") && line.ends_with(".h\"")))
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            if body.contains(")preamble\"") {
+                return Err(io::Error::other(format!(
+                    "{} contains the preamble delimiter",
+                    header.display()
+                )));
+            }
+            let path = preambles.join(format!("{name}.cpp"));
+            let source = format!(
+                "namespace mlx::core::quantized_preamble {{\n\nconst char* {name}() {{\n  \
+                 return R\"preamble(\n#line 1 \"metal/kquant/{name}.h\"\n{body}\n)preamble\";\n}}\n\n}} \
+                 // namespace mlx::core::quantized_preamble\n"
+            );
+            std::fs::write(&path, source)
+                .map_err(|error| build_file_error("write K-quant preamble", &path, error))?;
+            bridge.file(path);
         }
     }
 

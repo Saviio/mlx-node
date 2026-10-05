@@ -24,6 +24,7 @@
 #include <mutex>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 
 #include <algorithm>
@@ -95,7 +96,7 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
   }
   static const bool trace = [] {
     const char* v = std::getenv("MLX_METAL_COMMAND_TRACE");
-    return v && std::string(v) == "1";
+    return v && std::atoi(v) >= 1;
   }();
   const auto trace_start = trace ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
@@ -165,6 +166,10 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
       ~CtxSlotGuard() { current_builder_ctx = prev_; }
       void* prev_;
     } slot(ctx);
+    // MLX keys compile-cache entries by peek_default_stream(), which is empty
+    // until this thread's first op creates the stream. Create it before the
+    // first trace, or the second call misses the cache and traces again.
+    (void)mlx::core::default_stream(mlx::core::default_device());
     auto out = entry.fn(in);
     if (out.size() != n_outputs) {
       std::cerr << "mlx_compiled_graph_invoke: fn_id " << fn_id

@@ -1,0 +1,41 @@
+# Golden values of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
+# One line per case in the gate test's order: the value.
+applegpu_g17s = machine
+applegpu_g17g = route
+true = nax
+34 = cases
+e3def3db8a292899 = keys
+0
+8
+8
+8
+8
+6
+5
+4
+4
+3
+3
+2
+2
+2
+2
+2
+2
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+0

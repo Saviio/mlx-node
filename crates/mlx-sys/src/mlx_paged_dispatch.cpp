@@ -10,6 +10,7 @@
 // dispatched against different command queues.
 
 #include "mlx_paged_dispatch.h"
+#include "mlx_paged_metallib.h"
 
 #include <algorithm>
 #include <atomic>
@@ -55,23 +56,22 @@ constexpr int kNumThreads = 256;
 constexpr int kNumSimdLanes = 32;
 constexpr int kNumWarps = kNumThreads / kNumSimdLanes;
 
+} // namespace
+
 // =============================================================================
 // .metallib loading
 // =============================================================================
 //
-// The paged-attention kernels live in their own `.metallib`, separate
-// from MLX's `mlx.metallib`. mlx-sys/build.rs compiles
-// `crates/mlx-paged-attn/metal/*.metal` into
-// `<OUT_DIR>/paged_attn.metallib` and copies it next to the
-// crate-internal `mlx.metallib` so it ships in the same place.
-//
-// At runtime we call `Device::get_library(name, path)` once per
-// process; subsequent calls hit MLX's library cache. We use the
-// `path` overload (not the `builder` overload) so we feed Metal a
-// pre-compiled `.metallib` rather than re-compiling source at
-// runtime.
+// `paged_attn.metallib` holds the paged-attention kernels and the prebuilt
+// bridge kernels (mlx_kquant_metal.cpp, mlx_segmented_sdpa.cpp,
+// mlx_affine_mixed_qmm.cpp). mlx-sys/build.rs compiles it into
+// `<OUT_DIR>/paged_attn.metallib` and copies it next to the crate-internal
+// `mlx.metallib` so it ships in the same place. `Device::get_library(name,
+// path)` loads it once per process; later calls hit MLX's library cache.
 
+namespace {
 const std::string kPagedAttnLibraryName = "mlx_paged_attn";
+} // namespace
 
 // Resolve the path of the binary that contains this function, and look
 // for `paged_attn.metallib` next to it. Mirrors the colocated-library
@@ -132,6 +132,35 @@ MTL::Library* get_paged_attn_library(mlx::core::metal::Device& device) {
   });
   return device.get_library(kPagedAttnLibraryName, cached_path.string());
 }
+
+MTL::ComputePipelineState* get_prebuilt_kernel(
+    mlx::core::metal::Device& device,
+    const char* tag,
+    const char* family,
+    const std::string& kname,
+    const std::string& hash_name,
+    const mlx::core::metal::MTLFCList& func_consts) {
+  try {
+    auto* lib = get_paged_attn_library(device);
+    return device.get_kernel(kname, lib, hash_name, func_consts);
+  } catch (const std::exception& e) {
+    std::string path;
+    try {
+      path = paged_attn_metallib_path().string();
+    } catch (const std::exception&) {
+      path = "paged_attn.metallib";
+    }
+    std::ostringstream msg;
+    msg << "[" << tag << "] Cannot load " << family << " kernel " << kname
+        << " from " << path
+        << ". The metallib is stale or incomplete; rebuild it with `yarn "
+           "build:native`. "
+        << e.what();
+    throw PrebuiltKernelMissing(msg.str());
+  }
+}
+
+namespace {
 
 // =============================================================================
 // Kernel-name formatting (must match `MetalState::*_kernel_name` in

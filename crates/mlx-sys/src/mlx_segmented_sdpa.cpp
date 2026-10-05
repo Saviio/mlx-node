@@ -1,5 +1,8 @@
 #include "mlx_common.h"
-#include "mlx/backend/common/segmented_sdpa_plan.h"
+#include "mlx_segmented_sdpa_plan.h"
+
+#include <cstdint>
+#include <vector>
 
 #ifdef MLX_NODE_METAL_ENABLED
 
@@ -9,6 +12,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -16,22 +20,15 @@
 
 #include "mlx/backend/gpu/slicing.h"
 #include "mlx/backend/metal/device.h"
-#include "mlx/backend/metal/sdpa_vector_plan.h"
 #include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
+#include "mlx_paged_metallib.h"
+#include "mlx_segmented_sdpa.h"
+#include "mlx_test_counters.h"
 
-namespace mlx::core::fast {
-
-SegmentedSdpaCapabilities
-segmented_sdpa_capabilities(MTL::ComputePipelineState *pipeline,
-                            MTL::Device *device) {
-  return {pipeline->threadExecutionWidth(),
-          pipeline->maxTotalThreadsPerThreadgroup(),
-          pipeline->staticThreadgroupMemoryLength(),
-          device->maxThreadgroupMemoryLength()};
-}
+namespace mlx::core::segmented_sdpa {
 
 namespace {
 
@@ -72,9 +69,39 @@ std::vector<array> segmented_fallback(std::vector<array> inputs, float scale,
                                       bool causal, Stream stream) {
   auto keys = concatenate({inputs[1], inputs[3]}, 2, stream);
   auto values = concatenate({inputs[2], inputs[4]}, 2, stream);
-  return {scaled_dot_product_attention(inputs[0], keys, values, scale,
-                                       causal ? "causal" : "", std::nullopt,
-                                       std::nullopt, stream)};
+  return {fast::scaled_dot_product_attention(
+      inputs[0], keys, values, scale, causal ? "causal" : "", std::nullopt,
+      std::nullopt, false, stream)};
+}
+
+SegmentedSdpaCapabilities capabilities(MTL::ComputePipelineState *pipeline,
+                                       MTL::Device *device) {
+  return {pipeline->threadExecutionWidth(),
+          pipeline->maxTotalThreadsPerThreadgroup(),
+          pipeline->staticThreadgroupMemoryLength(),
+          device->maxThreadgroupMemoryLength()};
+}
+
+constexpr SegmentedKernel kKernels[] = {SegmentedKernel::one_pass,
+                                        SegmentedKernel::two_pass_1,
+                                        SegmentedKernel::verify_two_pass_1};
+
+const char *kernel_name(SegmentedKernel kernel) {
+  switch (kernel) {
+  case SegmentedKernel::one_pass:
+    return "mlx_node_sdpa_segmented_bf16_256";
+  case SegmentedKernel::two_pass_1:
+    return "mlx_node_sdpa_segmented_2pass_1_bf16_256";
+  case SegmentedKernel::verify_two_pass_1:
+    return "mlx_node_sdpa_segmented_verify_2pass_1_bf16_256";
+  }
+  throw std::invalid_argument("unknown segmented SDPA kernel");
+}
+
+// MLX's own aggregation kernel: the partials must reduce exactly as MLX's
+// vector SDPA reduces them.
+MTL::ComputePipelineState *reduction_kernel(metal::Device &device) {
+  return device.get_kernel("sdpa_vector_2pass_2_bfloat16_t_256");
 }
 
 int64_t prefix_row_stride(const array &pk, const array &pv) {
@@ -90,30 +117,25 @@ struct Pipelines {
 Pipelines get_pipelines(metal::Device &device, int query_length, int gqa_factor,
                         int total_length, int q_heads, int kv_heads,
                         bool causal, int64_t prefix_row_stride) {
+  const char device_class = device.get_architecture().back();
   const bool two_pass =
-      sdpa_vector_uses_two_pass(device, total_length, q_heads, kv_heads);
+      sdpa_vector_uses_two_pass(device_class, total_length, q_heads, kv_heads);
   const int partitions =
-      two_pass ? sdpa_vector_partition_count(device, total_length,
-                                             gqa_factor * query_length)
+      two_pass ? sdpa_vector_partition_count(device_class, total_length,
+                                             gqa_factor * query_length,
+                                             env::get_var("MLX_SDPA_BLOCKS", 0))
                : 32;
-  metal::MTLFCList constants = {{&causal, MTL::DataType::DataTypeBool, 22}};
-  if (two_pass) {
-    constants.emplace_back(&partitions, MTL::DataType::DataTypeInt, 26);
-  }
-  std::string base = two_pass
-                         ? "sdpa_vector_segmented_2pass_1_bfloat16_t_256_256"
-                         : "sdpa_vector_segmented_bfloat16_t_256_256";
-  std::string hash =
-      base + (causal ? "_c_" : "_nc_") + std::to_string(partitions);
-  auto *stage1 = device.get_kernel(base, hash, constants);
+  const auto kernel =
+      two_pass ? SegmentedKernel::two_pass_1 : SegmentedKernel::one_pass;
+  auto *stage1 = segmented_kernel(device, {kernel, causal, partitions, 0, 0});
   MTL::ComputePipelineState *stage2 = nullptr;
   if (two_pass) {
-    stage2 = device.get_kernel("sdpa_vector_2pass_2_bfloat16_t_256");
+    stage2 = reduction_kernel(device);
   }
-  auto c1 = segmented_sdpa_capabilities(stage1, device.mtl_device());
+  auto c1 = capabilities(stage1, device.mtl_device());
   std::optional<SegmentedSdpaCapabilities> c2;
   if (stage2 != nullptr) {
-    c2 = segmented_sdpa_capabilities(stage2, device.mtl_device());
+    c2 = capabilities(stage2, device.mtl_device());
   }
   auto plan = plan_segmented_sdpa_launch(query_length, gqa_factor, two_pass,
                                          partitions, c1, c2 ? &*c2 : nullptr);
@@ -125,29 +147,81 @@ Pipelines get_pipelines(metal::Device &device, int query_length, int gqa_factor,
   return {stage1, stage2, plan};
 }
 
+} // namespace
+
+MTL::ComputePipelineState *
+segmented_kernel(metal::Device &device,
+                 const SegmentedSpecialization &specialization) {
+  const auto &sp = specialization;
+  // Indices 22 and 26 are MLX's sdpa_vector.h do_causal and blocks.
+  metal::MTLFCList constants = {{&sp.causal, MTL::DataType::DataTypeBool, 22}};
+  std::string hash =
+      std::string(kernel_name(sp.kernel)) + (sp.causal ? "_c" : "_nc");
+  if (sp.kernel != SegmentedKernel::one_pass) {
+    constants.emplace_back(&sp.partitions, MTL::DataType::DataTypeInt, 26);
+    hash += "_" + std::to_string(sp.partitions);
+  }
+  if (sp.kernel == SegmentedKernel::verify_two_pass_1) {
+    constants.emplace_back(&sp.gqa, MTL::DataType::DataTypeInt, 27);
+    constants.emplace_back(&sp.rows, MTL::DataType::DataTypeInt, 28);
+    hash += "_g" + std::to_string(sp.gqa) + "_r" + std::to_string(sp.rows);
+  }
+  return fast::paged::get_prebuilt_kernel(
+      device, "segmented_sdpa", "segmented SDPA", kernel_name(sp.kernel), hash,
+      constants);
+}
+
+std::vector<std::string> metal_kernel_names() {
+  std::vector<std::string> names;
+  for (auto kernel : kKernels) {
+    names.emplace_back(kernel_name(kernel));
+  }
+  return names;
+}
+
+std::vector<SegmentedSpecialization> metal_kernel_specializations() {
+  // Every partition count the vector-SDPA policy returns without
+  // MLX_SDPA_BLOCKS, over the boundaries of every device class.
+  std::set<int> partitions;
+  for (char device_class : {'s', 'd', 'g'}) {
+    for (int length :
+         {1, 1024, 1025, 8192, 8193, 16384, 32768, 32769, 65536, 65537}) {
+      for (int simdgroups = 1; simdgroups <= 32 * 8; ++simdgroups) {
+        partitions.insert(
+            sdpa_vector_partition_count(device_class, length, simdgroups, 0));
+      }
+    }
+  }
+  std::vector<SegmentedSpecialization> out;
+  for (bool causal : {false, true}) {
+    out.push_back({SegmentedKernel::one_pass, causal, 32, 0, 0});
+    for (int p : partitions) {
+      out.push_back({SegmentedKernel::two_pass_1, causal, p, 0, 0});
+    }
+  }
+  for (int p : partitions) {
+    for (int gqa = 1; gqa <= 32; ++gqa) {
+      for (int rows = 2; rows <= 8; ++rows) {
+        out.push_back({SegmentedKernel::verify_two_pass_1, true, p, gqa, rows});
+      }
+    }
+  }
+  return out;
+}
+
 int segmented_max_query_length(metal::Device &device, int gqa_factor) {
   if (gqa_factor < 1 || gqa_factor > 32) {
     return 0;
   }
-  const bool causal = true;
   const int partitions = 64;
-  metal::MTLFCList constants = {{&causal, MTL::DataType::DataTypeBool, 22},
-                                {&partitions, MTL::DataType::DataTypeInt, 26}};
-  auto *pipeline = device.get_kernel(
-      "sdpa_vector_segmented_2pass_1_bfloat16_t_256_256",
-      "sdpa_vector_segmented_2pass_1_bfloat16_t_256_256_caps", constants);
-  metal::MTLFCList one_pass_constants = {
-      {&causal, MTL::DataType::DataTypeBool, 22}};
-  auto *one_pass = device.get_kernel(
-      "sdpa_vector_segmented_bfloat16_t_256_256",
-      "sdpa_vector_segmented_bfloat16_t_256_256_caps", one_pass_constants);
-  auto *reduction = device.get_kernel("sdpa_vector_2pass_2_bfloat16_t_256");
-  const auto stage1 =
-      segmented_sdpa_capabilities(pipeline, device.mtl_device());
-  const auto one_pass_caps =
-      segmented_sdpa_capabilities(one_pass, device.mtl_device());
-  const auto stage2 =
-      segmented_sdpa_capabilities(reduction, device.mtl_device());
+  auto *pipeline = segmented_kernel(
+      device, {SegmentedKernel::two_pass_1, true, partitions, 0, 0});
+  auto *one_pass =
+      segmented_kernel(device, {SegmentedKernel::one_pass, true, 32, 0, 0});
+  auto *reduction = reduction_kernel(device);
+  const auto stage1 = capabilities(pipeline, device.mtl_device());
+  const auto one_pass_caps = capabilities(one_pass, device.mtl_device());
+  const auto stage2 = capabilities(reduction, device.mtl_device());
   // Query length changes the actual threadgroup shape even though Metal
   // reuses one function specialization. Walk down from the workload bound
   // and ask the same launch planner used by eval_gpu for every candidate.
@@ -163,6 +237,8 @@ int segmented_max_query_length(metal::Device &device, int gqa_factor) {
   return 0;
 }
 
+namespace {
+
 SegmentedSdpaReductionPlan reduction_plan(const Pipelines &pipelines) {
   return {pipelines.plan.two_pass, static_cast<int>(pipelines.plan.partitions)};
 }
@@ -174,6 +250,24 @@ struct VerifyDispatch {
   MTL::ComputePipelineState *unified;
   SegmentedSdpaLaunchPlan unified_plan;
 };
+
+struct UnifiedVerifyLaunch {
+  MTL::ComputePipelineState *pipeline;
+  SegmentedSdpaLaunchPlan plan;
+};
+
+// Register pressure sets the verify pipeline's thread limit, so whether one
+// dispatch can serve the block depends on the GPU, not only on the policy.
+UnifiedVerifyLaunch unified_verify_launch(metal::Device &device, int rows,
+                                          int gqa, int partitions) {
+  auto *pipeline = segmented_kernel(device, {SegmentedKernel::verify_two_pass_1,
+                                             true, partitions, gqa, rows});
+  return {pipeline,
+          plan_segmented_verify_launch(
+              rows, gqa, partitions,
+              capabilities(pipeline, device.mtl_device()),
+              capabilities(reduction_kernel(device), device.mtl_device()))};
+}
 
 // Rows [0, head_rows) see prefix + new[..head_rows]; rows [head_rows, rows)
 // see prefix + all new rows: the chunks a two-call verify would dispatch.
@@ -197,23 +291,10 @@ VerifyDispatch plan_verify_dispatch(metal::Device &device, int head_rows,
   SegmentedSdpaLaunchPlan unified_plan{false, true, 0, 0, 0};
   if (head_reduction.two_pass && tail_reduction.two_pass &&
       head_reduction.partitions == tail_reduction.partitions) {
-    const bool causal = true;
-    const int partitions = tail_reduction.partitions;
-    metal::MTLFCList constants = {{&causal, MTL::DataType::DataTypeBool, 22},
-                                  {&partitions, MTL::DataType::DataTypeInt, 26},
-                                  {&gqa, MTL::DataType::DataTypeInt, 27},
-                                  {&rows, MTL::DataType::DataTypeInt, 28}};
-    const std::string base =
-        "sdpa_vector_segmented_verify_2pass_1_bfloat16_t_256_256";
-    unified =
-        device.get_kernel(base,
-                          base + "_c_" + std::to_string(partitions) + "_g" +
-                              std::to_string(gqa) + "_r" + std::to_string(rows),
-                          constants);
-    unified_plan = plan_segmented_verify_launch(
-        rows, gqa, partitions,
-        segmented_sdpa_capabilities(unified, device.mtl_device()),
-        segmented_sdpa_capabilities(tail.stage2, device.mtl_device()));
+    const auto launch =
+        unified_verify_launch(device, rows, gqa, tail_reduction.partitions);
+    unified = launch.pipeline;
+    unified_plan = launch.plan;
   }
   const auto route = select_segmented_verify_route(
       head_rows, head_reduction, tail_reduction, unified_plan.supported);
@@ -249,6 +330,7 @@ void encode_reduction(metal::CommandEncoder &encoder,
                       const array &sums, const array &maxs, array &out,
                       int batch, int q_heads, int q_rows) {
   const int partitions = pipelines.plan.partitions;
+  bridge_testing::record("segmented_sdpa_2pass_2");
   encoder.set_compute_pipeline_state(pipelines.stage2);
   encoder.set_input_array(partials, 0);
   encoder.set_input_array(sums, 1);
@@ -280,6 +362,7 @@ void encode_segmented_call(metal::CommandEncoder &encoder,
   const auto strides = segmented_strides(q, pk, pv, nk, nv);
 
   if (!pipelines.plan.two_pass) {
+    bridge_testing::record("segmented_sdpa_one_pass");
     encoder.set_output_array(out, 5);
     encoder.set_bytes(gqa, 6);
     encoder.set_bytes(prefix_n, 7);
@@ -294,6 +377,7 @@ void encode_segmented_call(metal::CommandEncoder &encoder,
   }
 
   const int partitions = pipelines.plan.partitions;
+  bridge_testing::record("segmented_sdpa_2pass_1");
   array partials({}, bfloat16, nullptr, {});
   array sums({}, float32, nullptr, {});
   array maxs({}, float32, nullptr, {});
@@ -328,6 +412,7 @@ void encode_unified_verify(metal::CommandEncoder &encoder,
   array maxs({}, float32, nullptr, {});
   add_reduction_temporaries(encoder, batch, q_heads, rows, partitions, partials,
                             sums, maxs);
+  bridge_testing::record("segmented_sdpa_verify_2pass_1");
   encoder.set_compute_pipeline_state(dispatch.unified);
   encoder.set_input_array(q, 0);
   encoder.set_input_array(pk, 1);
@@ -348,7 +433,7 @@ void encode_unified_verify(metal::CommandEncoder &encoder,
                    q_heads, rows);
 }
 
-class SegmentedSdpa final : public Custom {
+class SegmentedSdpa final : public fast::Custom {
 public:
   SegmentedSdpa(Stream stream, float scale, bool causal, int head_rows)
       : Custom(stream,
@@ -382,6 +467,7 @@ public:
     auto &out = outputs[0];
 
     if (head_rows_ == 0) {
+      bridge_testing::record("segmented_sdpa_route_single");
       auto pipelines =
           get_pipelines(device, q_len, gqa, prefix_n + new_n, q_heads, kv_heads,
                         causal_, prefix_row_stride(pk, pv));
@@ -404,15 +490,18 @@ public:
                              kv_heads, prefix_row_stride(pk, pv));
     switch (dispatch.route) {
     case SegmentedVerifyRoute::one_pass:
+      bridge_testing::record("segmented_sdpa_route_one_pass");
       out.set_data(allocator::malloc(out.nbytes()));
       encode_segmented_call(encoder, dispatch.tail, q, 0, q_len, pk, pv, nk, nv,
                             new_n, scale_, out);
       return;
     case SegmentedVerifyRoute::unified:
+      bridge_testing::record("segmented_sdpa_route_unified");
       out.set_data(allocator::malloc(out.nbytes()));
       encode_unified_verify(encoder, dispatch, q, pk, pv, nk, nv, scale_, out);
       return;
     case SegmentedVerifyRoute::split: {
+      bridge_testing::record("segmented_sdpa_route_split");
       const int tail_rows = q_len - head_rows_;
       array head_out({q.shape(0), q_heads, head_rows_, kHeadDimension},
                      bfloat16, nullptr, {});
@@ -459,6 +548,8 @@ private:
   int head_rows_;
 };
 
+} // namespace
+
 array segmented_sdpa(const array &q, const array &prefix_k,
                      const array &prefix_v, const array &new_k,
                      const array &new_v, float scale, bool causal,
@@ -477,6 +568,8 @@ array segmented_sdpa(const array &q, const array &prefix_k,
   int max_query_length = 0;
   try {
     max_query_length = segmented_max_query_length(device, gqa);
+  } catch (const fast::paged::PrebuiltKernelMissing &) {
+    throw;
   } catch (const std::exception &) {
     if (require_segmented) {
       throw;
@@ -508,6 +601,8 @@ array segmented_sdpa(const array &q, const array &prefix_k,
       }
       return fallback();
     }
+  } catch (const fast::paged::PrebuiltKernelMissing &) {
+    throw;
   } catch (const std::exception &) {
     if (require_segmented) {
       throw;
@@ -518,17 +613,16 @@ array segmented_sdpa(const array &q, const array &prefix_k,
   return array(q.shape(), bfloat16, primitive, std::move(inputs));
 }
 
-} // namespace
-} // namespace mlx::core::fast
+} // namespace mlx::core::segmented_sdpa
 
 namespace {
 
 mlx_array *segmented_sdpa_forward_impl(mlx_array *q, mlx_array *prefix_k,
-                           mlx_array *prefix_v, mlx_array *new_k,
-                           mlx_array *new_v, float scale, bool causal,
-                           bool require_segmented) {
+                                       mlx_array *prefix_v, mlx_array *new_k,
+                                       mlx_array *new_v, float scale,
+                                       bool causal, bool require_segmented) {
   try {
-    auto result = mlx::core::fast::segmented_sdpa(
+    auto result = mlx::core::segmented_sdpa::segmented_sdpa(
         *reinterpret_cast<array *>(q), *reinterpret_cast<array *>(prefix_k),
         *reinterpret_cast<array *>(prefix_v), *reinterpret_cast<array *>(new_k),
         *reinterpret_cast<array *>(new_v), scale, causal, require_segmented);
@@ -545,8 +639,8 @@ extern "C" mlx_array *
 mlx_segmented_sdpa_forward(mlx_array *q, mlx_array *prefix_k,
                            mlx_array *prefix_v, mlx_array *new_k,
                            mlx_array *new_v, float scale, bool causal) {
-  return segmented_sdpa_forward_impl(q, prefix_k, prefix_v, new_k, new_v,
-                                     scale, causal, false);
+  return segmented_sdpa_forward_impl(q, prefix_k, prefix_v, new_k, new_v, scale,
+                                     causal, false);
 }
 
 // Test-only contract: never silently qualify the concatenated fallback.
@@ -554,37 +648,20 @@ extern "C" mlx_array *
 mlx_segmented_sdpa_test_forward(mlx_array *q, mlx_array *prefix_k,
                                 mlx_array *prefix_v, mlx_array *new_k,
                                 mlx_array *new_v, float scale, bool causal) {
-  return segmented_sdpa_forward_impl(q, prefix_k, prefix_v, new_k, new_v,
-                                     scale, causal, true);
+  return segmented_sdpa_forward_impl(q, prefix_k, prefix_v, new_k, new_v, scale,
+                                     causal, true);
 }
 
-extern "C" int mlx_segmented_sdpa_test_plan(
-    int query_length, int gqa_factor, bool two_pass, int partitions,
-    size_t stage1_width, size_t stage1_max_threads, size_t stage1_static_memory,
-    size_t device_max_memory, size_t stage2_width, size_t stage2_max_threads,
-    size_t stage2_static_memory, uint32_t *out_stage1_threads,
-    uint32_t *out_stage2_threads) {
-  using namespace mlx::core::fast;
-  SegmentedSdpaCapabilities c1{stage1_width, stage1_max_threads,
-                               stage1_static_memory, device_max_memory};
-  SegmentedSdpaCapabilities c2{stage2_width, stage2_max_threads,
-                               stage2_static_memory, device_max_memory};
-  auto plan = plan_segmented_sdpa_launch(query_length, gqa_factor, two_pass,
-                                         partitions, c1, &c2);
-  if (out_stage1_threads) {
-    *out_stage1_threads = plan.stage1_threads;
-  }
-  if (out_stage2_threads) {
-    *out_stage2_threads = plan.stage2_threads;
-  }
-  return plan.supported ? 1 : 0;
-}
-
+// 0 when segmented SDPA is not supported here; -1 (message on stderr) when its
+// prebuilt kernels are missing from paged_attn.metallib.
 extern "C" int mlx_segmented_sdpa_max_query_length(int gqa_factor) {
   try {
     auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
-    return mlx::core::fast::segmented_max_query_length(
+    return mlx::core::segmented_sdpa::segmented_max_query_length(
         mlx::core::metal::device(stream.device), gqa_factor);
+  } catch (const mlx::core::fast::paged::PrebuiltKernelMissing &e) {
+    std::fprintf(stderr, "mlx_segmented_sdpa_max_query_length: %s\n", e.what());
+    return -1;
   } catch (const std::exception &) {
     return 0;
   }
@@ -605,19 +682,51 @@ extern "C" int mlx_segmented_sdpa_test_device_verify_route(
       *out_device_class = device.get_architecture().back();
     }
     const int gqa = q_heads / kv_heads;
-    const int head_rows = fast::segmented_verify_head_rows(
-        rows, fast::segmented_max_query_length(device, gqa));
+    const int head_rows = segmented_sdpa::segmented_verify_head_rows(
+        rows, segmented_sdpa::segmented_max_query_length(device, gqa));
     if (head_rows < 0) {
       return -1;
     }
     if (head_rows == 0) {
-      return static_cast<int>(fast::SegmentedVerifyRoute::single);
+      return static_cast<int>(segmented_sdpa::SegmentedVerifyRoute::single);
     }
     // Contiguous [B, H, prefix, D] K/V rows.
-    return static_cast<int>(
-        fast::plan_verify_dispatch(device, head_rows, rows, gqa, prefix_n,
-                                   q_heads, kv_heads, fast::kHeadDimension)
-            .route);
+    return static_cast<int>(segmented_sdpa::plan_verify_dispatch(
+                                device, head_rows, rows, gqa, prefix_n, q_heads,
+                                kv_heads, segmented_sdpa::kHeadDimension)
+                                .route);
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+// Test-only: the raw limits of the pipelines a one-call verify dispatches,
+// read from Metal without the launch planner. out[0..3] the verify kernel's
+// threadExecutionWidth, maxTotalThreadsPerThreadgroup and
+// staticThreadgroupMemoryLength, out[3..6] the same for MLX's reduction
+// kernel, out[6] the device's maxThreadgroupMemoryLength. -1 on error.
+extern "C" int mlx_segmented_sdpa_test_verify_pipeline_limits(int gqa, int rows,
+                                                              int partitions,
+                                                              uint64_t *out) {
+  using namespace mlx::core;
+  try {
+    if (out == nullptr) {
+      return -1;
+    }
+    auto stream = default_stream(Device::gpu);
+    auto &device = metal::device(stream.device);
+    auto *verify = segmented_sdpa::segmented_kernel(
+        device, {segmented_sdpa::SegmentedKernel::verify_two_pass_1, true,
+                 partitions, gqa, rows});
+    auto *reduction = segmented_sdpa::reduction_kernel(device);
+    out[0] = verify->threadExecutionWidth();
+    out[1] = verify->maxTotalThreadsPerThreadgroup();
+    out[2] = verify->staticThreadgroupMemoryLength();
+    out[3] = reduction->threadExecutionWidth();
+    out[4] = reduction->maxTotalThreadsPerThreadgroup();
+    out[5] = reduction->staticThreadgroupMemoryLength();
+    out[6] = device.mtl_device()->maxThreadgroupMemoryLength();
+    return 0;
   } catch (const std::exception &) {
     return -1;
   }
@@ -631,32 +740,11 @@ extern "C" mlx_array *mlx_segmented_sdpa_forward(mlx_array *, mlx_array *,
   return nullptr;
 }
 
-extern "C" mlx_array *mlx_segmented_sdpa_test_forward(
-    mlx_array *, mlx_array *, mlx_array *, mlx_array *, mlx_array *, float, bool) {
+extern "C" mlx_array *mlx_segmented_sdpa_test_forward(mlx_array *, mlx_array *,
+                                                      mlx_array *, mlx_array *,
+                                                      mlx_array *, float,
+                                                      bool) {
   return nullptr;
-}
-
-extern "C" int mlx_segmented_sdpa_test_plan(
-    int query_length, int gqa_factor, bool two_pass, int partitions,
-    size_t stage1_width, size_t stage1_max_threads,
-    size_t stage1_static_memory, size_t device_max_memory, size_t stage2_width,
-    size_t stage2_max_threads, size_t stage2_static_memory,
-    uint32_t *out_stage1_threads, uint32_t *out_stage2_threads) {
-  mlx::core::fast::SegmentedSdpaCapabilities c1{
-      stage1_width, stage1_max_threads, stage1_static_memory,
-      device_max_memory};
-  mlx::core::fast::SegmentedSdpaCapabilities c2{
-      stage2_width, stage2_max_threads, stage2_static_memory,
-      device_max_memory};
-  auto plan = mlx::core::fast::plan_segmented_sdpa_launch(
-      query_length, gqa_factor, two_pass, partitions, c1, &c2);
-  if (out_stage1_threads) {
-    *out_stage1_threads = plan.stage1_threads;
-  }
-  if (out_stage2_threads) {
-    *out_stage2_threads = plan.stage2_threads;
-  }
-  return plan.supported ? 1 : 0;
 }
 
 extern "C" int mlx_segmented_sdpa_max_query_length(int) { return 0; }
@@ -666,14 +754,41 @@ extern "C" int mlx_segmented_sdpa_test_device_verify_route(int, int, int, int,
   return -1;
 }
 
+extern "C" int mlx_segmented_sdpa_test_verify_pipeline_limits(int, int, int,
+                                                              uint64_t *) {
+  return -1;
+}
+
 #endif
+
+extern "C" int mlx_segmented_sdpa_test_plan(
+    int query_length, int gqa_factor, bool two_pass, int partitions,
+    size_t stage1_width, size_t stage1_max_threads, size_t stage1_static_memory,
+    size_t device_max_memory, size_t stage2_width, size_t stage2_max_threads,
+    size_t stage2_static_memory, uint32_t *out_stage1_threads,
+    uint32_t *out_stage2_threads) {
+  using namespace mlx::core::segmented_sdpa;
+  SegmentedSdpaCapabilities c1{stage1_width, stage1_max_threads,
+                               stage1_static_memory, device_max_memory};
+  SegmentedSdpaCapabilities c2{stage2_width, stage2_max_threads,
+                               stage2_static_memory, device_max_memory};
+  auto plan = plan_segmented_sdpa_launch(query_length, gqa_factor, two_pass,
+                                         partitions, c1, &c2);
+  if (out_stage1_threads) {
+    *out_stage1_threads = plan.stage1_threads;
+  }
+  if (out_stage2_threads) {
+    *out_stage2_threads = plan.stage2_threads;
+  }
+  return plan.supported ? 1 : 0;
+}
 
 // Test-only, platform independent: the route for a block of `rows` queries
 // whose two chunks would reduce as given; -1 when two chunks cannot cover it.
 extern "C" int mlx_segmented_sdpa_test_verify_route(
     int rows, int max_query_length, bool head_two_pass, int head_partitions,
     bool tail_two_pass, int tail_partitions, bool unified_supported) {
-  using namespace mlx::core::fast;
+  using namespace mlx::core::segmented_sdpa;
   const int head_rows = segmented_verify_head_rows(rows, max_query_length);
   if (head_rows < 0) {
     return -1;
@@ -688,7 +803,7 @@ extern "C" int mlx_segmented_sdpa_test_verify_plan(
     size_t stage1_max_threads, size_t stage1_static_memory,
     size_t device_max_memory, size_t stage2_width, size_t stage2_max_threads,
     size_t stage2_static_memory, uint32_t *out_stage1_threads) {
-  using namespace mlx::core::fast;
+  using namespace mlx::core::segmented_sdpa;
   SegmentedSdpaCapabilities c1{stage1_width, stage1_max_threads,
                                stage1_static_memory, device_max_memory};
   SegmentedSdpaCapabilities c2{stage2_width, stage2_max_threads,
@@ -699,4 +814,112 @@ extern "C" int mlx_segmented_sdpa_test_verify_plan(
     *out_stage1_threads = plan.stage1_threads;
   }
   return plan.supported ? 1 : 0;
+}
+
+namespace {
+
+struct Fnv1a {
+  uint64_t state = 0xcbf29ce484222325ull;
+  void add(int64_t value) {
+    for (int byte = 0; byte < 8; ++byte) {
+      state ^= static_cast<uint64_t>(value >> (8 * byte)) & 0xff;
+      state *= 0x100000001b3ull;
+    }
+  }
+  void add(const mlx::core::segmented_sdpa::SegmentedSdpaLaunchPlan &plan) {
+    add(plan.supported);
+    add(plan.two_pass);
+    add(plan.partitions);
+    add(plan.stage1_threads);
+    add(plan.stage2_threads);
+  }
+};
+
+} // namespace
+
+// Test-only, platform independent: FNV-1a 64 digests of every planner and
+// policy output over a fixed input sweep for one device class, in the order
+// two-pass, partitions, head rows, launch plan, verify launch, verify route.
+extern "C" int64_t mlx_segmented_sdpa_test_plan_digests(char device_class,
+                                                        int blocks_override,
+                                                        uint64_t *out_digests) {
+  using namespace mlx::core::segmented_sdpa;
+  Fnv1a digests[6];
+  int64_t checked = 0;
+  std::vector<int> lengths;
+  for (int length = 1; length <= 140000;
+       length += length < 2048 ? 1 : (length < 70000 ? 7 : 997)) {
+    lengths.push_back(length);
+  }
+  for (int boundary = 2048; boundary <= (1 << 17); boundary *= 2) {
+    for (int d = -2; d <= 2; ++d) {
+      lengths.push_back(boundary + d);
+    }
+  }
+  for (int length : lengths) {
+    for (int q_heads : {1, 2, 4, 6, 8, 12, 16, 24, 32, 64}) {
+      for (int kv_heads : {1, 2, 4, 8}) {
+        if (q_heads % kv_heads != 0) {
+          continue;
+        }
+        ++checked;
+        digests[0].add(
+            sdpa_vector_uses_two_pass(device_class, length, q_heads, kv_heads));
+      }
+    }
+    for (int simdgroups = 1; simdgroups <= 256; ++simdgroups) {
+      ++checked;
+      digests[1].add(sdpa_vector_partition_count(device_class, length,
+                                                 simdgroups, blocks_override));
+    }
+  }
+
+  const size_t widths[] = {16, 32, 64};
+  const size_t threads[] = {0, 32, 512, 960, 1023, 1024, 2048};
+  const size_t memory[] = {0, 4096, 32768, 65536};
+  for (int rows = -1; rows <= 10; ++rows) {
+    for (int max_q = -1; max_q <= 10; ++max_q) {
+      ++checked;
+      digests[2].add(segmented_verify_head_rows(rows, max_q));
+    }
+    for (int gqa = 0; gqa <= 33; ++gqa) {
+      for (int partitions : {0, 16, 31, 32, 48, 64, 128, 1024}) {
+        for (size_t w : widths) {
+          for (size_t t : threads) {
+            for (size_t m : memory) {
+              SegmentedSdpaCapabilities c1{w, t, m, 32768};
+              SegmentedSdpaCapabilities c2{32, t, m, 32768};
+              for (bool two_pass : {false, true}) {
+                checked += 2;
+                digests[3].add(plan_segmented_sdpa_launch(rows, gqa, two_pass,
+                                                          partitions, c1, &c2));
+                digests[3].add(plan_segmented_sdpa_launch(
+                    rows, gqa, two_pass, partitions, c1, nullptr));
+              }
+              ++checked;
+              digests[4].add(
+                  plan_segmented_verify_launch(rows, gqa, partitions, c1, c2));
+            }
+          }
+        }
+      }
+    }
+  }
+  for (int head_rows = 0; head_rows <= 8; ++head_rows) {
+    for (int a = 0; a < 4; ++a) {
+      for (int b = 0; b < 4; ++b) {
+        const int parts[] = {32, 64, 128, 256};
+        for (bool unified : {false, true}) {
+          ++checked;
+          digests[5].add(static_cast<int>(select_segmented_verify_route(
+              head_rows, {(a & 1) != 0, parts[a]}, {(b & 1) != 0, parts[b]},
+              unified)));
+        }
+      }
+    }
+  }
+  for (int i = 0; i < 6; ++i) {
+    out_digests[i] = digests[i].state;
+  }
+  return checked;
 }

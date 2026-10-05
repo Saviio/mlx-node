@@ -6,8 +6,15 @@
  * discover after a 16-minute build and a notarization round trip.
  */
 
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+
+import {
+  assertAddonMinOs,
+  assertMetallibComplete,
+  assertMlxMetallibCarriesNax,
+  assertPagedMetallibIntegrity,
+} from '../../core/metallib-select.js';
 
 /**
  * The three native files, which MUST end up in ONE directory together.
@@ -72,6 +79,8 @@ export function resolvePayload(repoRoot: string): PayloadSource {
     }
     native[file] = path;
   }
+  checkAddonMinOs(native['mlx-core.darwin-arm64.node']!);
+  checkMetallibPair(native['mlx.metallib']!, native['paged_attn.metallib']!);
 
   const wwwRoot = join(repoRoot, 'packages', 'dashboard', 'web');
   // index.html specifically: the directory survives a failed build, and an empty
@@ -98,6 +107,40 @@ export function resolvePayload(repoRoot: string): PayloadSource {
   }
 
   return { native, wwwRoot, appDir };
+}
+
+/**
+ * The addon's `LC_BUILD_VERSION` minos is at least the 26.2 floor, the gate
+ * `yarn build:native` applies: the Info.plist floor is derived from it.
+ */
+export function checkAddonMinOs(addonPath: string): void {
+  try {
+    assertAddonMinOs(readFileSync(addonPath), addonPath);
+  } catch (err) {
+    throw new PayloadError((err as Error).message, 'yarn build:native');
+  }
+}
+
+/**
+ * `paged_attn.metallib` passes the same gate `yarn build:native` applies
+ * (packages/core/metallib-select.ts): it holds the K-quant (NAX included),
+ * segmented SDPA and mixed-affine kernels, which have no JIT fallback, so an
+ * older library clears any size floor and then throws on first use. An
+ * `mlx.metallib` without MLX's NAX kernels (an MLX_METAL_NO_NAX build), or
+ * either file shorter than its MTLB header declares, fails.
+ */
+export function checkMetallibPair(mlxMetallibPath: string, pagedMetallibPath: string): void {
+  try {
+    const mlxMetallib = readFileSync(mlxMetallibPath);
+    assertMlxMetallibCarriesNax(mlxMetallib, mlxMetallibPath);
+    assertMetallibComplete(mlxMetallib, mlxMetallibPath);
+    assertPagedMetallibIntegrity(readFileSync(pagedMetallibPath), {
+      path: pagedMetallibPath,
+      minBytes: MIN_BYTES['paged_attn.metallib'],
+    });
+  } catch (err) {
+    throw new PayloadError((err as Error).message, 'yarn build:native');
+  }
 }
 
 /**

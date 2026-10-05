@@ -662,7 +662,7 @@ unsafe extern "C-unwind" {
     /// Compiles and checks portable BF16/FP16 D256 attention pipelines.
     /// Auto-enabled without NAX; MLX_PORTABLE_D256_SDPA=1 forces for validation.
     pub fn mlx_metal_portable_d256_sdpa_available() -> bool;
-    /// Probe whether MLX can dispatch the fused D=256 full-SDPA kernel for the
+    /// Probe whether MLX's NAX D=256 full-SDPA route exists for the
     /// effective input dtype. Returns 0 on success and writes a conservative
     /// result to `out_available`; returns -1 on invalid output or a caught C++
     /// exception. Non-Metal builds return success with `false`.
@@ -670,9 +670,8 @@ unsafe extern "C-unwind" {
         effective_dtype_is_float32: bool,
         out_available: *mut bool,
     ) -> i32;
-    /// Evaluate the D=256-specific eligibility predicate shared with MLX's
-    /// Metal dispatcher, without adding hot-path logging or counters. The
-    /// caller still owns the dispatcher's outer inference/stream gates.
+    /// Mirror of MLX's D=256 Metal routing (inference, GPU stream) in
+    /// `mlx_stream.cpp`; re-check it on every MLX bump.
     /// Uses the same 0/-1 fallible-output contract as the capability probe.
     pub fn mlx_metal_d256_full_sdpa_would_use(
         effective_dtype_is_float32: bool,
@@ -730,7 +729,8 @@ unsafe extern "C-unwind" {
     // Segmented BF16 vector attention, with concatenated SDPA fallback for
     // unsupported pipeline capabilities. A causal block wider than one
     // supported query chunk is one call with no fallback. Null indicates a
-    // construction error (or an unavailable backend, which Rust checks before
+    // construction error, including prebuilt kernels missing from
+    // paged_attn.metallib (or an unavailable backend, which Rust checks before
     // calling).
     pub fn mlx_segmented_sdpa_forward(
         q: *mut mlx_array,
@@ -753,6 +753,12 @@ unsafe extern "C-unwind" {
         causal: bool,
     ) -> *mut mlx_array;
 
+    // Widest query chunk both segmented launches support for `gqa_factor`:
+    // 0 when segmented SDPA is not supported here (the caller takes
+    // concatenated SDPA), -1 when its prebuilt kernels are missing from
+    // paged_attn.metallib (a packaging error the caller must surface; message
+    // on stderr). The forward entry points return null for that error instead
+    // of falling back.
     pub fn mlx_segmented_sdpa_max_query_length(gqa_factor: i32) -> i32;
 
     pub fn mlx_segmented_sdpa_test_plan(
@@ -802,6 +808,27 @@ unsafe extern "C-unwind" {
         prefix_n: i32,
         out_device_class: *mut std::ffi::c_char,
     ) -> i32;
+
+    /// TEST-ONLY: raw Metal limits of the one-call verify kernel and MLX's
+    /// reduction kernel, read without the launch planner: `out[0..7]` =
+    /// verify {thread execution width, max threads per threadgroup, static
+    /// threadgroup memory}, reduction {same three}, device max threadgroup
+    /// memory. -1 without Metal or on error.
+    pub fn mlx_segmented_sdpa_test_verify_pipeline_limits(
+        gqa: i32,
+        rows: i32,
+        partitions: i32,
+        out: *mut u64,
+    ) -> i32;
+
+    /// TEST-ONLY, platform independent: FNV-1a 64 digests of the segmented
+    /// planners and vector-SDPA policy over a fixed sweep for one device
+    /// class, written to `out_digests[0..6]`; returns the number of inputs.
+    pub fn mlx_segmented_sdpa_test_plan_digests(
+        device_class: std::ffi::c_char,
+        blocks_override: i32,
+        out_digests: *mut u64,
+    ) -> i64;
 
     // Fused forward step - single FFI call for entire forward pass
     // This reduces FFI overhead from ~300 calls to 1 call per token
@@ -1787,6 +1814,123 @@ unsafe extern "C-unwind" {
         mode: *const std::os::raw::c_char,
         sorted_indices: bool,
     ) -> *mut mlx_array;
+
+    /// TEST-ONLY: per-thread K-quant kernel-family counters. Enabling or
+    /// disabling resets this thread's counts.
+    pub fn mlx_test_kquant_counting(enable: bool);
+    /// TEST-ONLY: this thread's dispatch count for a kernel family
+    /// (e.g. `qmv_fast`, `qmv_wide_nv8`, `qmm_t_nax`, `gather_qmm_rhs_nt`).
+    pub fn mlx_test_kquant_family_count(family: *const std::os::raw::c_char) -> u64;
+    /// TEST-ONLY: the GPU generation the Metal dispatcher sees, -1 without Metal.
+    pub fn mlx_test_kquant_gpu_gen() -> i32;
+    /// TEST-ONLY: checks `paged_attn.metallib` against every K-quant kernel
+    /// name the Metal dispatcher can build. `counts` (4 slots) receives base
+    /// names, NAX names, K-quant functions in the library and pipelines built;
+    /// `report` receives "missing <name>" / "unexpected <name>" lines.
+    /// `build_pipelines` also builds every pipeline this device can request.
+    /// False without Metal, on error, or when `len` is too small.
+    pub fn mlx_test_kquant_metallib_check(
+        build_pipelines: bool,
+        counts: *mut i64,
+        report: *mut std::ffi::c_char,
+        len: usize,
+    ) -> bool;
+    /// TEST-ONLY: checks `paged_attn.metallib` against the kernels the
+    /// segmented SDPA (`family` "segmented_sdpa") or mixed-affine
+    /// ("affine_mixed") dispatcher can request. `counts` (3 slots) receives
+    /// dispatcher names, the family's functions in the library and pipelines
+    /// built; `report` receives "missing <name>" / "unexpected <name>" lines.
+    /// `build_pipelines` also builds every pipeline the dispatcher can build,
+    /// each function-constant specialization included, when no name is
+    /// missing. False without Metal, for an unknown family, on error, or when
+    /// `len` is too small.
+    pub fn mlx_test_bridge_metallib_check(
+        family: *const std::ffi::c_char,
+        build_pipelines: bool,
+        counts: *mut i64,
+        report: *mut std::ffi::c_char,
+        len: usize,
+    ) -> bool;
+    /// TEST-ONLY: the Metal architecture name (NUL-terminated) of the hardware
+    /// (`hardware`) or the one the dispatcher routes by (honours
+    /// `MLX_METAL_GPU_ARCH`); false without Metal or when `len` is too small.
+    pub fn mlx_test_metal_architecture(
+        hardware: bool,
+        out: *mut std::ffi::c_char,
+        len: usize,
+    ) -> bool;
+
+    /// TEST-ONLY: the bridge K-quant ops on an explicit device (0 CPU, 1 GPU).
+    pub fn mlx_test_kquant_quantized_matmul(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        device: i32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY, see `mlx_test_kquant_quantized_matmul`.
+    pub fn mlx_test_kquant_gather_qmm(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        lhs_indices: *mut mlx_array,
+        rhs_indices: *mut mlx_array,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        sorted_indices: bool,
+        device: i32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY, see `mlx_test_kquant_quantized_matmul`.
+    pub fn mlx_test_kquant_dequantize(
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out_dtype: i32,
+        mode: *const std::os::raw::c_char,
+        device: i32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY: shapeless-compiles the bridge K-quant matmul on `trace_x`,
+    /// then replays it on `x`; writes the replay and the eager result.
+    pub fn mlx_test_kquant_shapeless_replay(
+        trace_x: *mut mlx_array,
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        device: i32,
+        out_replay: *mut *mut mlx_array,
+        out_eager: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// TEST-ONLY: shapeless-compiles the mixed BF16/F32 affine matmul on
+    /// `trace_x`, then replays it on `x`; writes the replay and the eager result.
+    pub fn mlx_test_affine_mixed_shapeless_replay(
+        trace_x: *mut mlx_array,
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out_replay: *mut *mut mlx_array,
+        out_eager: *mut *mut mlx_array,
+    ) -> bool;
 
     // Gated Delta Recurrence Metal Kernel
     pub fn mlx_gated_delta_kernel(

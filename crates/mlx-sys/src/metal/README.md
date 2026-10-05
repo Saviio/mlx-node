@@ -1,6 +1,7 @@
 # Custom Metal kernels
 
-The `.metal.inc` files contain C++ raw strings for `fast::metal_kernel`.
+The `.metal.inc` files contain C++ raw strings for `fast::metal_kernel`. The
+`.metal` files are prebuilt into `paged_attn.metallib`.
 Organize them by their mathematical and storage contracts:
 
 - `common/`: reusable operations. A kernel may specialize a dtype, tile size,
@@ -12,6 +13,27 @@ Organize them by their mathematical and storage contracts:
   top-10 routing, fixed shared-expert packing, 16 key / 48 value heads, and
   four-stream hyper-connection mixing. The dense projection kernels also
   retain mixer epilogues that divide by four.
+- `kquant/`: the ggml K-quant / IQ kernels (`kquant.h`, `kquant_nax.h`) and
+  their instantiation lists (`kquant.metal`, `kquant_nax.metal`). `build.rs`
+  compiles the lists with MLX's kernel flags into `paged_attn.metallib`, and
+  `mlx_kquant_metal.cpp` loads every kernel from there (no JIT fallback),
+  choosing kernels like MLX's affine dispatcher. Its `kquant::kernels` name
+  builders must match the lists; `kquant_metallib_names` checks both ways.
+  `build.rs` also turns each header into a `quantized_preamble::` function for
+  the custom kernels that reuse its decoders.
+- `affine_mixed/affine_qmv_wide_mixed.metal`: the BF16 x / F32 affine sidecar
+  `qmv_wide`, one instantiation per tile width. `segmented_sdpa/sdpa_segmented.metal`:
+  the BF16 D=256 segmented SDPA kernels, specialized by function constants at
+  pipeline build; `mlx_segmented_sdpa.cpp` reduces their partials with MLX's
+  own `sdpa_vector_2pass_2`. `build.rs` prebuilds both into
+  `paged_attn.metallib` with the K-quant flags, and their dispatchers load them
+  from there (no JIT fallback). The host names must match the dispatchers'
+  name builders; `bridge_metallib_names` checks both ways.
+- The three kernel families above (`kquant/`, `affine_qmv_wide_mixed`,
+  `sdpa_segmented`) are guarded by `#[ignore]` golden-digest gates in
+  `crates/mlx-core/tests/*_golden_gate.rs`, run on every MLX pin bump. A change
+  here that moves output bits fails them too, and they have no capture mode
+  ([docs/mlx-fork.md](../../../../docs/mlx-fork.md)).
 - Add `qwen3_5/`, `lfm2/`, or `gemma4/` when a shader requires that family's
   semantics. Qwen3.5 currently uses `common/` recurrence and quantized kernels;
   LFM2 and Gemma4 have no family-specific shader includes here.
