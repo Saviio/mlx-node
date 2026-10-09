@@ -1360,6 +1360,25 @@ export declare class OutputStore {
   queryRaw(sql: string): Promise<string>;
 }
 
+export declare class PcmPlayer {
+  static open(
+    sampleRate: number,
+    channels: number,
+    bufferSeconds?: number | undefined | null,
+    prebufferSeconds?: number | undefined | null,
+  ): PcmPlayer;
+  write(samples: Float32Array): Promise<undefined>;
+  finish(): Promise<PcmPlaybackStats>;
+  cancel(): void;
+}
+
+export declare class PcmTempo {
+  constructor(sampleRate: number, channels: number, speed: number);
+  write(samples: Float32Array): Float32Array;
+  finish(): Float32Array;
+  close(): void;
+}
+
 /**
  * NAPI-exported view of [`PrivacyFilterModel`].
  *
@@ -4834,6 +4853,12 @@ export interface ParseToolCallsResult {
 
 /** Parse VLM output into structured document */
 export declare function parseVlmOutput(text: string): ParsedDocument;
+
+export interface PcmPlaybackStats {
+  playedSeconds: number;
+  underruns: number;
+  firstPlaybackMs?: number;
+}
 
 /**
  * Lightweight performance metrics returned by chat/chatStream when
