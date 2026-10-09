@@ -40,6 +40,19 @@ export interface PublicModelEntry {
   object: 'model';
   created: number;
   owned_by: string;
+  /**
+   * Optional enrichment read by Grok Build's `/v1/models` prefetch
+   * (`parse_remote_model_value` accepts both camelCase and snake_case).
+   * `api_backend` picks the wire protocol — our router serves
+   * `/v1/messages` (Anthropic) and `/v1/responses` (OpenAI), never
+   * `/v1/chat/completions`. Grok defaults an unstamped entry to
+   * chat_completions, so hosts must always pin one — `"messages"` is the
+   * path `mlx launch claude` already exercises.
+   */
+  context_window?: number;
+  api_backend?: 'messages' | 'responses';
+  model_family?: string;
+  supports_images?: boolean;
 }
 
 export interface HandlerOptions {

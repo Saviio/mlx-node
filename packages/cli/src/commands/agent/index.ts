@@ -1,25 +1,32 @@
 /**
- * `mlx agent` — boot the pi-based local coding agent on the in-process
- * mlx provider (fully offline).
+ * `mlx agent` — boot the Grok Build coding agent over the local inference
+ * host (fully offline).
  *
- * pi owns almost every flag, so this command never `parseArgs`es the
- * full argv: {@link scanAgentArgs} lifts out only what mlx handles
- * (`--models-dir`, tracing, help, the blocked `update` positional) and forwards
- * the rest verbatim. Boot discipline (spike-proven, see
- * `packages/agent/src/run-agent.ts`): pi may `process.exit()` inside
- * `runAgent`, print mode owns stdout/stdin, so nothing here runs after
- * the handoff and nothing here reads stdin.
+ * The agent binary (`mlx-agent`, built from the `mlx` branch of
+ * github.com/mlx-node/grok-build) is a standalone Rust process that speaks
+ * HTTP to `mlx serve`. This command's whole job:
+ *
+ *   1. lift mlx-owned flags out of argv (`--models-dir`, tracing, help,
+ *      the blocked `update` positional),
+ *   2. make sure at least one local model exists (first-run wizard),
+ *   3. spawn `mlx serve --port 0 --auth-token <tok>` + the agent binary,
+ *      pointed at the real port via `GROK_*_BASE_URL`/`XAI_API_KEY`
+ *      (see ./grok-build.ts for the env contract).
+ *
+ * The binary owns every other flag, so this command never `parseArgs`es the
+ * full argv: {@link scanAgentArgs} lifts out only what mlx handles and
+ * forwards the rest verbatim.
  */
 
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
-import type { MlxModelInfo } from '@mlx-node/agent';
-// Native-free subpath: the help path must print without loading the addon, and
+// Native-free subpaths: the help path must print without loading the addon, and
 // the family list must have exactly ONE definition (the drift guard's).
 import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { expandPiAgentDir } from '@mlx-node/agent/paths';
+import { launchGrokAgent, type GrokAgentLaunchOptions } from './grok-build.js';
 
 export { expandPiAgentDir } from '@mlx-node/agent/paths';
 
@@ -39,114 +46,152 @@ export interface AgentArgScan {
    * `--no-persist-cache` flag turns it off). A SINGLE process-wide boolean
    * applied to every family in `COLD_TIER_RESTORE_FAMILIES` — not to qwen3
    * alone. Lifted out of the argv like the other mlx flags — never forwarded
-   * to pi.
+   * to the agent binary.
    */
   persistPagedCache: boolean;
   /**
-   * `-h`/`--help` seen and this is NOT a pi pass-through invocation
-   * (`install`/`remove`/`uninstall`/`list`/`config` print their own
-   * per-command help inside pi, so those pass through untouched).
+   * `-h`/`--help` seen and this is NOT a binary-managed subcommand
+   * (`models`/`export`/`doctor`/… print their own help inside the binary, so
+   * those pass through untouched).
    */
   help: boolean;
-  /** Leading `update` positional — pi's npm self-update, always blocked. */
+  /** Leading `update` positional — the binary's self-update, always blocked. */
   update: boolean;
   /**
-   * pi one-shot metadata argv: `--version`/`-v` in an option-NAME position,
-   * or `--export` that consumed a value. pi answers these BEFORE model
-   * resolution — `main()` prints VERSION / exports and `process.exit`s ahead
-   * of session creation — so they need no local model: forward verbatim,
-   * skipping discovery, the first-run wizard and default-model injection.
-   * A bare trailing `--export` does NOT count: pi only consumes a following
-   * value (`i + 1 < len`), otherwise it is an unknown flag. Neither does an
-   * EMPTY value (`--export ''`): pi stores '' but its truthiness gate
-   * (`if (parsed.export)`) skips the export path, so pi would fall into
-   * normal session startup — that run must stay on the discovery path.
+   * The binary answers these BEFORE model resolution and exits — they need no
+   * inference server: `--version`/`-v`, or any leading subcommand other than
+   * the interactive default (see {@link GROK_SUBCOMMANDS}). The launcher skips
+   * spawning `mlx serve` for them.
    */
-  piOneShot: boolean;
-  /** Args forwarded to pi in their original order. */
+  grokOneShot: boolean;
+  /** Args forwarded to the agent binary in their original order. */
   passthrough: string[];
 }
 
 /**
- * Leading positionals that route into pi's own command handlers and stay
- * useful. pi recognizes them ONLY at `args[0]`: `parsePackageCommand`
- * matches exactly `install | remove | uninstall | update | list`
- * (`const [rawCommand] = args`) and `handleConfigCommand` matches
- * `config` (`const [command] = args`). So these must reach pi verbatim —
- * `update` (npm self-update) is the one member mlx blocks instead.
+ * Leading positionals that are real subcommands of the agent binary. Every one
+ * except `agent` (ACP server) is a local metadata operation that never needs a
+ * running model — the launcher skips the inference host for them. `update`
+ * also lands here so the leading-positional rule is one table; `run()`
+ * intercepts it before the handoff.
  */
-const PI_PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set(['install', 'remove', 'uninstall', 'list', 'config']);
-
-/**
- * Options that UNCONDITIONALLY consume the FOLLOWING token as their value —
- * mirrors pi's `cli/args.js` (`arg === X && i + 1 < len` → `args[++i]`).
- * re-verify on a pi bump (same bounded coupling as the {@link expandPiAgentDir}
- * / {@link readPersistedDefaultModel} shims). Shared by BOTH argv walks — the
- * {@link scanAgentArgs} option-name lift and the {@link withDefaultModel} model
- * scan — so they classify identically and a value token after a pi
- * value-consumer is never re-interpreted: `--system-prompt --models-dir` sets
- * systemPrompt="--models-dir" in pi, so mlx must forward that value verbatim,
- * not strip it as its own flag (the R3-2 / WB-5 sibling leaks). Both walks skip
- * the token after any of these. Deliberately EXCLUDES the conditional consumers
- * `-p`/`--print`, `--list-models`, and theme/TUI selectors (handled by
- * `agentOptionConsumesNext` using pi's conditional rules) and the flag-only
- * carriers `-c`/`--continue`/`-r`/`--resume` (no value). The inline
- * `--opt=value` form is not modeled either — pi's exact-match parser does not
- * accept it.
- */
-const VALUE_CONSUMING_ARGS: ReadonlySet<string> = new Set([
-  '--thinking-budget',
-  '--mode',
-  '--provider',
-  '--model',
-  '--api-key',
-  '--system-prompt',
-  '--append-system-prompt',
-  '--name',
-  '-n',
-  '--session',
-  '--session-id',
-  '--fork',
-  '--session-dir',
-  '--models',
-  '--tools',
-  '-t',
-  '--exclude-tools',
-  '-xt',
-  '--thinking',
-  '--export',
-  '--extension',
-  '-e',
-  '--skill',
-  '--prompt-template',
-  '--theme',
+const GROK_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  'agent',
+  'config',
+  'doctor',
+  'leader',
+  'logout',
+  'login',
+  'mcp',
+  'plugin',
+  'memory',
+  'models',
+  'sessions',
+  'usage',
+  'setup',
+  'share',
+  'wrap',
+  'export',
+  'trace',
+  'update',
 ]);
 
-/** Match pi 0.84.4 value consumption; shared with delegate so option values remain opaque. */
+/**
+ * Flags in option-NAME position that unconditionally consume the NEXT token as
+ * their value (grok CLI, crates/codegen/xai-grok-pager/src/app/cli.rs).
+ * Re-verify on an upstream sync. Shared by BOTH argv walks — the
+ * {@link scanAgentArgs} option-name lift and the {@link withDefaultModel}
+ * model scan — so a value token after any of these is never re-interpreted:
+ * `--system-prompt-override --models-dir` sets the prompt to "--models-dir",
+ * so mlx must forward that value verbatim rather than strip it as its own
+ * flag. The inline `--opt=value` form is not modeled.
+ */
+const VALUE_CONSUMING_ARGS: ReadonlySet<string> = new Set([
+  '--model',
+  '-m',
+  '--agent',
+  '--agents',
+  '--agent-profile',
+  '--cwd',
+  '--leader-socket',
+  '--session-id',
+  '-s',
+  '--resume',
+  '-r',
+  '--load',
+  '--rules',
+  '--append-system-prompt',
+  '--system-prompt-override',
+  // Alias of --system-prompt-override in the fork's clap definition.
+  '--system-prompt',
+  '--tools',
+  '--disallowed-tools',
+  '--max-turns',
+  '--reasoning-effort',
+  '--effort',
+  '--permission-mode',
+  '--allow',
+  '--deny',
+  '--prompt-file',
+  '--prompt-json',
+  '--output-format',
+  '--json-schema',
+  '--sandbox',
+  '--worktree',
+  '--ref',
+  '--worktree-ref',
+  '--cli-chat-proxy-base-url',
+  '--xai-api-base-url',
+  '--grok-ws-origin',
+  '--grok-ws-url',
+  '--plugin-dir',
+  '--client-identifier',
+  '--debug-file',
+  '--storage-mode',
+  '--compaction-mode',
+  '--hunk-tracker-mode',
+  '--background-wait-timeout',
+  '--installer',
+  '--trust-folder',
+  '--terminal',
+  '--fs-read',
+  '--fs-write',
+  '--memory-flush',
+  '--todo-gate',
+  '--local-workspace',
+  '--local-workspace-cwd',
+  '--restore-code',
+]);
+
+/**
+ * Grok flag→value mapping; shared with delegate so option values stay opaque
+ * to the mlx flag scan. `-p`/`--single` conditionally consumes the next token
+ * (the prompt text), matching the binary's parser.
+ */
 export function agentOptionConsumesNext(argv: readonly string[], index: number): boolean {
   const arg = argv[index];
-  const next = argv[index + 1];
+  const next = argv[i_next(index, argv)];
   if (next === undefined) return false;
   if (VALUE_CONSUMING_ARGS.has(arg!)) return true;
-  if (arg === '--print' || arg === '-p') {
+  if (arg === '--single' || arg === '-p') {
     return !next.startsWith('@') && (!next.startsWith('-') || next.startsWith('---'));
   }
-  if (arg === '--list-models') return !next.startsWith('-') && !next.startsWith('@');
-  if (arg === '--use-theme' || arg === '--tui-mode') return !next.startsWith('-');
   return false;
+}
+
+function i_next(index: number, argv: readonly string[]): number {
+  return index + 1 < argv.length ? index + 1 : argv.length;
 }
 
 /**
  * Pure manual scan of `mlx agent`'s argv — see {@link AgentArgScan}.
  *
- * ONE pi-parity, value-aware walk (sibling of {@link withDefaultModel}'s model
- * scan, sharing {@link VALUE_CONSUMING_ARGS}): mlx's own options
- * (`--models-dir`, `--trace`, `--trace-dir`, `-h`/`--help`) are recognized ONLY in an option-NAME
- * position. A token sitting in a pi value-consumer's value slot
- * (`--system-prompt --models-dir` → "--models-dir" is systemPrompt's value) is
- * forwarded verbatim, never hijacked as mlx's flag. Routing (`help`/`update`)
- * reads the value-aware passthrough head, so a stripped `--models-dir` pair
- * cannot mask what pi will see at args[0].
+ * ONE value-aware walk (shared with {@link withDefaultModel}'s model scan via
+ * {@link VALUE_CONSUMING_ARGS}): mlx's own options are recognized ONLY in an
+ * option-NAME position. A token sitting in a value-consumer's value slot is
+ * forwarded verbatim, never hijacked as mlx's flag. Routing (help/update/
+ * subcommand) reads the value-aware passthrough head, so a stripped
+ * `--models-dir` pair cannot mask what the binary will see at argv[0].
  */
 export function scanAgentArgs(argv: string[]): AgentArgScan {
   const passthrough: string[] = [];
@@ -157,7 +202,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   let traceDirMissingValue = false;
   let persistPagedCache = true;
   let helpSeen = false;
-  let piOneShot = false;
+  let versionSeen = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -167,15 +212,10 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       break;
     }
 
-    // pi value-consumer in an option-NAME position: the following token is its
-    // VALUE (pi does `args[++i]`), never an option name. Forward BOTH verbatim
-    // and skip the value so it is never interpreted as mlx's --models-dir/help.
-    // This is checked FIRST, so a `--models-dir` (or `--help`) sitting in a
-    // pi-consumer's value slot passes through untouched.
+    // Value-consumer in an option-NAME position: the following token is its
+    // VALUE, never an option name. Forward BOTH verbatim and skip the value so
+    // it is never interpreted as mlx's --models-dir/help.
     if (agentOptionConsumesNext(argv, i)) {
-      if (arg === '--export' && argv[i + 1]!.length > 0) {
-        piOneShot = true;
-      }
       passthrough.push(arg, argv[i + 1]!);
       i++;
       continue;
@@ -184,11 +224,10 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     // mlx-only options, recognized ONLY here (an option-NAME position).
     if (arg === '--models-dir') {
       const next = argv[i + 1];
-      // The SPACE-form value must be a real path token: absent, empty,
-      // or option-looking (`-…`) values are usage errors. Consuming an
-      // option here would swallow the next flag (`--models-dir --local`
-      // must not create ./--local and turn an install global). Dash-
-      // leading dirs must use the `--models-dir=<dir>` form.
+      // The SPACE-form value must be a real path token: absent, empty, or
+      // option-looking (`-…`) values are usage errors. Consuming an option
+      // here would swallow the next flag. Dash-leading dirs must use the
+      // `--models-dir=<dir>` form.
       if (next === undefined || next.startsWith('-')) {
         modelsDirMissingValue = true;
       } else if (next.length === 0) {
@@ -220,8 +259,6 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     if (arg === '--trace-dir') {
       trace = true;
       const next = argv[i + 1];
-      // Match --models-dir's value rules: never swallow the next option. A
-      // dash-leading directory remains available through --trace-dir=<dir>.
       if (next === undefined || next.startsWith('-')) {
         traceDirMissingValue = true;
       } else if (next.length === 0) {
@@ -246,15 +283,17 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     if (arg === '-h' || arg === '--help') {
       helpSeen = true;
     }
-    if (arg === '--version' || arg === '-v') {
-      piOneShot = true;
+    if (arg === '--version' || arg === '-v' || arg === '-V') {
+      versionSeen = true;
     }
     passthrough.push(arg);
   }
 
-  // Route on what pi will actually see at args[0] — the value-aware passthrough
-  // head — so a preceding (stripped) `--models-dir` pair or a consumed value
-  // cannot mask a pass-through command or the blocked `update`.
+  // Route on what the binary will actually see at argv[0] — the value-aware
+  // passthrough head — so a stripped `--models-dir` pair or a consumed value
+  // cannot mask a subcommand or the blocked `update`.
+  const leadingCommand = passthrough[0] ?? '';
+  const isSubcommand = GROK_SUBCOMMANDS.has(leadingCommand);
   return {
     modelsDir,
     modelsDirMissingValue,
@@ -262,9 +301,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     traceDir,
     traceDirMissingValue,
     persistPagedCache,
-    help: helpSeen && !PI_PASSTHROUGH_COMMANDS.has(passthrough[0] ?? ''),
-    update: passthrough[0] === 'update',
-    piOneShot,
+    help: helpSeen && !isSubcommand,
+    update: leadingCommand === 'update',
+    grokOneShot: versionSeen || (isSubcommand && leadingCommand !== 'agent'),
     passthrough,
   };
 }
@@ -274,30 +313,22 @@ const DEFAULT_AGENT_LOG_FILTER = 'mlx_core::inference=info,mlx_core::decode=info
 export interface AgentTracingSetupOptions {
   /** @internal Hermetic environment seam for tests. */
   env?: NodeJS.ProcessEnv;
-  /** @internal Home-directory seam for tests. */
-  homeDir?: string;
-  /** @internal Clock seam for a deterministic per-run directory. */
+  /** @internal Hermetic clock seam for tests. */
   now?: Date;
-  /** @internal Process-id seam for a deterministic per-run directory. */
+  /** @internal Hermetic home seam for tests. */
+  homeDir?: string;
+  /** @internal Hermetic pid seam for tests. */
   pid?: number;
-  /** @internal Output seam. Production writes to stderr so pi keeps stdout. */
+  /** @internal Where the "inference log" announcement goes (stderr default). */
   announce?: (line: string) => void;
 }
 
 /**
- * Configure the native Rust `tracing` subscriber before `@mlx-node/agent`
- * imports the addon. N-API initializes the subscriber while loading the addon,
- * so the target filter and file must already be present in the environment.
- *
- * The diagnostics are opt-in through `--trace` or `--trace-dir`. Caller-supplied
- * `MLX_NODE_LOG` and `MLX_NODE_LOG_FILE` values always win. Otherwise each
- * process gets a bounded inference/decode filter and a fresh file below
- * `~/.mlx-node/logs/agent/` (or the explicit trace directory).
+ * Configure the native Rust `tracing` subscriber before the spawned `mlx
+ * serve` loads the addon. Env is exported into THIS process so the serve
+ * subprocess inherits it.
  */
-export function configureAgentTracing(
-  scan: Pick<AgentArgScan, 'trace' | 'traceDir'>,
-  options: AgentTracingSetupOptions = {},
-): string | undefined {
+export function configureAgentTracing(scan: Pick<AgentArgScan, 'trace' | 'traceDir'>, options: AgentTracingSetupOptions = {}): string | undefined {
   const env = options.env ?? process.env;
   const requested = scan.trace || scan.traceDir !== undefined;
   if (!requested) return undefined;
@@ -308,9 +339,6 @@ export function configureAgentTracing(
   let traceDir: string | undefined;
   let logFile: string;
   if (explicitFile !== undefined && explicitFile.trim() !== '') {
-    // Preserve the user's environment value verbatim; use its trimmed path for
-    // pre-creation/announcement because the Rust subscriber applies the same
-    // trim before opening it.
     logFile = explicitFile.trim();
   } else {
     traceDir = scan.traceDir
@@ -327,8 +355,7 @@ export function configureAgentTracing(
   }
 
   // Diagnostics are never a launch prerequisite. Pre-create private paths when
-  // possible; subscriber initialization remains responsible for opening its
-  // actual writer after the deferred addon import.
+  // possible; the subscriber in the serve subprocess opens the real writer.
   try {
     const parent = dirname(logFile);
     mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -345,52 +372,27 @@ export function configureAgentTracing(
 }
 
 /**
- * An explicit `--models` scope is authoritative: the user already named the
- * complete picker/cycling scope, so forward it verbatim. A concrete `--model`
- * is different: it chooses the active model but does NOT constrain pi's model
- * selector, so {@link withDefaultModel} still adds the local-only scope around
- * it.
+ * Agent-bin flags whose presence means the user already picked a model or a
+ * prior session, so {@link withDefaultModel} must not inject `-m`.
+ * `-m`/`--model` is an explicit pick; `-c`/`--continue`, `-r`/`--resume`,
+ * `-s`/`--session-id`, `--fork-session`, and `--load` restore a session whose
+ * own saved model should win.
  */
-const FULL_SUPPRESS_ARGS: ReadonlySet<string> = new Set(['--models']);
-
-/**
- * Session / provider carriers where a bare `--model mlx/<id>` injection is
- * WRONG but a local-only SCOPE is right: {@link withDefaultModel} prepends
- * `--models mlx/*` for these instead of a concrete `--model`.
- *
- * - session refs (`-c`/`--continue`/`-r`/`--resume`/`--session`/`--session-id`):
- *   a real existing session must restore its OWN saved model. `--models` is a
- *   scope, not a model — pi leaves `options.model` undefined for an existing
- *   session (saved model wins) and only picks `scopedModels[0]` (an mlx model)
- *   for a NEW / unknown / empty session, never a cloud default.
- * - `--provider <p>` (no `--model`): provider-only never selects a model in pi
- *   (`resolveCliModel` needs a `cliModel`), so it would fall through to
- *   `findInitialModel` and an ambient cloud default. `--models mlx/*` forces an
- *   mlx model at the CLI-arg layer, ABOVE settings (global + project) and above
- *   the cloud fallback — immune to a write-once seed failure, a project
- *   `.pi/settings.json` override, or ambient API keys. Injecting a bare
- *   `--model mlx/<id>` here would be WORSE: pi resolves it against `--provider
- *   <p>` via `buildFallbackModel`, minting a bogus CLOUD `<p>/mlx/<id>` custom
- *   model; a `--models` scope carries no provider and cannot. Verified against
- *   pi 0.80.6 `core/model-resolver.js` + `main.js` `buildSessionOptions`.
- * - `--fork`: like the other session carriers, pi restores the copied
- *   session's model because the session already contains messages; the scope
- *   only keeps the model selector/cycling list local and does not replace the
- *   restored model.
- */
-const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
-  '--provider',
+const MODEL_OR_SESSION_CARRIER_ARGS: ReadonlySet<string> = new Set([
+  '-m',
+  '--model',
   '-c',
   '--continue',
   '-r',
   '--resume',
-  '--session',
+  '-s',
   '--session-id',
-  '--fork',
+  '--fork-session',
+  '--load',
 ]);
 
-/** Collect real option names, respecting pi's option values and end-of-options delimiter. */
-function collectPiOptionNames(argv: readonly string[]): Set<string> {
+/** Collect real option names, respecting value-consumers and `--`. */
+function collectAgentOptionNames(argv: readonly string[]): Set<string> {
   const optionNames = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!;
@@ -403,224 +405,70 @@ function collectPiOptionNames(argv: readonly string[]): Set<string> {
   return optionNames;
 }
 
-function injectsConcreteDefault(optionNames: ReadonlySet<string>): boolean {
-  return (
-    !optionNames.has('--models') &&
-    !optionNames.has('--model') &&
-    !Array.from(SESSION_PROVIDER_CARRIER_ARGS).some((arg) => optionNames.has(arg))
-  );
-}
-
 /**
- * Keep a launch on-machine at the AUTHORITATIVE CLI-arg layer (above settings
- * and above pi's cloud fallback). Without this, ambient provider credentials
- * (e.g. a `GROQ_API_KEY` in the shell) make pi's "first available model"
- * fallback pick a CLOUD model over the local ones — the opposite of what
- * `mlx agent` promises. Three cases:
- * - explicit scope ({@link FULL_SUPPRESS_ARGS}) → forward as-is;
- * - session / provider / fork carrier ({@link SESSION_PROVIDER_CARRIER_ARGS}) →
- *   prepend `--models mlx/*` (a local-only scope that preserves session restore
- *   yet blocks a cloud default for a new / unknown / empty session);
- * - explicit model → prepend `--models mlx/*` so the picker starts in the
- *   local scope (the registry boundary separately keeps its `all` view local);
- * - plain fresh run → prepend both the local scope and
- *   `--model mlx/<default>`.
- * Pure function, exported for tests.
+ * Inject `-m <default>` on a fresh run so the session lands on the locally
+ * chosen default. Suppressed entirely when the user picked a model or named a
+ * session to resume — the binary's catalog comes from `/v1/models`, so every
+ * listed model is already local; no provider-scope juggling remains.
  */
 export function withDefaultModel(passthrough: string[], defaultModelId: string): string[] {
-  // Classify over OPTION NAMES, not raw tokens: a value token that merely looks
-  // like an option (`--system-prompt --model` → "--model" is systemPrompt's
-  // VALUE, not an option) must not drive the decision. Walk left→right and, just
-  // like pi's parser (`args[++i]`), skip the token after any unconditional
-  // value-consumer so only real option names remain. A sentinel that is itself
-  // a consumer both classifies AND skips its own following value in this one
-  // pass; a sentinel consumed as some earlier option's value is skipped here and
-  // never classifies.
-  const optionNames = collectPiOptionNames(passthrough);
-
-  // Fail-closed default is to inject a LOCAL model and LOCAL picker scope.
-  // Suppress only when the user supplied an explicit scope. A concrete model
-  // still needs the scope: --model selects one model but pi otherwise exposes
-  // every authenticated provider in /model.
-  if (Array.from(FULL_SUPPRESS_ARGS).some((arg) => optionNames.has(arg))) {
+  const optionNames = collectAgentOptionNames(passthrough);
+  if (Array.from(MODEL_OR_SESSION_CARRIER_ARGS).some((arg) => optionNames.has(arg))) {
     return passthrough;
   }
-  if (optionNames.has('--model')) {
-    return ['--models', 'mlx/*', ...passthrough];
-  }
-  if (Array.from(SESSION_PROVIDER_CARRIER_ARGS).some((arg) => optionNames.has(arg))) {
-    return ['--models', 'mlx/*', ...passthrough];
-  }
-  return ['--models', 'mlx/*', '--model', `mlx/${defaultModelId}`, ...passthrough];
+  return ['-m', defaultModelId, ...passthrough];
 }
 
-/** A `defaultProvider`/`defaultModel` pair persisted by pi's `/model`. */
-export interface PersistedPiDefault {
-  provider: string;
+/** The default model id grok's `[models]` table persisted. */
+export interface PersistedGrokDefault {
   modelId: string;
 }
 
 /**
- * Resolve pi's agent config home the way `runAgent`'s env seeding will:
- * an explicit `PI_CODING_AGENT_DIR` wins — run through {@link expandPiAgentDir}
- * to match pi's own tilde/file-URL expansion — else `~/.mlx-node/agent`
- * (the value `runAgent` seeds). An explicitly passed `agentDir` (test seam)
- * is used verbatim. May throw only via `expandPiAgentDir` (e.g. a malformed
- * `file://` URL); callers wrap this in their own try/catch. Shared by the
- * persisted-default reader and writer so both open the SAME settings.json.
+ * Read the persisted `[models] default = "…"` the binary wrote to
+ * `~/.mlx-agent/config.toml` (its `/model` picker persists there). Minimal
+ * line scan — TOML parsing is not worth a dependency for one key.
  */
-function resolvePiAgentDir(agentDir?: string): string {
-  const envDir = process.env.PI_CODING_AGENT_DIR;
-  return agentDir ?? (envDir ? expandPiAgentDir(envDir) : join(homedir(), '.mlx-node', 'agent'));
-}
-
-/**
- * Read pi's persisted `/model` default from the agent config home:
- * `<agentDir>/settings.json`, fields `defaultProvider` + `defaultModel`
- * (pi's `SettingsManager.setDefaultModelAndProvider` writes them to the
- * GLOBAL-scope file, i.e. this one). The dir mirrors what pi itself
- * will resolve after `runAgent`'s env seeding (see {@link resolvePiAgentDir}).
- * Absent, malformed, or unresolvable settings mean "no persisted default",
- * never an error.
- */
-export function readPersistedDefaultModel(agentDir?: string): PersistedPiDefault | undefined {
+export function readPersistedDefaultModel(agentDir?: string): PersistedGrokDefault | undefined {
   try {
-    const dir = resolvePiAgentDir(agentDir);
-    const parsed: unknown = JSON.parse(readFileSync(join(dir, 'settings.json'), 'utf8'));
-    if (typeof parsed !== 'object' || parsed === null) {
-      return undefined;
-    }
-    const { defaultProvider, defaultModel } = parsed as Record<string, unknown>;
-    if (typeof defaultProvider !== 'string' || defaultProvider.length === 0) {
-      return undefined;
-    }
-    if (typeof defaultModel !== 'string' || defaultModel.length === 0) {
-      return undefined;
-    }
-    return { provider: defaultProvider, modelId: defaultModel };
+    const dir = agentDir ?? process.env.GROK_HOME ?? join(homedir(), '.mlx-agent');
+    const text = readFileSync(join(dir, 'config.toml'), 'utf8');
+    const match = text.match(/^\s*default\s*=\s*"([^"]+)"/m);
+    if (!match?.[1]) return undefined;
+    return { modelId: match[1] };
   } catch {
     return undefined;
   }
 }
 
 /**
- * Persist an mlx `/model` default into `<agentDir>/settings.json`
- * (`defaultProvider` + `defaultModel`), PRESERVING every existing field.
- *
- * This is the belt half of the local-first guarantee for pi's session /
- * provider paths, which suppress the `--model` injection: pi's
- * `findInitialModel` consults this persisted default (step 3) ABOVE its
- * "first available cloud model" fallback (step 4) and BELOW a restored
- * session's own model, so seeding an mlx default keeps a `-c`/`--session`/
- * provider-only launch on-machine instead of silently picking a cloud
- * model that an ambient API key made available.
- *
- * Callers gate this to WRITE-ONCE (only when no default is persisted) so a
- * later user `/model` pick is never overwritten. Best-effort by contract:
- * ANY I/O failure is swallowed — a settings write must never crash the
- * launch (the `--model` injection on plain fresh runs remains the fallback).
- * The dir resolves IDENTICALLY to {@link readPersistedDefaultModel}.
- */
-export function writePersistedDefaultModel(provider: string, modelId: string, agentDir?: string): void {
-  try {
-    const dir = resolvePiAgentDir(agentDir);
-    const path = join(dir, 'settings.json');
-
-    // Never CLOBBER a present-but-recoverable settings.json: pi treats a
-    // malformed/unreadable file as a LOAD ERROR and refuses to overwrite it, so
-    // the seed only fires on a genuinely-absent file or a valid settings object.
-    // Split the read by failure reason:
-    let existing: string;
-    try {
-      existing = readFileSync(path, 'utf8');
-    } catch (readError) {
-      // ENOENT = the file genuinely does not exist → seed a fresh, minimal file.
-      // Any OTHER read error (EACCES/EISDIR/ENOTDIR/…) → a present file we cannot
-      // read: leave it untouched rather than risk clobbering recoverable settings.
-      if ((readError as NodeJS.ErrnoException).code === 'ENOENT') {
-        mkdirSync(dir, { recursive: true });
-        const fresh = { defaultProvider: provider, defaultModel: modelId };
-        writeFileSync(path, `${JSON.stringify(fresh, null, 2)}\n`, 'utf8');
-      }
-      return;
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(existing);
-    } catch {
-      // Present but not valid JSON → recoverable by the user; do NOT overwrite.
-      console.error(`mlx agent: ${path} is not valid JSON; leaving it untouched (no default seeded)`);
-      return;
-    }
-    // Valid JSON but not a plain settings object (array / string / number /
-    // null) → treat as malformed and SKIP; only a real object is safe to merge.
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      return;
-    }
-
-    const settings = parsed as Record<string, unknown>;
-    settings['defaultProvider'] = provider;
-    settings['defaultModel'] = modelId;
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
-  } catch {
-    // Settings I/O failure must not abort the launch.
-  }
-}
-
-/**
- * Pick the model id {@link withDefaultModel} injects on a fresh run. pi
- * only consults its persisted default AFTER CLI args, and `mlx agent`
- * always passes `--model` on fresh runs — so the injection itself must
- * honor the user's persisted `/model` pick:
- * - persisted `mlx/<id>` still discovered → inject that id;
- * - persisted `mlx/<id>` no longer discovered → first discovered model;
- * - persisted NON-mlx provider → deliberately overridden — this command
- *   is local-first/offline — but announced via `notice` (stderr), never
- *   silently.
+ * Pick the `-m` value {@link withDefaultModel} injects on a fresh run:
+ * a still-discovered persisted pick, else the first discovered model.
  */
 export function chooseDefaultModel(
-  models: readonly MlxModelInfo[],
-  persisted: PersistedPiDefault | undefined,
+  models: readonly string[],
+  persisted: PersistedGrokDefault | undefined,
 ): { modelId: string; notice?: string } {
-  const fallback = models[0]!.discovered.name;
-  if (persisted === undefined) {
-    return { modelId: fallback };
+  const fallback = models[0]!;
+  if (persisted !== undefined && models.includes(persisted.modelId)) {
+    return { modelId: persisted.modelId };
   }
-  if (persisted.provider === 'mlx') {
-    const match = models.find((model) => model.discovered.name === persisted.modelId);
-    return { modelId: match ? match.discovered.name : fallback };
-  }
-  return {
-    modelId: fallback,
-    notice:
-      `mlx agent: persisted default ${persisted.provider}/${persisted.modelId} is not a local mlx model; ` +
-      `using mlx/${fallback} (this agent runs offline — pass --model to pick another local model)`,
-  };
+  return { modelId: fallback };
 }
 
 /**
- * mlx-side help text; pi's full flag list is appended by forwarding `--help`.
- * Exported so a test can assert the `--no-persist-cache` copy matches the
- * allowlist it actually applies to — the old wording named qwen3 alone and
- * promised "other families unaffected", which running it on qwen3_5_moe
- * disproved.
+ * mlx-side help text; the binary's own flag list prints via a forwarded
+ * `--help` (it exits before serving). Exported so tests can assert the
+ * `--no-persist-cache` copy matches the allowlist it applies to.
  */
 export function agentPreambleText(): string {
   return `
-mlx agent — local coding agent (pi) running fully offline on MLX
+mlx agent — Grok Build coding agent running fully offline on MLX
 
 Usage:
-  mlx agent [options] [@file ...]
+  mlx agent [options]
 
-Thinking controls (shared with mlx delegate):
-  --thinking <level>    off, minimal, low, medium, high, xhigh, max.
-                       Qwen3.8: minimal=low, high/max=xhigh.
-  --thinking-budget <n> Optional hard cap on reasoning tokens per model turn.
-                       0 closes thinking immediately; omitted means no cap.
-
-mlx options (handled before pi sees the args):
+mlx options (handled before the agent binary sees the args):
   --models-dir <dir>        Local models directory (default: ~/.mlx-node/models;
                             also via MLX_MODELS_DIR or ~/.mlx-node/config.json).
                             Dash-leading paths need the --models-dir=<dir> form.
@@ -633,56 +481,51 @@ mlx options (handled before pi sees the args):
                             every other family never persists, flag or not.
 
 First run: when no local model exists, an interactive wizard offers a curated
-download. Agent config home: ~/.mlx-node/agent (override: PI_CODING_AGENT_DIR).
+download. Agent config home: ~/.mlx-agent (override: GROK_HOME).
 
 Environment:
-  MLX_AGENT_AUTO_APPROVE=1  Auto-approve bash/write/edit/subagent tool calls in headless
-                            print/json runs — without an attached UI the
-                            permission gate blocks them otherwise.
-  MLX_AGENT_ENABLE_GEMMA_DRAFT=1
-                            Use an embedded Gemma4 draft for flat speculative
-                            decoding instead of the default paged AR path.
+  MLX_AGENT_BIN             Path to a locally built agent binary (dev override;
+                            default: <repo>/grok-build/target/release/mlx-agent,
+                            then the prebuilt download under ~/.mlx-node/bin).
+  MLX_CLI_ENTRY             Path to this CLI's entry point, used to spawn the
+                            inference host (default: the running 'mlx' bin).
   MLX_NODE_LOG              Override the Rust tracing target filter used by --trace.
   MLX_NODE_LOG_FILE         Override the Rust tracing log file used by --trace.
 
 Notes:
-  The built-in subagent tool provides scout/planner/reviewer/worker. Each child
-  is an isolated in-memory Pi session inside the parent process. Child sessions
-  share one resident model/cache host; up to four tool loops may overlap while
-  model inference is serialized. When the mlx-node app engine is running,
-  agents reuse it; cache/draft settings are managed by the app. Connection errors
-  never start another engine. Otherwise, mlx agent uses in-process inference
-  and mlx delegate calls share a background inference service.
-  --no-extensions (or -ne) disables subagents as well as
-  discovered extensions.
+  The agent binary is the forked Grok Build TUI. It discovers models from the
+  spawned inference host's /v1/models and speaks the Anthropic Messages wire
+  protocol (/v1/messages) — the same path 'mlx launch claude' uses.
   'mlx agent update' is disabled — update @mlx-node/cli via your package
-  manager instead. 'install'/'remove'/'list' manage pi extensions, themes and
-  skills under the agent config home; 'config' edits which are enabled.
+  manager instead. Subcommands (models, sessions, export, doctor, mcp, plugin,
+  memory, config, leader, login, logout, setup, share, usage, wrap, trace)
+  pass through to the binary and run without the inference host.
 
-pi options:`;
+Binary options:
+`;
 }
 
-/** @internal Print {@link agentPreambleText} ahead of pi's own flag list. */
+/** @internal Print {@link agentPreambleText} ahead of the binary's flag list. */
 function printAgentPreamble(): void {
   console.log(agentPreambleText());
 }
 
 /**
- * Injectable seams for {@link run}'s argv-routing tests. Production
- * leaves them unset and fills each via the deferred dynamic imports;
- * types are `typeof import(...)` lookups (erased at compile time) so the
- * module stays importable without the native addon.
+ * Injectable seams for {@link run}'s argv-routing tests. Production leaves
+ * them unset and fills each via the deferred imports; types are `typeof
+ * import(...)` lookups (erased at compile time) so the module stays importable
+ * without the native addon.
  */
 export interface AgentRunDeps {
   resolveModelsDir?: (typeof import('@mlx-node/server/host/paths'))['resolveModelsDir'];
-  discoverMlxModels?: (typeof import('@mlx-node/agent'))['discoverMlxModels'];
-  runAgent?: (typeof import('@mlx-node/agent'))['runAgent'];
+  /** Discover local chat models (native-free path via @mlx-node/lm). */
+  discoverModels?: (dir: string) => Promise<{ name: string }[]>;
+  /** Spawn the inference host + agent binary. */
+  launch?: (opts: GrokAgentLaunchOptions) => Promise<number>;
   /** Whole first-run wizard step (imports + IO wiring included). */
   wizard?: (modelsDir: string) => Promise<void>;
-  /** Persisted-`/model` reader; production = {@link readPersistedDefaultModel}. */
+  /** Persisted-default reader; production = {@link readPersistedDefaultModel}. */
   readPersistedDefault?: typeof readPersistedDefaultModel;
-  /** Persisted-`/model` writer; production = {@link writePersistedDefaultModel}. */
-  writePersistedDefault?: (provider: string, modelId: string) => void;
 }
 
 /** Production wizard step: interactive catalog pick + download. */
@@ -701,12 +544,14 @@ async function runProductionWizard(modelsDir: string): Promise<void> {
   });
 }
 
-export async function run(
-  argv: string[],
-  deps: AgentRunDeps = {},
-  mode?: 'delegate',
-  delegateCallerApproved?: boolean,
-): Promise<void> {
+/** Discover model names only (native-free); production = @mlx-node/lm discovery. */
+async function discoverModelNames(modelsDir: string): Promise<{ name: string }[]> {
+  const { discoverLocalChatModels } = await import('@mlx-node/lm/model-discovery');
+  const models = await discoverLocalChatModels(modelsDir);
+  return models.map((m) => ({ name: m.name }));
+}
+
+export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void> {
   const scan = scanAgentArgs(argv);
 
   if (scan.update) {
@@ -727,43 +572,31 @@ export async function run(
     return;
   }
 
-  // Must run before the deferred `@mlx-node/agent` import below. The native
-  // tracing subscriber is installed while the native addon initializes.
-  const traceLogFile = configureAgentTracing(scan);
+  // Must run before the spawned `mlx serve` starts so its native tracing
+  // subscriber picks up the env we export here.
+  configureAgentTracing(scan);
 
-  // Deferred imports: `@mlx-node/agent` loads the native addon and the
-  // pure `scanAgentArgs` export above must stay importable without it.
-  const resolveModelsDir = deps.resolveModelsDir ?? (await import('@mlx-node/server/host/paths')).resolveModelsDir;
-  const runAgent = deps.runAgent ?? (await import('@mlx-node/agent')).runAgent;
-
-  const modelsDir = resolveModelsDir(scan.modelsDir);
+  const launch = deps.launch ?? launchGrokAgent;
 
   if (scan.help) {
     printAgentPreamble();
-    // pi appends its full flag list and process.exit(0)s on this path.
-    await runAgent({ modelsDir, models: [], argv: ['--help'], traceLogFile });
+    // The binary prints its full flag list and exits; no server needed.
+    process.exitCode = await launch({ argv: ['--help'], needsServer: false });
     return;
   }
 
-  // Pass-through commands (install/remove/uninstall/list/config) must
-  // reach pi with the command still at args[0] — pi's
-  // `parsePackageCommand` and `handleConfigCommand` both read ONLY
-  // args[0], so a prepended `--model` would knock them into the agent
-  // prompt path. pi one-shots (`--version`/`-v`, `--export <file>`) exit
-  // inside pi before any model resolution. Neither needs a model: skip
-  // discovery, the first-run wizard and default-model injection, and
-  // forward verbatim. `--list-models` is deliberately NOT routed here:
-  // with zero models pi prints a dead-end "/login" hint (this agent is
-  // offline-only, /login cannot produce a local model), while the wizard
-  // path downloads a model in a TTY — then actually lists it — or prints
-  // the exact `mlx download model` commands headless.
-  if (PI_PASSTHROUGH_COMMANDS.has(scan.passthrough[0] ?? '') || scan.piOneShot) {
-    await runAgent({ modelsDir, models: [], argv: scan.passthrough, traceLogFile });
+  // One-shots and binary subcommands (models/sessions/export/…) resolve and
+  // exit inside the binary — forward verbatim with no server and no wizard.
+  if (scan.grokOneShot) {
+    process.exitCode = await launch({ argv: scan.passthrough, needsServer: false });
     return;
   }
 
-  const discoverMlxModels = deps.discoverMlxModels ?? (await import('@mlx-node/agent')).discoverMlxModels;
-  let models = await discoverMlxModels(modelsDir);
+  const resolveModelsDir = deps.resolveModelsDir ?? (await import('@mlx-node/server/host/paths')).resolveModelsDir;
+  const discover = deps.discoverModels ?? discoverModelNames;
+  const modelsDir = resolveModelsDir(scan.modelsDir);
+
+  let models = await discover(modelsDir);
 
   if (models.length === 0) {
     try {
@@ -774,7 +607,7 @@ export async function run(
       return;
     }
 
-    models = await discoverMlxModels(modelsDir);
+    models = await discover(modelsDir);
     if (models.length === 0) {
       console.error(`No usable model found in ${modelsDir} after the download.`);
       console.error(
@@ -787,33 +620,14 @@ export async function run(
   }
 
   const persisted = (deps.readPersistedDefault ?? readPersistedDefaultModel)();
-  const { modelId, notice } = chooseDefaultModel(models, persisted);
-  // Write-once belt: seed an mlx default into pi's settings.json when none is
-  // persisted yet. The AUTHORITATIVE guard for the session / provider carrier
-  // paths is the `--models mlx/*` scope injected by withDefaultModel (CLI-arg
-  // layer, above settings) — this seed is belt-and-suspenders: it gives pi's
-  // `/model` a starting default and keeps `findInitialModel` step-3 on-machine
-  // if the scope is ever bypassed. Only when unset, so a later user `/model`
-  // pick is never overwritten; the writer swallows I/O failures, so a bad
-  // settings file can't crash launch.
-  if (persisted === undefined) {
-    (deps.writePersistedDefault ?? writePersistedDefaultModel)('mlx', modelId);
-  }
-  const passthroughOptionNames = collectPiOptionNames(scan.passthrough);
+  const { modelId } = chooseDefaultModel(
+    models.map((m) => m.name),
+    persisted,
+  );
   const agentArgv = withDefaultModel(scan.passthrough, modelId);
-  // A notice only makes sense when a concrete default actually overrode a
-  // non-mlx persisted default. Adding the local picker scope around an explicit
-  // --model does not override that explicit choice and must stay silent.
-  if (notice !== undefined && injectsConcreteDefault(passthroughOptionNames)) {
-    console.error(notice);
-  }
 
-  await runAgent({
-    modelsDir,
-    models,
+  process.exitCode = await launch({
     argv: agentArgv,
-    traceLogFile,
-    persistPagedCache: scan.persistPagedCache,
-    ...(mode ? { mode, delegateCallerApproved } : {}),
+    modelsDir,
   });
 }

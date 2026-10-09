@@ -15,14 +15,44 @@ For CI, verify the exact head commit and distinguish failed, pending, skipped an
 
 /** Context and skills belong to the caller; it supplies the bounded task/evidence. */
 export const DELEGATE_DEFAULT_ARGS = [
-  '--print',
-  '--system-prompt',
+  '--system-prompt-override',
   DELEGATE_SYSTEM_PROMPT,
   '--tools',
-  'read,bash',
-  '--no-context-files',
-  '--no-skills',
+  'read_file,run_terminal_command',
+  // Headless workers cannot answer a permission prompt; the background
+  // classifier auto-reviews each tool call instead of blocking the turn.
+  '--permission-mode',
+  'auto',
 ];
+
+/** Delegate/mlx-owned flags (not grok options) that still consume the next token as their value. */
+const DELEGATE_VALUE_FLAGS = new Set(['--models-dir', '--trace-dir', '--repo', '--pr']);
+
+/** `-p` takes the prompt as its VALUE — fold every bare positional into it. */
+function foldPositionalsIntoPrint(argv: string[]): string[] {
+  const positionals: string[] = [];
+  const rest: string[] = [];
+  let positionalOnly = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (!positionalOnly && arg === '--') {
+      positionalOnly = true;
+      continue;
+    }
+    if (!positionalOnly && (agentOptionConsumesNext(argv, i) || DELEGATE_VALUE_FLAGS.has(arg!))) {
+      rest.push(arg);
+      if (i + 1 < argv.length) rest.push(argv[++i]!);
+      continue;
+    }
+    if (positionalOnly || !arg.startsWith('-')) {
+      positionals.push(arg);
+      continue;
+    }
+    rest.push(arg);
+  }
+  if (positionals.length === 0) return argv;
+  return ['-p', positionals.join(' '), ...rest];
+}
 
 /** Preserve the installed `delegate github` instruction without a second agent implementation. */
 export function parseDelegateArgs(argv: string[]): { args: string[]; callerApproved: boolean } {
@@ -95,8 +125,13 @@ export function parseDelegateArgs(argv: string[]): { args: string[]; callerAppro
 
   const scan = scanAgentArgs(args);
   // Keep agent metadata and package commands working, including their normal exit/help behavior.
-  if (scan.help || scan.piOneShot || AGENT_COMMANDS.has(scan.passthrough[0] ?? '')) return { args, callerApproved };
-  return { args: [...DELEGATE_DEFAULT_ARGS, ...args], callerApproved };
+  if (scan.help || scan.grokOneShot || AGENT_COMMANDS.has(scan.passthrough[0] ?? '')) {
+    return { args, callerApproved };
+  }
+  const defaults = callerApproved
+    ? DELEGATE_DEFAULT_ARGS.slice(0, -2).concat('--permission-mode', 'bypassPermissions')
+    : DELEGATE_DEFAULT_ARGS;
+  return { args: [...defaults, ...foldPositionalsIntoPrint(args)], callerApproved };
 }
 
 export function delegateAgentArgs(argv: string[]): string[] {
@@ -109,23 +144,21 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     console.log(`Usage: mlx delegate [--caller-approved] [agent options] 'PROMPT'
        mlx delegate github [--repo OWNER/REPO] [--pr NUMBER] [--caller-approved] [--allow-write] [agent options] 'TASK'
 
-Uses the mlx agent runtime, model settings, session storage, cache and metrics.
-Delegate calls automatically share one background inference service and one
-resident model. Independent sessions decode concurrently when the model supports
-batching; other models queue in that service. It exits after five idle minutes.
-The worker has a focused prompt and read/bash tools, without local subagents,
-project instruction files or skills. Explicit agent prompt/tool options still apply.
-When launched by Codex, tools run inside the caller's inherited process sandbox
-without a second approval UI. For Claude Code, Grok, or another caller, pass
---caller-approved only after approving the bounded task and its tool execution.
-This opt-in inherits OS restrictions; it does not copy the caller's tool approval
-rules or grant extra access. Blocked operations return a handoff to the caller.
-Read the final print-mode handoff once. Use --mode json for debugging the full
-agent event stream, or --session for a focused follow-up on a saved task.
+Uses the mlx agent runtime (grok build) against a locally spawned mlx serve.
+The worker runs headless (-p) with a focused prompt and read_file +
+run_terminal_command tools. Explicit agent prompt/tool options still apply.
+Without --caller-approved, tool calls are auto-reviewed
+(--permission-mode auto). For Claude Code, Grok, or another caller, pass
+--caller-approved only after approving the bounded task and its tool
+execution; it switches the worker to --permission-mode bypassPermissions.
+This opt-in inherits OS restrictions; it does not copy the caller's tool
+approval rules or grant extra access.
+Read the final print-mode output once. Use --output-format json for the full
+event stream, or -r/--resume for a focused follow-up on a saved session.
 While waiting, check process completion instead of dumping worker transcripts.
 The github form supplies task context; --allow-write does not grant sandbox access.
 
 All mlx agent options follow:`);
   }
-  await runAgent(args, deps, 'delegate', callerApproved);
+  await runAgent(args, deps);
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vite-plus/test';
 
-import { scanAgentArgs, withDefaultModel } from '../src/commands/agent/index.js';
+import type { AgentRunDeps } from '../src/commands/agent/index.js';
 import {
   DELEGATE_DEFAULT_ARGS,
   DELEGATE_SYSTEM_PROMPT,
@@ -9,18 +9,40 @@ import {
   run,
 } from '../src/commands/delegate.js';
 
+const APPROVED_DEFAULT_ARGS = [
+  ...DELEGATE_DEFAULT_ARGS.slice(0, -2),
+  '--permission-mode',
+  'bypassPermissions',
+];
+
 describe('delegate agent arguments', () => {
-  it('accepts a general prompt with normal agent options and stdin/file inputs', () => {
-    const args = ['--thinking', 'high', '--mode', 'json', '--session', 'session-id', '@context.md', 'Explain this'];
-    expect(delegateAgentArgs(args)).toEqual([...DELEGATE_DEFAULT_ARGS, ...args]);
+  it('injects the worker profile and folds positionals into -p ahead of the parsed args', () => {
+    const args = ['--reasoning-effort', 'high', '--resume', 'session-id', '@context.md', 'Explain this'];
+    expect(delegateAgentArgs(args)).toEqual([
+      ...DELEGATE_DEFAULT_ARGS,
+      '-p',
+      '@context.md Explain this',
+      '--reasoning-effort',
+      'high',
+      '--resume',
+      'session-id',
+    ]);
+    expect(DELEGATE_DEFAULT_ARGS).toEqual([
+      '--system-prompt-override',
+      DELEGATE_SYSTEM_PROMPT,
+      '--tools',
+      'read_file,run_terminal_command',
+      '--permission-mode',
+      'auto',
+    ]);
   });
 
   it('keeps agent metadata and package commands usable without prompt mode', () => {
     for (const args of [
       ['--help'],
       ['--version'],
-      ['--export', 'session.jsonl'],
-      ['install', 'npm:extension'],
+      ['export', 'session.jsonl'],
+      ['config'],
       ['update'],
     ]) {
       expect(delegateAgentArgs(args)).toEqual(args);
@@ -33,12 +55,12 @@ describe('delegate agent arguments', () => {
       const { args, callerApproved } = parseDelegateArgs([...prefix, '--caller-approved', 'Check PR #148']);
       expect(callerApproved).toBe(true);
       expect(args).not.toContain('--caller-approved');
-      expect(args.at(-1)).toBe('Check PR #148');
+      expect(args[args.indexOf('-p') + 1]).toBe('Check PR #148');
     },
   );
 
   it.each([
-    ['--system-prompt', '--caller-approved'],
+    ['--system-prompt-override', '--caller-approved'],
     ['github', '--append-system-prompt', '--caller-approved'],
     ['github', '--', '--caller-approved'],
     ['--models-dir', '--caller-approved'],
@@ -51,24 +73,24 @@ describe('delegate agent arguments', () => {
     expect(() => parseDelegateArgs(['github', '--caller-approved=false', 'Task'])).toThrow('takes no value');
   });
 
-  it.each([false, true])('forwards approval only to the delegate runtime (%s)', async (approved) => {
-    const runAgent = vi.fn<NonNullable<import('../src/commands/agent/index.js').AgentRunDeps['runAgent']>>(
-      async () => {},
-    );
+  it.each([
+    [false, 'auto'],
+    [true, 'bypassPermissions'],
+  ])('forwards approval as the worker permission mode (%s → %s)', async (approved, mode) => {
+    const launch = vi.fn<NonNullable<AgentRunDeps['launch']>>(async () => 0);
     await run(['github', ...(approved ? ['--caller-approved'] : []), '--repo', 'owner/repo', 'Check PR #148'], {
       resolveModelsDir: () => '/models',
-      discoverMlxModels: async () => [
-        { discovered: { name: 'local', path: '/models/local', modelType: 'qwen3' }, piModel: {} } as never,
-      ],
-      readPersistedDefault: () => ({ provider: 'mlx', modelId: 'local' }),
-      runAgent,
+      discoverModels: async () => [{ name: 'local' }],
+      readPersistedDefault: () => ({ modelId: 'local' }),
+      launch,
     });
-    expect(runAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ mode: 'delegate', delegateCallerApproved: approved }),
-    );
-    expect(runAgent.mock.calls[0]?.[0]).not.toEqual(
-      expect.objectContaining({ argv: expect.arrayContaining(['--caller-approved']) }),
-    );
+    expect(launch).toHaveBeenCalledOnce();
+    const options = launch.mock.calls[0]![0];
+    expect(options).toMatchObject({ modelsDir: '/models' });
+    expect(options.argv).toContain('--permission-mode');
+    expect(options.argv[options.argv.indexOf('--permission-mode') + 1]).toBe(mode);
+    expect(options.argv).not.toContain('--caller-approved');
+    expect(options.argv[options.argv.indexOf('-p') + 1]).toContain('Check PR #148');
   });
 
   it('uses a focused worker prompt with the installed GitHub context', () => {
@@ -78,51 +100,47 @@ describe('delegate agent arguments', () => {
     expect(context).toContain('GitHub repository: owner/repo.');
     expect(context).toContain('Pull request: #42.');
     expect(context).toContain('read-only');
-    expect(args.at(-1)).toBe('Explain failed checks');
+    expect(args[args.indexOf('-p') + 1]).toBe('Explain failed checks');
     expect(DELEGATE_SYSTEM_PROMPT).toContain('Do not invoke another agent');
   });
 
-  it('accepts authorized-write context without granting permission or disabling tools', () => {
+  it('accepts authorized-write context without granting permission or widening tools', () => {
     const args = delegateAgentArgs(['github', '--allow-write', '--repo=owner/repo', 'Post the approved comment']);
     expect(args[args.indexOf('--append-system-prompt') + 1]).toContain('explicitly authorized');
     expect(args).not.toContain('--allow-write');
-    expect(args[args.indexOf('--tools') + 1]).toBe('read,bash');
-    expect(args).not.toContain('--no-extensions');
+    expect(args[args.indexOf('--tools') + 1]).toBe('read_file,run_terminal_command');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('auto');
   });
 
-  it.each(['--system-prompt', '--append-system-prompt', '--model', '--session', '--extension'])(
+  it.each(['--system-prompt-override', '--append-system-prompt', '--model', '--resume', '--permission-mode'])(
     'does not consume a GitHub-looking value belonging to %s',
     (option) => {
       const args = delegateAgentArgs(['github', option, '--repo', '--pr', '42', 'Task']);
-      expect(args.slice(-3)).toEqual([option, '--repo', 'Task']);
-      expect(args[DELEGATE_DEFAULT_ARGS.length + 1]).toContain('Pull request: #42.');
+      expect(args.slice(-2)).toEqual([option, '--repo']);
+      expect(args[args.indexOf('-p') + 1]).toBe('Task');
+      expect(args[args.indexOf('--append-system-prompt') + 1]).toContain('Pull request: #42.');
     },
   );
 
-  it('respects the end-of-options delimiter through model selection', () => {
+  it('treats tokens after -- as literal prompt text', () => {
     const args = delegateAgentArgs(['github', '--repo', 'owner/repo', '--', '--model', '--repo', '--no-persist-cache']);
-    expect(args.slice(-4)).toEqual(['--', '--model', '--repo', '--no-persist-cache']);
-    const scan = scanAgentArgs(args);
-    expect(scan.persistPagedCache).toBe(true);
-    expect(withDefaultModel(scan.passthrough, 'local').slice(0, 4)).toEqual([
-      '--models',
-      'mlx/*',
-      '--model',
-      'mlx/local',
-    ]);
+    expect(args).not.toContain('--');
+    expect(args[args.indexOf('-p') + 1]).toBe('--model --repo --no-persist-cache');
+    expect(args[args.indexOf('--append-system-prompt') + 1]).toContain('GitHub repository: owner/repo.');
   });
 
   it('keeps print prompts and conditional agent option values opaque', () => {
     const args = delegateAgentArgs([
       'github',
-      '--print',
+      '-p',
       'Task --repo other/repo',
-      '--use-theme',
-      'dark',
+      '--permission-mode',
+      'auto',
       '--repo',
       'owner/repo',
     ]);
-    expect(args.slice(-4)).toEqual(['--print', 'Task --repo other/repo', '--use-theme', 'dark']);
+    expect(args[args.indexOf('-p') + 1]).toBe('Task --repo other/repo');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('auto');
     expect(args[args.indexOf('--append-system-prompt') + 1]).toContain('GitHub repository: owner/repo.');
   });
 
@@ -134,5 +152,20 @@ describe('delegate agent arguments', () => {
     ['github', '--pr', 'not-a-number'],
   ])('rejects invalid compatibility arguments before starting an agent: %j', (...args) => {
     expect(() => delegateAgentArgs(args)).toThrow();
+  });
+
+  it('prints delegate usage on --help and forwards --help to the agent binary without a server', async () => {
+    const launch = vi.fn<NonNullable<AgentRunDeps['launch']>>(async () => 0);
+    const stdout = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const previous = process.exitCode;
+    try {
+      await run(['--help'], { launch });
+      expect(stdout).toHaveBeenCalledWith(expect.stringContaining('Usage: mlx delegate'));
+      expect(launch).toHaveBeenCalledWith({ argv: ['--help'], needsServer: false });
+      expect(process.exitCode).toBe(0);
+    } finally {
+      process.exitCode = previous;
+      vi.restoreAllMocks();
+    }
   });
 });

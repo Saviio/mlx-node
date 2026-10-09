@@ -9,6 +9,8 @@ export interface DiscoveredModel {
   path: string;
   modelType: ModelType;
   preset: LaunchPreset;
+  contextWindow: number;
+  supportsImages: boolean;
 }
 
 /**
@@ -16,10 +18,14 @@ export interface DiscoveredModel {
  * supported GGUF files and their quant variants. No weights are loaded here.
  */
 export async function discoverModels(dir: string, opts?: DiscoveryScanOptions): Promise<DiscoveredModel[]> {
-  return (await discoverLocalChatModels(dir, opts)).map(({ name, path, modelType, preset }) => ({
-    name,
-    path,
-    modelType,
-    preset,
-  }));
+  return (await discoverLocalChatModels(dir, opts)).map(
+    ({ name, path, modelType, preset, contextWindow, supportsImages }) => ({
+      name,
+      path,
+      modelType,
+      preset,
+      contextWindow,
+      supportsImages,
+    }),
+  );
 }

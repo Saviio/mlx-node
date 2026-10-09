@@ -193,6 +193,14 @@ export function makeSwapController(
       object: 'model',
       created,
       owned_by: 'mlx-node',
+      // Grok Build prefetch contract: it defaults `api_backend` to
+      // chat_completions, a route this host does not serve. "messages"
+      // (Anthropic wire) is the backend this router fully supports —
+      // the same path `mlx launch claude` drives — so always pin it.
+      context_window: entry.contextWindow,
+      api_backend: 'messages',
+      model_family: String(entry.modelType),
+      supports_images: entry.supportsImages,
     }));
   }
 

@@ -33,6 +33,8 @@ function discovered(names: string[]): DiscoveredModel[] {
       sampling: { temperature: 0.6, topP: 0.95, topK: 20, minP: 0, presencePenalty: 0, repetitionPenalty: 1 },
       maxOutputTokens: 1024,
     },
+    contextWindow: 262144,
+    supportsImages: false,
   }));
 }
 

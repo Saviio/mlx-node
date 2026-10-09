@@ -22,7 +22,7 @@ Commands:
   redact             Redact PII from text using a privacy-filter model
   serve              Serve local models over an Anthropic/OpenAI-compatible API
   launch claude      Start a local server and spawn Claude Code pointed at it
-  agent              Start the local coding agent (pi-based, fully offline)
+  agent              Start the local coding agent (grok build fork, fully offline)
   delegate           Run the local agent with a prompt and exit
 
 Options:

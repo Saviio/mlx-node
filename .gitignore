@@ -218,4 +218,5 @@ __pycache__/
 *.metallib
 .vite-agent
 /Model-Optimizer
+/grok-build
 .vitest/
