@@ -2644,6 +2644,21 @@ export declare class TextRecModel {
   recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
 }
 
+export declare class TtsNativeModel {
+  static load(path: string, optionsJson?: string | undefined | null): Promise<TtsNativeModel>;
+  get metadata(): string;
+  start(text: string, optionsJson: string): TtsNativeStream;
+  prepareVoice(audio: Float32Array, sampleRate: number, transcript: string): Promise<string>;
+  releaseVoice(id: string): Promise<undefined>;
+  dispose(): Promise<undefined>;
+}
+
+export declare class TtsNativeStream {
+  next(): Promise<TtsNativeChunk | undefined | null>;
+  waitFinished(): Promise<undefined>;
+  cancel(): void;
+}
+
 export declare class VlmChatResult {
   get text(): string;
   get tokens(): MxArray;
@@ -6044,6 +6059,14 @@ export interface TrainStepResultWithOutputs {
   outputsJson?: string;
   /** Actual token counts for each completion (for accurate TUI display) */
   completionLengths: Array<number>;
+}
+
+export interface TtsNativeChunk {
+  samples: Float32Array;
+  finished: boolean;
+  finishReason?: string;
+  synthesisMs?: number;
+  firstPcmMs?: number;
 }
 
 /**
