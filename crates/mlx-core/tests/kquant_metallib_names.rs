@@ -11,11 +11,27 @@
 
 use std::ffi::{CStr, c_char};
 
-/// 7 modes x 3 dtypes x 39 families, plus 4 bfloat16 qmv_sg8 kernels and the
-/// 2 sg8 prep kernels (group sizes 16 and 32).
-const BASE_NAMES: i64 = 7 * 3 * 39 + 4 + 2;
-/// 7 modes x 3 dtypes x qmm_t_nax {aligned, unaligned} x {batched, single}.
-const NAX_NAMES: i64 = 7 * 3 * 4;
+/// The modes kquant.metal instantiates: q6k, q4k, q5k, q3k, q2k, iq4nl, iq4xs,
+/// the legacy iq3s8 and the seven grid formats iq2xxs, iq2xs, iq2s, iq3xxs,
+/// iq1s, iq1m, iq3s.
+const MODES: i64 = 15;
+/// The MLX affine modes a4g64 and a8g64: dequantize and the Tiled64 families
+/// only.
+const AFFINE_MODES: i64 = 2;
+/// 15 modes x 3 dtypes x (39 row-major families + 15 Tiled64 "_t64" families:
+/// qmv_t64 at 8 and 16 k-splits per 32-, 16- and 8-row threadgroup, qmv_wide
+/// nv 2..8, qmm_t, qmm_t_splitk), plus 4 bfloat16 qmv_sg8 kernels and the 2
+/// sg8 prep kernels (group sizes 16 and 32), plus each affine mode's
+/// dequantize and 15 Tiled64 families.
+const BASE_NAMES: i64 = MODES * 3 * (39 + 15) + 4 + 2 + AFFINE_MODES * 3 * (1 + 15);
+/// 15 modes x 3 dtypes x (qmm_t_nax {aligned, unaligned} x {batched, single}
+/// plus the aligned, single Tiled64 qmm_t_nax_t64, plus gather_qmm_rhs_nax_nt
+/// at bm 32 and 64), plus the bfloat16 tensor-op kernels: the three Tiled64
+/// row tiers (qmm_m8/m16/m32_nax_t64) per mode and the 10 row-major
+/// qmm_m8_nax (q3k, q2k, iq4nl and the seven grid formats); each affine mode
+/// adds qmm_t_nax_t64 per dtype and its three Tiled64 row tiers.
+const NAX_NAMES: i64 =
+    MODES * 3 * (4 + 1 + 2) + MODES * 3 + 10 + AFFINE_MODES * 3 + AFFINE_MODES * 3;
 
 struct Check {
     base: i64,

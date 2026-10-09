@@ -10,15 +10,16 @@ use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, parse_generation_defaults,
 };
 use crate::models::gemma4::quantized_linear::{
-    LinearProj, try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear,
-    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
-    try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
+    LinearProj, try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
+    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
+    try_build_sym8_quantized_linear,
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, ensure_affine_biases_present, ensure_dense_weight_floating,
     ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, has_kquant_mode, load_quant_settings_from_disk,
-    mode_to_str, normalize_per_layer_key,
+    ensure_plain_fp8_storage_resolves_fp8_e4m3, ensure_row_major_kquant_layout, has_kquant_mode,
+    load_quant_settings_from_disk, mode_to_str, normalize_per_layer_key,
 };
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::tokenizer::Qwen3Tokenizer;
@@ -68,6 +69,23 @@ pub(super) fn build_projection(
     default: PerLayerQuant,
     overrides: &HashMap<String, PerLayerQuant>,
 ) -> Result<LinearProj> {
+    build_projection_tiled(params, prefix, default, overrides, &mut Vec::new())
+}
+
+/// [`build_projection`] that also records, in `tiled`, the prefixes whose
+/// K-quant or bf16-companion affine group was repacked into the Tiled64
+/// layout here (a `t64` checkpoint tensor is built tiled as-is and not
+/// recorded), so the caller can drop their row-major map entries with
+/// `release_tiled_kquant_sources` once the owning layer is built. The plain `build_projection` discards the list:
+/// its callers (the DFlash draft, tests) hold small maps whose transient is
+/// not worth plumbing.
+pub(super) fn build_projection_tiled(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    default: PerLayerQuant,
+    overrides: &HashMap<String, PerLayerQuant>,
+    tiled: &mut Vec<String>,
+) -> Result<LinearProj> {
     let plq = muse_projection_quant(prefix, overrides, default);
     let scales_key = format!("{prefix}.scales");
     if params.contains_key(&scales_key) {
@@ -80,19 +98,37 @@ pub(super) fn build_projection(
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
             PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
-            PerLayerMode::Affine => {
-                try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
-            }
+            // Tiled64 into the affine K-quant contract on a Metal host, as
+            // the K-quant arm (Muse-Glimmer threads no activation amax).
+            PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
+                params,
+                prefix,
+                plq.group_size,
+                plq.bits,
+                tiled,
+            )?,
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
             PerLayerMode::Q4K
             | PerLayerMode::Q5K
             | PerLayerMode::Q6K
             | PerLayerMode::Q3K
+            | PerLayerMode::Q2K
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S => {
-                try_build_kquant_quantized_linear(params, prefix, plq.mode, "muse_glimmer")?
-            }
+            | PerLayerMode::IQ3S
+            | PerLayerMode::IQ2XXS
+            | PerLayerMode::IQ2XS
+            | PerLayerMode::IQ2S
+            | PerLayerMode::IQ3XXS
+            | PerLayerMode::IQ1S
+            | PerLayerMode::IQ1M => try_build_kquant_quantized_linear_tiled(
+                params,
+                prefix,
+                plq.mode,
+                plq.layout,
+                "muse_glimmer",
+                tiled,
+            )?,
         }
         .ok_or_else(|| {
             Error::from_reason(format!(
@@ -128,6 +164,7 @@ fn load_embedding(
             )));
         }
         ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "muse_glimmer")?;
+        ensure_row_major_kquant_layout(plq, prefix, "muse_glimmer")?;
         embedding.load_quantized_packed(
             weight,
             scales,
@@ -553,7 +590,7 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
         config.persist_paged_cache,
     );
     let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
-    let params = load_target_safetensors(path, config.text_config.tie_word_embeddings)?;
+    let mut params = load_target_safetensors(path, config.text_config.tie_word_embeddings)?;
     checkpoint_load.record_mmap();
     if persist_cold {
         crate::engine::persistence::prewarm_checkpoint_pages(path);
@@ -564,6 +601,7 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
         group_size,
         mode: top_mode.unwrap_or(PerLayerMode::Affine),
         input_amax: None,
+        layout: Default::default(),
     };
     if params.keys().any(|key| key.ends_with(".scales")) && top_mode.is_none() {
         return Err(Error::from_reason(
@@ -587,36 +625,40 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
         text.rms_norm_eps,
     )?;
 
+    // Checkpoint byte total BEFORE installation: the layer loop releases the
+    // row-major sources of Tiled64 K-quant projections from `params` (the
+    // model owns same-sized tiled copies), so the map afterwards under-counts.
+    let text_weight_bytes = params
+        .values()
+        .map(|array| array.nbytes() as u64)
+        .fold(0u64, |acc, v| acc.saturating_add(v));
+    let mut tiled = Vec::<String>::new();
     let mut layers = Vec::with_capacity(text.num_hidden_layers);
     for index in 0..text.num_hidden_layers {
         let base = format!("model.language_model.layers.{index}");
         let attn = format!("{base}.self_attn");
+        let mut proj = |prefix: String| -> Result<LinearProj> {
+            build_projection_tiled(&params, &prefix, default, &overrides, &mut tiled)
+        };
         let attention = MuseGlimmerAttention::from_projections(
             text,
             index,
             config.rope_traditional,
-            build_projection(&params, &format!("{attn}.q_proj"), default, &overrides)?,
-            build_projection(&params, &format!("{attn}.k_proj"), default, &overrides)?,
-            build_projection(&params, &format!("{attn}.v_proj"), default, &overrides)?,
-            build_projection(&params, &format!("{attn}.o_proj"), default, &overrides)?,
-            build_projection(&params, &format!("{attn}.gate_proj"), default, &overrides)?,
+            proj(format!("{attn}.q_proj"))?,
+            proj(format!("{attn}.k_proj"))?,
+            proj(format!("{attn}.v_proj"))?,
+            proj(format!("{attn}.o_proj"))?,
+            proj(format!("{attn}.gate_proj"))?,
         )?;
         let mlp_base = format!("{base}.mlp");
         let mlp = MuseGlimmerMlp::new(
-            build_projection(
-                &params,
-                &format!("{mlp_base}.gate_proj"),
-                default,
-                &overrides,
-            )?,
-            build_projection(&params, &format!("{mlp_base}.up_proj"), default, &overrides)?,
-            build_projection(
-                &params,
-                &format!("{mlp_base}.down_proj"),
-                default,
-                &overrides,
-            )?,
+            proj(format!("{mlp_base}.gate_proj"))?,
+            proj(format!("{mlp_base}.up_proj"))?,
+            proj(format!("{mlp_base}.down_proj"))?,
         );
+        // The layer owns its tiled projections now; drop the map's row-major
+        // originals (mirrors the dense qwen3_5 loader).
+        crate::models::quantized_linear::release_tiled_kquant_sources(&mut params, &mut tiled);
         layers.push(MuseGlimmerDecoderLayer::new(
             attention,
             mlp,
@@ -652,17 +694,13 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
     let dflash = load_dflash(path, &config, default, &overrides)?;
     let paged = build_paged_runtime(&config)?;
     let has_dflash = dflash.is_some();
-    let weight_bytes = params
-        .values()
-        .map(|array| array.nbytes() as u64)
-        .sum::<u64>()
-        .saturating_add(if has_dflash {
-            std::fs::metadata(path.join("draft.safetensors"))
-                .map(|meta| meta.len())
-                .unwrap_or(0)
-        } else {
-            0
-        });
+    let weight_bytes = text_weight_bytes.saturating_add(if has_dflash {
+        std::fs::metadata(path.join("draft.safetensors"))
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    } else {
+        0
+    });
     let weights_resident = if persist_cold {
         let arrays = params.values().collect::<Vec<_>>();
         Some(crate::array::memory::materialize_weights(&arrays)?)
@@ -812,6 +850,7 @@ mod tests {
             group_size: 16,
             mode: PerLayerMode::Q6K,
             input_amax: None,
+            layout: Default::default(),
         };
         let overrides = HashMap::from([(
             "layers.0.self_attn.q_proj".to_string(),
@@ -820,6 +859,7 @@ mod tests {
                 group_size: 32,
                 mode: PerLayerMode::Q4K,
                 input_amax: None,
+                layout: Default::default(),
             },
         )]);
         assert_eq!(
@@ -1000,6 +1040,7 @@ mod tests {
                 group_size: 32,
                 mode: PerLayerMode::Q5K,
                 input_amax: None,
+                layout: Default::default(),
             },
         );
         assert!(requires_row_exact_decode_projections(None, &overrides));
@@ -1014,6 +1055,7 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
 
         assert!(

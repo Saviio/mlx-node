@@ -84,7 +84,16 @@ struct KQuant {
     biases_cols: i64,
 }
 
-const KQUANTS: [KQuant; 7] = [
+const KQUANTS: [KQuant; 15] = [
+    KQuant {
+        mode: "q2k",
+        bits: 2,
+        group_size: 16,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 32,
+        biases_cols: 2,
+    },
     KQuant {
         mode: "q3k",
         bits: 3,
@@ -139,8 +148,10 @@ const KQUANTS: [KQuant; 7] = [
         scales_cols: 8,
         biases_cols: 1,
     },
+    // The legacy expanded IQ3_S import (int8 codes); the bridge reaches it
+    // from ("iq3s", bits 8) too (kquant::resolve_mode, mlx_kquant.h).
     KQuant {
-        mode: "iq3s",
+        mode: "iq3s8",
         bits: 8,
         group_size: 32,
         scales_signed: true,
@@ -148,7 +159,79 @@ const KQUANTS: [KQuant; 7] = [
         scales_cols: 8,
         biases_cols: 1,
     },
+    // The grid formats (gguf_kquant.rs): `bits` native grid-index words per
+    // 32-value unit, `scales_cols` companion bytes per 8 units, one d.
+    KQuant {
+        mode: "iq3s",
+        bits: 3,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 24,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq2xxs",
+        bits: 1,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 8,
+        scales_cols: 32,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq2xs",
+        bits: 2,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 8,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq2s",
+        bits: 2,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq3xxs",
+        bits: 2,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 32,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq1s",
+        bits: 1,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 8,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq1m",
+        bits: 1,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 8,
+        scales_cols: 24,
+        biases_cols: 1,
+    },
 ];
+
+fn is_grid(kq: &KQuant) -> bool {
+    matches!(
+        kq.mode,
+        "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m" | "iq3s"
+    )
+}
 
 // ---------------------------------------------------------------------------
 // tolerances
@@ -565,6 +648,13 @@ fn filled_kquant_weights(kq: &KQuant, leading: &[i64], packed: i64) -> Weights {
             .map(|_| (lcg(&mut st) % 17) as i8 - 8)
             .collect();
         MxArray::from_int8(&v, &shape(scales_cols))
+    } else if is_grid(kq) {
+        // Native companion bytes (sign indices, qh, scale nibbles): every
+        // bit pattern is valid.
+        let v: Vec<u8> = (0..scales_len)
+            .map(|_| (lcg(&mut st) >> 24) as u8)
+            .collect();
+        MxArray::from_uint8(&v, &shape(scales_cols))
     } else {
         // q4k/q5k interleave (sc, m), both 6-bit unsigned.
         let v: Vec<u8> = (0..scales_len).map(|_| (lcg(&mut st) % 64) as u8).collect();
@@ -908,6 +998,57 @@ fn quantize_rejects_every_kquant_mode_on_every_device() {
                 quantize(&x, kq.group_size, kq.bits, kq.mode),
             );
         }
+    }
+}
+
+/// Artifacts converted before the packed IQ3_S form hand the bridge
+/// `("iq3s", bits 8)` with int8 sub-scales and byte codes; it must read them
+/// as the legacy `iq3s8` contract, bit for bit, on both devices — and must
+/// not take the packed `iq3s` for its bits or its scales dtype.
+#[test]
+fn iq3s_with_eight_bits_is_the_legacy_iq3s8_contract() {
+    let legacy = KQUANTS.iter().find(|k| k.mode == "iq3s8").expect("iq3s8");
+    let packed = KQUANTS.iter().find(|k| k.mode == "iq3s").expect("iq3s");
+    assert_eq!((legacy.bits, packed.bits), (8, 3));
+    let (w, scales, biases) = filled_kquant_weights(legacy, &[N], K_DEEP);
+    for device in [Device::Cpu, Device::Gpu] {
+        if !select(device) {
+            continue;
+        }
+        let what = format!("iq3s bits=8 {}", device.label());
+        let ours = expect_f32(
+            &format!("{what} dequantize"),
+            dequantize_handle(&w, &scales, Some(&biases), 32, 8, "iq3s"),
+        );
+        let reference = expect_f32(
+            &format!("{what} dequantize iq3s8"),
+            dequantize_handle(&w, &scales, Some(&biases), 32, 8, "iq3s8"),
+        );
+        assert_eq!(ours, reference, "{what}: dequantize differs from iq3s8");
+        assert!(reference.iter().any(|v| *v != 0.0), "{what}: all zero");
+        for m in [1i64, 8] {
+            let x = activation(&[m, K_DEEP], 0x135 + m as u32, DType::BFloat16);
+            let ours = expect_f32(
+                &format!("{what} qmm M={m}"),
+                quantized_matmul_handle(&x, &w, &scales, Some(&biases), true, 32, 8, "iq3s"),
+            );
+            let reference = expect_f32(
+                &format!("{what} qmm M={m} iq3s8"),
+                quantized_matmul_handle(&x, &w, &scales, Some(&biases), true, 32, 8, "iq3s8"),
+            );
+            assert_eq!(ours, reference, "{what} M={m}: matmul differs from iq3s8");
+        }
+        // The packed contract's bits with the legacy arrays, and the legacy
+        // bits with packed (uint8) scales, are both refused.
+        expect_rejected(
+            &format!("{what} bits=3 on legacy arrays"),
+            dequantize(&w, &scales, Some(&biases), 32, 3, "iq3s"),
+        );
+        let (pw, pscales, pbiases) = filled_kquant_weights(packed, &[N], K_DEEP);
+        expect_rejected(
+            &format!("{what} bits=8 on packed arrays"),
+            dequantize(&pw, &pscales, Some(&pbiases), 32, 8, "iq3s"),
+        );
     }
 }
 
@@ -1433,14 +1574,83 @@ fn gpu_matches_cpu_on_every_gather_kernel() {
         });
 
         // gather_qmm_rhs, the sorted-MoE path: one row per token, a null left
-        // index, and 16 tokens over the 4 experts.
+        // index, and 16 tokens over the 4 experts. N = 128 takes the tensor op
+        // (gather_qmm_rhs_nax_nt, tf32 for float32: qmm_t_f32_tol); N = 136
+        // stays on the simdgroup kernel.
         let xr = activation(&[16, 1, K], 127, DType::Float32);
+        compare_devices(
+            &format!("gather_qmm_rhs_nax_nt {m}"),
+            qmm_t_f32_tol(),
+            || gather_of(kq, &xr, &we, None, &rhs16, true, true),
+        );
         compare_devices(&format!("gather_qmm_rhs_nt {m}"), F32_TOL, || {
-            gather_of(kq, &xr, &we, None, &rhs16, true, true)
+            gather_of(kq, &xr, &weu, None, &rhs16, true, true)
         });
         compare_devices(&format!("gather_qmm_rhs_nn {m}"), F32_TOL, || {
             gather_of(kq, &xr, &wen, None, &rhs16, false, true)
         });
+    }
+    select(Device::Cpu);
+}
+
+/// `kquant_gather_qmm_rhs_nax` (kquant_nax.h), the sorted-MoE expert matmul
+/// on the tensor op, against the CPU in float16 and bfloat16 (no tf32, so the
+/// `qmm_t` tile tolerance applies) on routings that reach every branch of the
+/// per-expert tile schedule: experts with no rows, an expert spanning two
+/// tiles, a partial last tile whose second simdgroup starts past M (the
+/// `load_safe` arm), and both instantiations (bm 32 below 64 rows per expert,
+/// bm 64 from there). On a host without the tensor op the same shapes run the
+/// simdgroup `gather_qmm_rhs_nt`; the family counter says which.
+#[test]
+fn gather_qmm_rhs_nax_matches_cpu() {
+    if !select(Device::Gpu) {
+        eprintln!("skipping gather_qmm_rhs_nax_matches_cpu: no GPU device");
+        return;
+    }
+    let family = |name: &str| {
+        let name = CString::new(name).expect("family");
+        // SAFETY: thread-local test hook reading a NUL-terminated name.
+        unsafe { mlx_sys::mlx_test_kquant_family_count(name.as_ptr()) }
+    };
+    // (experts, rows per expert): bm 32 and bm 64 schedules.
+    let routings: [(i64, &[u32]); 2] = [(6, &[0, 5, 40, 1, 0, 18]), (2, &[70, 60])];
+    for kq in &KQUANTS {
+        let m = kq.mode;
+        for (experts, rows) in &routings {
+            let we = filled_kquant_weights(kq, &[*experts, N], K);
+            let routes: Vec<u32> = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(e, n)| std::iter::repeat_n(e as u32, *n as usize))
+                .collect();
+            let b = routes.len() as i64;
+            let rhs = indices(&routes);
+            for (dtype, name, tol) in [
+                (DType::Float16, "f16", F16_TILE_TOL),
+                (DType::BFloat16, "bf16", BF16_TILE_TOL),
+            ] {
+                let x = activation(&[b, 1, K], 151 + b as u32, dtype);
+                // SAFETY: thread-local test hook; enabling resets the counts.
+                unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+                compare_devices(
+                    &format!("gather_qmm_rhs_nax_nt E={experts} B={b} {name} {m}"),
+                    tol,
+                    || gather_of(kq, &x, &we, None, &rhs, true, true),
+                );
+                let (nax, simd) = (family("gather_qmm_rhs_nax_nt"), family("gather_qmm_rhs_nt"));
+                // SAFETY: as above.
+                unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+                if nax_available() {
+                    assert!(
+                        nax == 1 && simd == 0,
+                        "{m} E={experts} B={b} {name}: expected the tensor-op gather \
+                         (nax {nax}, simdgroup {simd})"
+                    );
+                } else {
+                    assert!(nax == 0 && simd == 1, "{m}: expected the simdgroup gather");
+                }
+            }
+        }
     }
     select(Device::Cpu);
 }

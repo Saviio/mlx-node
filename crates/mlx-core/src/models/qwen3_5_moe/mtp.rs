@@ -67,11 +67,11 @@ use super::decoder_layer::{AttentionType, DecoderLayer, MLPType};
 use super::layer_cache::Qwen3_5LayerCache;
 use super::switch_glu::SwitchGLU;
 use crate::models::quantized_linear::{
-    LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedSwitchLinear,
-    is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
-    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
-    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
-    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
+    LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
+    is_quantized_checkpoint, try_build_affine_quantized_linear_tiled,
+    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
+    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
+    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
 };
 
 /// Build an affine-mode `QuantizedSwitchLinear` from `params` if both
@@ -342,36 +342,52 @@ impl Qwen3_5MoeMTPModule {
         // activation-fp8 recipe keeps the MTP head Skip/bf16 (never an
         // activation-fp8 site), so a calibrated per-tensor amax is never
         // recorded for an `mtp.*` prefix — the threading would be a no-op here.
-        let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
-            let plq = plq_for(prefix);
-            match plq.mode {
-                PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
-                PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
-                PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-                // The upfront state guard rejects explicit metadata / Uint8
-                // storage. A body-level FP8 default with BF16 MTP weights may
-                // still resolve here and correctly takes the dense fallback.
-                PerLayerMode::Fp8E4m3 => None,
-                PerLayerMode::Affine => {
-                    try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
-                }
-                // Unreachable: `apply_weights_moe_inner` disables the MTP
-                // head load for sym8 checkpoints (`mtp_weights_loaded =
-                // false`, warn) before this `apply_weights` can run, so no
-                // sym8 PLQ ever reaches these builders.
-                PerLayerMode::Sym8 => None,
-                // Unreachable: the MoE loader disables MTP for K-quant
-                // checkpoints (`checkpoint_has_kquant` gate); an imported GGUF
-                // never ships an MTP head. `None` fails soft into AR decode.
-                PerLayerMode::Q6K
-                | PerLayerMode::Q4K
-                | PerLayerMode::Q5K
-                | PerLayerMode::Q3K
-                | PerLayerMode::IQ4NL
-                | PerLayerMode::IQ4XS
-                | PerLayerMode::IQ3S => None,
-            }
-        };
+        let try_build_ql =
+            |params: &HashMap<String, MxArray>, prefix: &str| -> Result<Option<QuantizedLinear>> {
+                let plq = plq_for(prefix);
+                Ok(match plq.mode {
+                    PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
+                    PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
+                    PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
+                    // The upfront state guard rejects explicit metadata / Uint8
+                    // storage. A body-level FP8 default with BF16 MTP weights may
+                    // still resolve here and correctly takes the dense fallback.
+                    PerLayerMode::Fp8E4m3 => None,
+                    // Tiled64 into the affine K-quant contract as in the body
+                    // loader. This loader reads the map by `&`, so the row-major
+                    // sources stay in it until the loader returns (one MTP layer:
+                    // a load-time transient, not a resident cost).
+                    PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
+                        params,
+                        prefix,
+                        plq.group_size,
+                        plq.bits,
+                        &mut Vec::new(),
+                    )?,
+                    // Unreachable: `apply_weights_moe_inner` disables the MTP
+                    // head load for sym8 checkpoints (`mtp_weights_loaded =
+                    // false`, warn) before this `apply_weights` can run, so no
+                    // sym8 PLQ ever reaches these builders.
+                    PerLayerMode::Sym8 => None,
+                    // Unreachable: the MoE loader disables MTP for K-quant
+                    // checkpoints (`checkpoint_has_kquant` gate); an imported GGUF
+                    // never ships an MTP head. `None` fails soft into AR decode.
+                    PerLayerMode::Q6K
+                    | PerLayerMode::Q4K
+                    | PerLayerMode::Q5K
+                    | PerLayerMode::Q3K
+                    | PerLayerMode::Q2K
+                    | PerLayerMode::IQ4NL
+                    | PerLayerMode::IQ4XS
+                    | PerLayerMode::IQ3S
+                    | PerLayerMode::IQ2XXS
+                    | PerLayerMode::IQ2XS
+                    | PerLayerMode::IQ2S
+                    | PerLayerMode::IQ3XXS
+                    | PerLayerMode::IQ1S
+                    | PerLayerMode::IQ1M => None,
+                })
+            };
         let try_build_qsl = |params: &HashMap<String, MxArray>, prefix: &str| {
             let plq = plq_for(prefix);
             match plq.mode {
@@ -392,9 +408,16 @@ impl Qwen3_5MoeMTPModule {
                 | PerLayerMode::Q4K
                 | PerLayerMode::Q5K
                 | PerLayerMode::Q3K
+                | PerLayerMode::Q2K
                 | PerLayerMode::IQ4NL
                 | PerLayerMode::IQ4XS
-                | PerLayerMode::IQ3S => None,
+                | PerLayerMode::IQ3S
+                | PerLayerMode::IQ2XXS
+                | PerLayerMode::IQ2XS
+                | PerLayerMode::IQ2S
+                | PerLayerMode::IQ3XXS
+                | PerLayerMode::IQ1S
+                | PerLayerMode::IQ1M => None,
             }
         };
 
@@ -415,7 +438,7 @@ impl Qwen3_5MoeMTPModule {
         // of being forced through affine-only dequant. A bf16 fc (no
         // `.scales`) stays a `LinearProj::Standard` — the identical dense
         // matmul as before; our checkpoints keep the MTP fc bf16.
-        if let Some(ql) = try_build_ql(params, "mtp.fc") {
+        if let Some(ql) = try_build_ql(params, "mtp.fc")? {
             self.fc.set_quantized(ql);
         } else if let Some(w) = params.get("mtp.fc.weight") {
             self.fc.set_weight(w, "mtp.fc")?;
@@ -443,22 +466,22 @@ impl Qwen3_5MoeMTPModule {
 
             // Attention weights.
             if is_quantized {
-                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix)) {
+                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))? {
                     attn.set_quantized_q_proj(ql);
                 } else if let Some(w) = params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
                     attn.set_q_proj_weight(w)?;
                 }
-                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix)) {
+                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))? {
                     attn.set_quantized_k_proj(ql);
                 } else if let Some(w) = params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
                     attn.set_k_proj_weight(w)?;
                 }
-                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix)) {
+                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))? {
                     attn.set_quantized_v_proj(ql);
                 } else if let Some(w) = params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
                     attn.set_v_proj_weight(w)?;
                 }
-                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix)) {
+                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))? {
                     attn.set_quantized_o_proj(ql);
                 } else if let Some(w) = params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
                     attn.set_o_proj_weight(w)?;
@@ -510,9 +533,9 @@ impl Qwen3_5MoeMTPModule {
                         let gate_key = format!("{}.mlp.gate_proj", prefix);
                         let up_key = format!("{}.mlp.up_proj", prefix);
                         let down_key = format!("{}.mlp.down_proj", prefix);
-                        let q_gate = try_build_ql(params, &gate_key);
-                        let q_up = try_build_ql(params, &up_key);
-                        let q_down = try_build_ql(params, &down_key);
+                        let q_gate = try_build_ql(params, &gate_key)?;
+                        let q_up = try_build_ql(params, &up_key)?;
+                        let q_down = try_build_ql(params, &down_key)?;
                         if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                             layer.set_quantized_dense_mlp(qg, qu, qd)?;
                         } else {
@@ -544,7 +567,7 @@ impl Qwen3_5MoeMTPModule {
                 MLPType::MoE(moe) => {
                     if is_quantized {
                         // Router gate (single-Linear projection).
-                        if let Some(ql) = try_build_ql(params, &format!("{}.mlp.gate", prefix)) {
+                        if let Some(ql) = try_build_ql(params, &format!("{}.mlp.gate", prefix))? {
                             moe.set_quantized_gate(ql);
                         } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
                             moe.set_gate_weight(w)?;
@@ -579,9 +602,9 @@ impl Qwen3_5MoeMTPModule {
                         let se_up_key = format!("{}.mlp.shared_expert.up_proj", prefix);
                         let se_down_key = format!("{}.mlp.shared_expert.down_proj", prefix);
 
-                        let q_se_gate = try_build_ql(params, &se_gate_key);
-                        let q_se_up = try_build_ql(params, &se_up_key);
-                        let q_se_down = try_build_ql(params, &se_down_key);
+                        let q_se_gate = try_build_ql(params, &se_gate_key)?;
+                        let q_se_up = try_build_ql(params, &se_up_key)?;
+                        let q_se_down = try_build_ql(params, &se_down_key)?;
 
                         if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
                             moe.set_quantized_shared_expert(qg, qu, qd)?;
@@ -598,7 +621,7 @@ impl Qwen3_5MoeMTPModule {
                         }
 
                         if let Some(ql) =
-                            try_build_ql(params, &format!("{}.mlp.shared_expert_gate", prefix))
+                            try_build_ql(params, &format!("{}.mlp.shared_expert_gate", prefix))?
                         {
                             moe.set_quantized_shared_expert_gate(ql);
                         } else if let Some(w) =
@@ -958,12 +981,14 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         let gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
 
         let Some((mut mtp, _)) = build_mtp_or_skip(label) else {
@@ -1036,6 +1061,7 @@ mod tests {
                 group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
                 mode: PerLayerMode::Fp8E4m3,
                 input_amax: None,
+                layout: Default::default(),
             },
         )]);
         let err = mtp
@@ -1210,6 +1236,7 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         if let Err(err) = mtp.apply_weights(
             &q_params,
@@ -1422,12 +1449,14 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         let default_gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         // Empty override table — MTP keys are never recorded here, so
         // `effective_plq_for` must take the gate-default fallback.
@@ -1557,12 +1586,14 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         let default_gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
 
         // (a) affine quantized fc → Quantized (mode "affine").
@@ -1582,6 +1613,7 @@ mod tests {
                     group_size: 32,
                     mode: PerLayerMode::Affine,
                     input_amax: None,
+                    layout: Default::default(),
                 },
             );
             if !apply_fc_or_skip(
@@ -1624,6 +1656,7 @@ mod tests {
                     group_size: MXFP8_GROUP_SIZE,
                     mode: PerLayerMode::Mxfp8,
                     input_amax: None,
+                    layout: Default::default(),
                 },
             );
             if !apply_fc_or_skip(

@@ -1458,8 +1458,9 @@ impl LayerKVPool {
     /// The caller supplies the `block_ids` array (already cast to `i32`) for
     /// the request's block table — kernel reads it as
     /// `[num_seqs=1, max_num_blocks_per_seq]` row-major. `num_tokens_in_request`
-    /// is the live `block_table.num_tokens()` and is uploaded as the single
-    /// element of `context_lens`.
+    /// is the context length counted from the first block in `block_ids` (a
+    /// sliding-window caller may drop whole blocks before its window) and is
+    /// uploaded as the single element of `context_lens`.
     ///
     /// `queries` shape on the GPU buffer is `[1, num_query_heads, head_size]`.
     /// `query_dtype` MUST be the actual element dtype of the queries buffer —
@@ -1518,13 +1519,14 @@ impl LayerKVPool {
                 k_scale,
                 v_scale,
                 crate::metal::PagedAttentionRouteHint::Auto,
+                0,
             )
         }
     }
 
-    /// Route-hinted sibling of [`Self::gather_attention`]. The hint affects
-    /// only the compute kernel; K/V buffers and block-table semantics are
-    /// identical.
+    /// Route-hinted sibling of [`Self::gather_attention`]. The hint and the
+    /// grouped partition plan (`grouped_stripes`, 0 = unplanned) affect only
+    /// the compute kernel; K/V buffers and block-table semantics are identical.
     ///
     /// # Safety
     /// The caller must uphold the same evaluated-query pointer, pool lifetime,
@@ -1545,6 +1547,7 @@ impl LayerKVPool {
         k_scale: f32,
         v_scale: f32,
         route_hint: crate::metal::PagedAttentionRouteHint,
+        grouped_stripes: u32,
     ) -> Result<crate::metal::PagedAttentionOutput, String> {
         use crate::metal::{
             MetalState, MlxMetalBuffer, PagedAttentionParams, RawBufferInfo,
@@ -1700,6 +1703,7 @@ impl LayerKVPool {
                 io_dtype,
                 cache_dtype,
                 route_hint,
+                grouped_stripes,
             )
         }
     }

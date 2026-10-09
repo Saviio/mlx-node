@@ -57,6 +57,14 @@ kquant::Mode mode_of(const char *mode) {
   return *parsed;
 }
 
+// "q4k" or "q4k@t64".
+kquant::ModeLayout mode_layout_of(const char *mode) {
+  auto parsed = kquant::parse_mode_layout(mode ? mode : "");
+  if (!parsed)
+    throw std::invalid_argument("not a K-quant mode");
+  return *parsed;
+}
+
 mlx_array *wrap(array a) {
   return reinterpret_cast<mlx_array *>(new array(std::move(a)));
 }
@@ -68,6 +76,12 @@ extern "C" {
 void mlx_test_kquant_counting(bool enable) {
   mlx::core::bridge_testing::family_counts.clear();
   mlx::core::bridge_testing::counting = enable;
+}
+
+// Test-only: pin the sorted MoE expert matmul to the simdgroup fallback
+// (`gather_qmm_rhs_nt`) for route parity; calling thread only.
+void mlx_test_kquant_gather_rhs_fallback(bool force) {
+  mlx::core::bridge_testing::force_gather_rhs_fallback = force;
 }
 
 uint64_t mlx_test_kquant_family_count(const char *family) {
@@ -91,6 +105,27 @@ int32_t mlx_test_kquant_gpu_gen() {
 #else
   return -1;
 #endif
+}
+
+// Whether the Tiled64 bfloat16 route of (M, N, K) at `bits` takes a
+// tensor-op row tier on this device (kquant::tiled_tensor_op_tier).
+bool mlx_test_kquant_tensor_op_tier(int32_t M, int32_t N, int32_t K,
+                                    int32_t bits, bool affine) {
+  try {
+    return mlx::core::kquant::tiled_tensor_op_tier(M, N, K, bits, affine);
+  } catch (...) {
+    return false;
+  }
+}
+
+// The M from which the Tiled64 route of (K, N) takes the GEMM
+// (kquant::tiled_qmv_vector_limit); 0 without Metal.
+int32_t mlx_test_kquant_qmv_vector_limit(int32_t K, int32_t N) {
+  try {
+    return mlx::core::kquant::tiled_qmv_vector_limit(K, N);
+  } catch (...) {
+    return 0;
+  }
 }
 
 // Checks paged_attn.metallib against kquant::metal_kernel_names(). `counts`
@@ -207,9 +242,10 @@ mlx_array *mlx_test_kquant_quantized_matmul(mlx_array *x, mlx_array *w,
                                             int group_size, int bits,
                                             const char *mode, int32_t device) {
   try {
+    auto ml = mode_layout_of(mode);
     return wrap(kquant::quantized_matmul(
         ref(x), ref(w), ref(scales), opt(biases), transpose, group_size, bits,
-        mode_of(mode), device_of(device)));
+        ml.mode, device_of(device), ml.layout));
   } catch (const std::exception &e) {
     std::cerr << "mlx_test_kquant_quantized_matmul: " << e.what() << std::endl;
     return nullptr;
@@ -261,11 +297,12 @@ bool mlx_test_kquant_shapeless_replay(mlx_array *trace_x, mlx_array *x,
                                       mlx_array **out_replay,
                                       mlx_array **out_eager) {
   try {
-    auto kmode = mode_of(mode);
+    auto ml = mode_layout_of(mode);
     auto dev = device_of(device);
     auto fn = [=](const std::vector<array> &in) {
       return std::vector<array>{kquant::quantized_matmul(
-          in[0], in[1], in[2], in[3], transpose, group_size, bits, kmode, dev)};
+          in[0], in[1], in[2], in[3], transpose, group_size, bits, ml.mode,
+          dev, ml.layout)};
     };
     auto compiled = mlx::core::compile(fn, /* shapeless = */ true);
     auto traced = compiled({ref(trace_x), ref(w), ref(scales), ref(biases)});

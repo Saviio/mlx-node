@@ -17,7 +17,6 @@ use serde::Deserialize;
 
 use crate::array::attention::scaled_dot_product_attention;
 use crate::array::{DType, MxArray};
-use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 use crate::models::qwen3_5::decoder_layer::DecoderLayer;
 use crate::nn::{Activations, Embedding, Linear, RMSNorm, RoPE};
@@ -208,10 +207,12 @@ fn non_causal_sliding_mask(
     ))
 }
 
-/// The sliding mask depends only on `(query_base, query_len, key_base,
-/// key_len, window)`, which every draft layer shares, so one propose builds it
-/// once and every layer reuses the same array.
-type SlidingMaskMemo = Option<((i32, i64, i32, i64, i64), Option<MxArray>)>;
+/// The sliding mask is `(query_base - key_base) + i - j < window`: it depends
+/// only on the base gap, `query_len`, `key_len` and `window`, which every
+/// draft layer shares and which repeat from cycle to cycle once the window
+/// is full, so it is built once and every layer of every such propose reuses
+/// the same array.
+type SlidingMaskMemo = Option<((i64, i64, i64, i64), Option<MxArray>)>;
 
 fn memo_sliding_mask(
     memo: &mut SlidingMaskMemo,
@@ -221,13 +222,22 @@ fn memo_sliding_mask(
     key_len: i64,
     window: i64,
 ) -> Result<Option<MxArray>> {
-    let key = (query_base, query_len, key_base, key_len, window);
+    let key = (
+        i64::from(query_base) - i64::from(key_base),
+        query_len,
+        key_len,
+        window,
+    );
     if let Some((cached, mask)) = memo.as_ref()
         && *cached == key
     {
         return Ok(mask.clone());
     }
-    let mask = non_causal_sliding_mask(query_base, query_len, key_base, key_len, window)?;
+    // Relative positions: the same booleans as the absolute ones, for any
+    // base the memo key is later matched at.
+    let gap = i32::try_from(key.0)
+        .map_err(|_| Error::from_reason("DFlash2 sliding mask: query/key base gap overflows"))?;
+    let mask = non_causal_sliding_mask(gap, query_len, 0, key_len, window)?;
     *memo = Some((key, mask.clone()));
     Ok(mask)
 }
@@ -237,6 +247,9 @@ struct DFlash2Attention {
     k_proj: LinearProj,
     v_proj: LinearProj,
     o_proj: LinearProj,
+    /// Row-merged `q|k|v` projection: one quantized matmul for the block
+    /// where the three packed formats merge (`None` keeps three).
+    qkv_proj: Option<LinearProj>,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
     rope: RoPE,
@@ -247,64 +260,156 @@ struct DFlash2Attention {
 }
 
 impl DFlash2Attention {
-    fn project_context(&self, x: &MxArray, base: i32) -> Result<(MxArray, MxArray)> {
-        let batch = x.shape_at(0)?;
-        let seq = x.shape_at(1)?;
-        let keys =
-            self.k_proj
-                .forward(x)?
-                .reshape(&[batch, seq, self.num_kv_heads, self.head_dim])?;
+    /// `rope(k_norm(keys))` as `[B, HK, T, D]` from `[B, T, HK * D]` rows.
+    fn finish_keys(&self, keys: &MxArray, base: i32) -> Result<MxArray> {
+        let keys = keys.reshape(&[
+            keys.shape_at(0)?,
+            keys.shape_at(1)?,
+            self.num_kv_heads,
+            self.head_dim,
+        ])?;
         let keys = self.k_norm.forward(&keys)?.transpose(Some(&[0, 2, 1, 3]))?;
-        let keys = self.rope.forward(&keys, Some(base))?;
-        let values = self
-            .v_proj
-            .forward(x)?
-            .reshape(&[batch, seq, self.num_kv_heads, self.head_dim])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        Ok((keys, values))
+        self.rope.forward(&keys, Some(base))
     }
 
-    fn forward(
+    /// `[B, HK, T, D]` values from `[B, T, HK * D]` rows.
+    fn finish_values(&self, values: &MxArray) -> Result<MxArray> {
+        values
+            .reshape(&[
+                values.shape_at(0)?,
+                values.shape_at(1)?,
+                self.num_kv_heads,
+                self.head_dim,
+            ])?
+            .transpose(Some(&[0, 2, 1, 3]))
+    }
+
+    fn project_context(&self, x: &MxArray, base: i32) -> Result<(MxArray, MxArray)> {
+        Ok((
+            self.finish_keys(&self.k_proj.forward(x)?, base)?,
+            self.finish_values(&self.v_proj.forward(x)?)?,
+        ))
+    }
+
+    /// `rope(q_norm(q))`, `rope(k_norm(k))` in one dispatch
+    /// (`mlx_qk_norm_rope`, bit-identical to the four-op chain) from
+    /// `[B, T, H, D]` inputs to `[B, H, T, D]`; `None` on a contract miss.
+    fn fused_qk_norm_rope(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        query_base: i32,
+    ) -> Option<(MxArray, MxArray)> {
+        if !unsafe { sys::mlx_metal_is_available() }
+            || self.rope.traditional
+            || self.q_norm.eps_f32() != self.k_norm.eps_f32()
+        {
+            return None;
+        }
+        let batch = queries.shape_at(0).ok()?;
+        let offsets = MxArray::from_int32(&vec![query_base; batch as usize], &[batch]).ok()?;
+        let mut out_q = std::ptr::null_mut();
+        let mut out_k = std::ptr::null_mut();
+        // SAFETY: every handle is a live array for the call; the outputs are
+        // owned handles or stay null when the call reports false.
+        let ok = unsafe {
+            sys::mlx_qk_norm_rope(
+                queries.as_raw_ptr(),
+                keys.as_raw_ptr(),
+                self.q_norm.weight().as_raw_ptr(),
+                self.k_norm.weight().as_raw_ptr(),
+                offsets.as_raw_ptr(),
+                self.q_norm.eps_f32(),
+                self.rope.base,
+                self.rope.scale,
+                self.rope.dims,
+                &mut out_q,
+                &mut out_k,
+            )
+        };
+        if !ok {
+            return None;
+        }
+        Some((
+            MxArray::from_handle(out_q, "dflash2 qk_norm_rope:q").ok()?,
+            MxArray::from_handle(out_k, "dflash2 qk_norm_rope:k").ok()?,
+        ))
+    }
+
+    /// The block's roped queries `[B, HQ, T, D]` and its K/V rows
+    /// `[B, HK, T, D]` at positions `query_base + t`. The merged `q|k|v`
+    /// matmul serves up to `max_rows` rows (see `DFlash2Model::merged_rows`).
+    fn project_block(
         &self,
         x: &MxArray,
-        context: Option<&(MxArray, MxArray)>,
-        context_base: i32,
+        query_base: i32,
+        max_rows: i64,
+    ) -> Result<(MxArray, MxArray, MxArray)> {
+        let batch = x.shape_at(0)?;
+        let seq = x.shape_at(1)?;
+        let (queries, keys, values) = match self.qkv_proj.as_ref().filter(|_| seq <= max_rows) {
+            Some(qkv_proj) => {
+                let q_width = self.num_heads * self.head_dim;
+                let kv_width = self.num_kv_heads * self.head_dim;
+                let mut parts = qkv_proj
+                    .forward(x)?
+                    .split_sections(&[q_width, q_width + kv_width], -1)?
+                    .into_iter();
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(q), Some(k), Some(v)) => (q, k, v),
+                    _ => return Err(Error::from_reason("DFlash2 q|k|v split arity")),
+                }
+            }
+            None => (
+                self.q_proj.forward(x)?,
+                self.k_proj.forward(x)?,
+                self.v_proj.forward(x)?,
+            ),
+        };
+        let queries = queries.reshape(&[batch, seq, self.num_heads, self.head_dim])?;
+        let keys = keys.reshape(&[batch, seq, self.num_kv_heads, self.head_dim])?;
+        let (queries, keys) = match self.fused_qk_norm_rope(&queries, &keys, query_base) {
+            Some(fused) => fused,
+            None => {
+                let queries = self
+                    .q_norm
+                    .forward(&queries)?
+                    .transpose(Some(&[0, 2, 1, 3]))?;
+                let keys = self.k_norm.forward(&keys)?.transpose(Some(&[0, 2, 1, 3]))?;
+                (
+                    self.rope.forward(&queries, Some(query_base))?,
+                    self.rope.forward(&keys, Some(query_base))?,
+                )
+            }
+        };
+        Ok((queries, keys, self.finish_values(&values)?))
+    }
+
+    /// Sliding-window attention of `queries` `[B, HQ, T, D]` over `keys` /
+    /// `values` `[B, HK, N, D]` whose first row sits at `key_base`.
+    fn attend(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        values: &MxArray,
+        key_base: i32,
         query_base: i32,
         masks: &mut SlidingMaskMemo,
     ) -> Result<MxArray> {
-        let batch = x.shape_at(0)?;
-        let seq = x.shape_at(1)?;
-        let queries =
-            self.q_proj
-                .forward(x)?
-                .reshape(&[batch, seq, self.num_heads, self.head_dim])?;
-        let queries = self
-            .q_norm
-            .forward(&queries)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let queries = self.rope.forward(&queries, Some(query_base))?;
-        let (block_keys, block_values) = self.project_context(x, query_base)?;
-        let (keys, values, key_base) = match context {
-            Some((context_keys, context_values)) => (
-                MxArray::concatenate(context_keys, &block_keys, 2)?,
-                MxArray::concatenate(context_values, &block_values, 2)?,
-                context_base,
-            ),
-            None => (block_keys, block_values, query_base),
-        };
-        let key_len = keys.shape_at(2)?;
+        let batch = queries.shape_at(0)?;
+        let seq = queries.shape_at(2)?;
         let mask = memo_sliding_mask(
             masks,
             query_base,
             seq,
             key_base,
-            key_len,
+            keys.shape_at(2)?,
             self.sliding_window,
         )?;
         let attended = scaled_dot_product_attention(
-            &queries,
-            &keys,
-            &values,
+            queries,
+            keys,
+            values,
             1.0 / (self.head_dim as f64).sqrt(),
             mask.as_ref(),
         )?
@@ -318,14 +423,24 @@ struct DFlash2Mlp {
     gate_proj: LinearProj,
     up_proj: LinearProj,
     down_proj: LinearProj,
+    /// Row-merged `gate|up` projection and its split point (one quantized
+    /// matmul where the two packed formats merge; `None` keeps two).
+    gate_up: Option<(LinearProj, i64)>,
 }
 
 impl DFlash2Mlp {
-    fn forward(&self, hidden: &MxArray) -> Result<MxArray> {
-        let gated = Activations::swiglu_compiled(
-            &self.gate_proj.forward(hidden)?,
-            &self.up_proj.forward(hidden)?,
-        )?;
+    fn forward(&self, hidden: &MxArray, max_rows: i64) -> Result<MxArray> {
+        let rows = hidden.shape_at(1)?;
+        let gated = match self.gate_up.as_ref().filter(|_| rows <= max_rows) {
+            Some((gate_up, split)) => {
+                let parts = gate_up.forward(hidden)?.split_sections(&[*split], -1)?;
+                Activations::swiglu_compiled(&parts[0], &parts[1])?
+            }
+            None => Activations::swiglu_compiled(
+                &self.gate_proj.forward(hidden)?,
+                &self.up_proj.forward(hidden)?,
+            )?,
+        };
         self.down_proj.forward(&gated)
     }
 }
@@ -462,10 +577,11 @@ impl DFlash2Layer {
     fn forward(
         &self,
         input: DraftResidual<'_>,
-        context: Option<&(MxArray, MxArray)>,
+        window: &mut DraftKvWindow,
         context_base: i32,
         query_base: i32,
         masks: &mut SlidingMaskMemo,
+        merged_rows: i64,
     ) -> Result<(MxArray, MxArray)> {
         let (residual, normed) = match input {
             DraftResidual::Hidden(hidden) => (hidden.clone(), self.input_norm.forward(hidden)?),
@@ -474,9 +590,18 @@ impl DFlash2Layer {
             }
         };
         let (prepared, dynamic) = self.attention_conv.prepare(&normed)?;
-        let attention =
+        let (queries, block_keys, block_values) =
             self.attention
-                .forward(&prepared, context, context_base, query_base, masks)?;
+                .project_block(&prepared, query_base, merged_rows)?;
+        let key_base = if window.len() > 0 {
+            context_base
+        } else {
+            query_base
+        };
+        let (keys, values) = window.with_block(&block_keys, &block_values)?;
+        let attention = self
+            .attention
+            .attend(&queries, &keys, &values, key_base, query_base, masks)?;
         let (hidden, normed) = DecoderLayer::add_residual_norm(
             &self.post_attention_norm,
             &residual,
@@ -485,7 +610,7 @@ impl DFlash2Layer {
         let (prepared, dynamic) = self.mlp_conv.prepare(&normed)?;
         let delta = self
             .mlp_conv
-            .finish(&self.mlp.forward(&prepared)?, &dynamic)?;
+            .finish(&self.mlp.forward(&prepared, merged_rows)?, &dynamic)?;
         Ok((hidden, delta))
     }
 }
@@ -750,8 +875,208 @@ impl CandidateSelector {
     }
 }
 
+/// Rows a draft window buffer grows by.
+const DRAFT_KV_STEP: i64 = 256;
+
+/// Whether draft projections of the given row widths may be row-merged (and
+/// the merge sliced back into views): only Tiled64 K-quant/affine linears,
+/// whose kernels decode and reduce each output row the same way at any
+/// width, and whose layout concatenates and slices in whole 64-row tiles, so
+/// every width must be a tile multiple. A projection still on MLX's affine
+/// route (no Metal, or a shape the tiled kernels do not take) is not merged:
+/// its per-row `qmv` / GEMM choice follows the width.
+fn kquant_rows_merge(packed: &QuantizedLinear, widths: &[i64]) -> bool {
+    use crate::models::quant_dispatch::{KQUANT_TILE_ROWS, split_kquant_layout};
+    split_kquant_layout(packed.mode()).1 && widths.iter().all(|w| w % KQUANT_TILE_ROWS == 0)
+}
+
+/// One draft layer's attention context: the newest `window` rows of K and V
+/// in temporal order, rows `[start, end)` of flat `[B, H, cap, D]` buffers.
+/// Appends write their rows in place (`mlx_kv_store_rows`, one dispatch for
+/// K and V) and the attention view is a slice, so neither the commit nor the
+/// propose copies the window; the buffer is only reallocated when the rows
+/// run past its end (every `DRAFT_KV_STEP` rows once the window is full).
+pub(crate) struct DraftKvWindow {
+    keys: Option<MxArray>,
+    values: Option<MxArray>,
+    start: i64,
+    end: i64,
+    window: i64,
+    /// Rows kept free past `end` so a propose can place its block in the
+    /// buffer without reallocating.
+    reserve: i64,
+}
+
+impl DraftKvWindow {
+    fn new(window: i64, reserve: i64) -> Self {
+        Self {
+            keys: None,
+            values: None,
+            start: 0,
+            end: 0,
+            window: window.max(1),
+            reserve: reserve.max(0),
+        }
+    }
+
+    /// Live rows.
+    pub(crate) fn len(&self) -> i64 {
+        self.end - self.start
+    }
+
+    fn capacity(&self) -> Result<i64> {
+        self.keys.as_ref().map_or(Ok(0), |keys| keys.shape_at(2))
+    }
+
+    /// The window `[start, end)` as `[B, H, len, D]` views, `None` when empty.
+    pub(crate) fn view(&self) -> Option<(MxArray, MxArray)> {
+        if self.end == self.start {
+            return None;
+        }
+        Some((
+            self.keys
+                .as_ref()?
+                .slice_axis(2, self.start, self.end)
+                .ok()?,
+            self.values
+                .as_ref()?
+                .slice_axis(2, self.start, self.end)
+                .ok()?,
+        ))
+    }
+
+    /// Append `[B, H, T, D]` rows (any strides) after the window; only the
+    /// newest `window` rows stay live.
+    fn append(&mut self, keys: &MxArray, values: &MxArray) -> Result<()> {
+        let mut rows = keys.shape_at(2)?;
+        let tail;
+        let (keys, values) = if rows > self.window {
+            self.start = 0;
+            self.end = 0;
+            tail = (
+                keys.slice_axis(2, rows - self.window, rows)?,
+                values.slice_axis(2, rows - self.window, rows)?,
+            );
+            rows = self.window;
+            (&tail.0, &tail.1)
+        } else {
+            (keys, values)
+        };
+        if self.end + rows + self.reserve > self.capacity()? {
+            // Move the rows that stay live to the front of fresh buffers.
+            let keep = self.len().min(self.window - rows);
+            let needed = keep + rows + self.reserve;
+            let capacity = ((needed + DRAFT_KV_STEP - 1) / DRAFT_KV_STEP * DRAFT_KV_STEP
+                + DRAFT_KV_STEP)
+                .min(self.window + self.reserve + DRAFT_KV_STEP)
+                .max(needed);
+            let fresh = |rows: &MxArray, old: Option<&MxArray>| -> Result<MxArray> {
+                let mut buffer = MxArray::zeros(
+                    &[
+                        rows.shape_at(0)?,
+                        rows.shape_at(1)?,
+                        capacity,
+                        rows.shape_at(3)?,
+                    ],
+                    Some(rows.dtype()?),
+                )?;
+                if let Some(old) = old
+                    && keep > 0
+                {
+                    let live = old.slice_axis(2, self.end - keep, self.end)?;
+                    buffer.slice_assign_axis_inplace(2, 0, keep, &live)?;
+                }
+                Ok(buffer)
+            };
+            let new_keys = fresh(keys, self.keys.as_ref())?;
+            let new_values = fresh(values, self.values.as_ref())?;
+            self.keys = Some(new_keys);
+            self.values = Some(new_values);
+            self.start = 0;
+            self.end = keep;
+        }
+        let at = self.end;
+        self.store_rows(at, keys, values)?;
+        self.end += rows;
+        self.start = self.start.max(self.end - self.window);
+        Ok(())
+    }
+
+    /// The attention view for a block: the window followed by the block's
+    /// `[B, H, T, D]` rows. The block lands in the buffer's free rows past
+    /// `end` (in place, one dispatch) and the view is one slice; a block that
+    /// does not fit, or an empty window, falls back to a concatenation. The
+    /// written rows are dead to the window and are overwritten by the next
+    /// append, whose store is ordered after this one by the shared handle.
+    fn with_block(&mut self, keys: &MxArray, values: &MxArray) -> Result<(MxArray, MxArray)> {
+        let rows = keys.shape_at(2)?;
+        let Some((context_keys, context_values)) = self.view() else {
+            return Ok((keys.clone(), values.clone()));
+        };
+        if self.end + rows > self.capacity()? {
+            return Ok((
+                MxArray::concatenate(&context_keys, keys, 2)?,
+                MxArray::concatenate(&context_values, values, 2)?,
+            ));
+        }
+        let at = self.end;
+        self.store_rows(at, keys, values)?;
+        let (Some(buffer_keys), Some(buffer_values)) = (&self.keys, &self.values) else {
+            return Err(Error::from_reason("DFlash2 draft window lost its buffers"));
+        };
+        Ok((
+            buffer_keys.slice_axis(2, self.start, self.end + rows)?,
+            buffer_values.slice_axis(2, self.start, self.end + rows)?,
+        ))
+    }
+
+    /// Write `keys` / `values` rows at `offset` in place and adopt the store
+    /// primitive's handles (same buffers); without Metal, slice_update.
+    fn store_rows(&mut self, offset: i64, keys: &MxArray, values: &MxArray) -> Result<()> {
+        let rows = keys.shape_at(2)?;
+        let (Some(buffer_keys), Some(buffer_values)) = (&self.keys, &self.values) else {
+            return Err(Error::from_reason("DFlash2 draft window has no buffers"));
+        };
+        let dst = [buffer_keys.as_raw_ptr(), buffer_values.as_raw_ptr()];
+        let src = [keys.as_raw_ptr(), values.as_raw_ptr()];
+        let offsets = [offset as i32; 2];
+        let mut out: [*mut sys::mlx_array; 2] = [std::ptr::null_mut(); 2];
+        // SAFETY: every pointer is a live array handle for the call; `out`
+        // receives owned handles (same buffers as `dst`) or stays null.
+        let fused = unsafe { sys::mlx_metal_is_available() }
+            && unsafe {
+                sys::mlx_kv_store_rows(
+                    2,
+                    dst.as_ptr(),
+                    src.as_ptr(),
+                    offsets.as_ptr(),
+                    out.as_mut_ptr(),
+                )
+            };
+        if fused {
+            self.keys = Some(MxArray::from_handle(out[0], "draft_kv_store:keys")?);
+            self.values = Some(MxArray::from_handle(out[1], "draft_kv_store:values")?);
+            return Ok(());
+        }
+        let (Some(buffer_keys), Some(buffer_values)) = (&mut self.keys, &mut self.values) else {
+            return Err(Error::from_reason("DFlash2 draft window has no buffers"));
+        };
+        buffer_keys.slice_assign_axis_inplace(2, offset, offset + rows, keys)?;
+        buffer_values.slice_assign_axis_inplace(2, offset, offset + rows, values)?;
+        Ok(())
+    }
+
+    fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
+        out.extend(self.keys.as_ref());
+        out.extend(self.values.as_ref());
+    }
+}
+
 pub(crate) struct DFlash2ContextCache {
-    layers: Vec<Gemma4LayerCache>,
+    layers: Vec<DraftKvWindow>,
+    /// The sliding mask depends only on the window/block geometry, which
+    /// repeats once the window is full, so it is built once and reused.
+    mask_memo: SlidingMaskMemo,
     logical_len: i32,
     /// Exact token prefix represented by every layer cache above.
     ///
@@ -765,8 +1090,14 @@ impl DFlash2ContextCache {
     pub(crate) fn new(config: &DFlash2Config) -> Self {
         Self {
             layers: (0..config.num_hidden_layers)
-                .map(|_| Gemma4LayerCache::new_sliding(config.sliding_window as i32 - 1))
+                .map(|_| {
+                    DraftKvWindow::new(
+                        config.sliding_window as i64 - 1,
+                        config.block_size as i64 + 1,
+                    )
+                })
                 .collect(),
+            mask_memo: None,
             logical_len: 0,
             token_history: Vec::new(),
         }
@@ -799,9 +1130,12 @@ impl DFlash2ContextCache {
                 token_ids.len()
             )));
         }
-        for (layer, cache) in model.layers.iter().zip(self.layers.iter_mut()) {
-            let (keys, values) = layer.attention.project_context(fused_context, base)?;
-            let _ = cache.update_and_fetch(&keys, &values)?;
+        for ((keys, values), window) in model
+            .project_context(fused_context, base)?
+            .iter()
+            .zip(self.layers.iter_mut())
+        {
+            window.append(keys, values)?;
         }
         self.logical_len = self
             .logical_len
@@ -842,8 +1176,8 @@ impl DFlash2ContextCache {
     }
 
     pub(crate) fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
-        for cache in &self.layers {
-            cache.collect_cache_arrays(out);
+        for window in &self.layers {
+            window.collect_arrays(out);
         }
     }
 
@@ -866,6 +1200,10 @@ pub(crate) struct DFlash2Model {
     layers: Vec<DFlash2Layer>,
     norm: RMSNorm,
     selector: CandidateSelector,
+    /// Every layer's `k|v` context projection row-merged (`k0|v0|k1|v1|…`):
+    /// the accepted rows' draft K/V for all layers in one quantized matmul.
+    /// `None` when the packed formats do not merge (per-layer projections).
+    context_kv: Option<LinearProj>,
 }
 
 impl DFlash2Model {
@@ -915,30 +1253,182 @@ impl DFlash2Model {
         )
     }
 
+    /// Row-merge the projections that share an input so each runs as one
+    /// quantized matmul: `q|k|v` and `gate|up` per layer, and every layer's
+    /// `k|v` for the context append. The merge needs K-quant projections
+    /// whose widths are whole Tiled64 tiles ([`kquant_rows_merge`]) and
+    /// agreeing packed formats; otherwise the separate projections stay.
+    /// Below the GEMM threshold the tiled kernels decode and reduce each
+    /// output row the same way at any width except the M = 8 tensor-op
+    /// route's split-K count, which follows N (`qmm_m8_nax_splits`), so a
+    /// merged block of 8 rows may differ from the separate projections in
+    /// the last bf16 bit. Per-layer merges turn the originals into row views
+    /// of the merged buffer (no extra bytes); the cross-layer `k|v` merge is
+    /// an extra resident copy, counted in `weight_bytes`.
+    fn merge_projections(&mut self) -> Result<()> {
+        let merge_rows = |first: &LinearProj, widths: &[i64]| -> bool {
+            match first {
+                LinearProj::Quantized(packed) => kquant_rows_merge(packed, widths),
+                LinearProj::Standard(_) => false,
+            }
+        };
+        for layer in &mut self.layers {
+            let attention = &mut layer.attention;
+            let q_rows = attention.num_heads * attention.head_dim;
+            let kv_rows = attention.num_kv_heads * attention.head_dim;
+            if merge_rows(&attention.q_proj, &[q_rows, kv_rows])
+                && let Some(qk) = attention.q_proj.concat_rows(&attention.k_proj)?
+                && let Some(qkv) = qk.concat_rows(&attention.v_proj)?
+            {
+                attention.q_proj = qkv.slice_rows(0, q_rows)?;
+                attention.k_proj = qkv.slice_rows(q_rows, q_rows + kv_rows)?;
+                attention.v_proj = qkv.slice_rows(q_rows + kv_rows, q_rows + 2 * kv_rows)?;
+                attention.qkv_proj = Some(qkv);
+            }
+            let mlp = &mut layer.mlp;
+            let split = self.config.intermediate_size as i64;
+            if merge_rows(&mlp.gate_proj, &[split])
+                && let Some(gate_up) = mlp.gate_proj.concat_rows(&mlp.up_proj)?
+            {
+                mlp.gate_proj = gate_up.slice_rows(0, split)?;
+                mlp.up_proj = gate_up.slice_rows(split, 2 * split)?;
+                mlp.gate_up = Some((gate_up, split));
+            }
+        }
+        let Some(first) = self.layers.first() else {
+            return Ok(());
+        };
+        let kv_rows = first.attention.num_kv_heads * first.attention.head_dim;
+        if !merge_rows(&first.attention.k_proj, &[kv_rows]) {
+            return Ok(());
+        }
+        let mut merged: Option<LinearProj> = None;
+        for layer in &self.layers {
+            for proj in [&layer.attention.k_proj, &layer.attention.v_proj] {
+                merged = match merged {
+                    None => match proj {
+                        LinearProj::Quantized(_) => {
+                            Some(proj.slice_rows(0, proj.packed_out_features()?)?)
+                        }
+                        LinearProj::Standard(_) => return Ok(()),
+                    },
+                    Some(acc) => match acc.concat_rows(proj)? {
+                        Some(next) => Some(next),
+                        None => return Ok(()),
+                    },
+                };
+            }
+        }
+        if let Some(LinearProj::Quantized(packed)) = &merged {
+            let extra = [
+                Some(packed.get_weight()),
+                Some(packed.get_scales()),
+                packed.get_biases(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|a| a.nbytes() as u64)
+            .sum::<u64>();
+            self.weight_bytes = self.weight_bytes.saturating_add(extra);
+        }
+        self.context_kv = merged;
+        Ok(())
+    }
+
+    /// Row heights the merged projections serve: a decode block (anchor +
+    /// proposals), the heights the merges were made for. Taller (prefill)
+    /// inputs take the separate projections, whose GEMM split-K then follows
+    /// each projection's own width.
+    fn merged_rows(&self) -> i64 {
+        self.config.block_size as i64 + 1
+    }
+
+    /// The accepted rows' draft K/V for every layer: `(keys, values)` per
+    /// layer as `[B, HK, T, D]`, keys normed and roped at `base + t`. With
+    /// the merged projection this is one quantized matmul, one k_norm per
+    /// layer and one RoPE over all layers' heads; otherwise per layer.
+    fn project_context(
+        &self,
+        fused_context: &MxArray,
+        base: i32,
+    ) -> Result<Vec<(MxArray, MxArray)>> {
+        let Some(context_kv) = self.context_kv.as_ref().filter(|_| {
+            fused_context
+                .shape_at(1)
+                .is_ok_and(|rows| rows <= self.merged_rows())
+        }) else {
+            return self
+                .layers
+                .iter()
+                .map(|layer| layer.attention.project_context(fused_context, base))
+                .collect();
+        };
+        let Some(first) = self.layers.first() else {
+            return Ok(Vec::new());
+        };
+        let kv_width = first.attention.num_kv_heads * first.attention.head_dim;
+        let bounds = (1..2 * self.layers.len() as i64)
+            .map(|i| i * kv_width)
+            .collect::<Vec<_>>();
+        let parts = context_kv
+            .forward(fused_context)?
+            .split_sections(&bounds, -1)?;
+        let mut keys = Vec::with_capacity(self.layers.len());
+        let mut values = Vec::with_capacity(self.layers.len());
+        for (layer, pair) in self.layers.iter().zip(parts.as_chunks::<2>().0) {
+            let attention = &layer.attention;
+            let normed = attention.k_norm.forward(&pair[0].reshape(&[
+                pair[0].shape_at(0)?,
+                pair[0].shape_at(1)?,
+                attention.num_kv_heads,
+                attention.head_dim,
+            ])?)?;
+            keys.push(normed.transpose(Some(&[0, 2, 1, 3]))?);
+            values.push(attention.finish_values(&pair[1])?);
+        }
+        let roped = first.attention.rope.forward(
+            &MxArray::concatenate_many(keys.iter().collect(), Some(1))?,
+            Some(base),
+        )?;
+        let head_bounds = (1..self.layers.len() as i64)
+            .map(|i| i * first.attention.num_kv_heads)
+            .collect::<Vec<_>>();
+        Ok(roped
+            .split_sections(&head_bounds, 1)?
+            .into_iter()
+            .zip(values)
+            .collect())
+    }
+
     fn forward_hidden(
         &self,
         target_embedding: &Embedding,
         block_ids: &MxArray,
         query_base: i32,
-        context: &DFlash2ContextCache,
+        context: &mut DFlash2ContextCache,
     ) -> Result<MxArray> {
         let embedded = target_embedding.forward(block_ids)?;
         let mut pending: Option<(MxArray, MxArray)> = None;
-        let mut masks: SlidingMaskMemo = None;
-        for (index, layer) in self.layers.iter().enumerate() {
-            let cached = context.layers[index].get_cached_kv();
-            let live_len = cached
-                .as_ref()
-                .map(|(keys, _)| keys.shape_at(2))
-                .transpose()?
-                .unwrap_or(0) as i32;
-            let context_base = context.logical_len.saturating_sub(live_len);
+        let DFlash2ContextCache {
+            layers: windows,
+            mask_memo,
+            logical_len,
+            ..
+        } = context;
+        for (layer, window) in self.layers.iter().zip(windows.iter_mut()) {
+            let context_base = logical_len.saturating_sub(window.len() as i32);
             let input = match &pending {
                 Some((hidden, delta)) => DraftResidual::Pending(hidden, delta),
                 None => DraftResidual::Hidden(&embedded),
             };
-            let next =
-                layer.forward(input, cached.as_ref(), context_base, query_base, &mut masks)?;
+            let next = layer.forward(
+                input,
+                window,
+                context_base,
+                query_base,
+                mask_memo,
+                self.merged_rows(),
+            )?;
             pending = Some(next);
         }
         match &pending {
@@ -953,7 +1443,7 @@ impl DFlash2Model {
         &self,
         target_embedding: &Embedding,
         target_lm_head: Option<&LinearProj>,
-        context: &DFlash2ContextCache,
+        context: &mut DFlash2ContextCache,
         anchor: u32,
         max_len: usize,
         temperature: f64,
@@ -973,12 +1463,19 @@ impl DFlash2Model {
         let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
         let t0 = std::time::Instant::now();
         let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
-        let hidden = self.forward_hidden(target_embedding, &block, context.logical_len, context)?;
-        let hidden = hidden.slice_axis(1, 1, max_len as i64 + 1)?;
+        let query_base = context.logical_len;
+        let hidden = self.forward_hidden(target_embedding, &block, query_base, context)?;
+        // The head runs on the whole block (anchor + proposals, 8 rows), the
+        // height its K-quant M = 8 route serves, and the anchor row's logits
+        // are dropped: at 7 rows the head took the per-row kernel and cost
+        // more than at 8.
         let logits = match target_lm_head {
             Some(head) => head.forward(&hidden)?,
             None => target_embedding.as_linear(&hidden)?,
         };
+        let rows = max_len as i64 + 1;
+        let hidden = hidden.slice_axis(1, 1, rows)?;
+        let logits = logits.slice_axis(1, 1, rows)?;
         let out = self
             .selector
             .select(&hidden, &logits, anchor, temperature, device_path, rng)?;
@@ -1081,6 +1578,7 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
         k_proj: linear(hidden, config.num_key_value_heads * head_dim)?,
         v_proj: linear(hidden, config.num_key_value_heads * head_dim)?,
         o_proj: linear(config.num_attention_heads * head_dim, hidden)?,
+        qkv_proj: None,
         q_norm: norm(head_dim)?,
         k_norm: norm(head_dim)?,
         rope: RoPE::new(head_dim as i32, Some(false), Some(config.rope_theta), None),
@@ -1095,6 +1593,7 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
             gate_proj: linear(hidden, config.intermediate_size)?,
             up_proj: linear(hidden, config.intermediate_size)?,
             down_proj: linear(config.intermediate_size, hidden)?,
+            gate_up: None,
         },
         input_norm: norm(hidden)?,
         post_attention_norm: norm(hidden)?,
@@ -1116,6 +1615,7 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
         layers: vec![layer],
         config,
         weight_bytes: 0,
+        context_kv: None,
     })
 }
 
@@ -1145,10 +1645,15 @@ fn validate_tensor(value: &MxArray, key: &str, shape: &[i64]) -> Result<()> {
 
 /// The published DFlash2 companion ships bf16. Its dense projections load as
 /// affine Q4/group64: against bf16 and Q8 it kept teacher-forced acceptance
-/// within noise and gave the lowest decode time per committed token. The
-/// draft reuses the target output head. A change of draft precision moves
-/// proposals and verify grouping, so it can change the transcript even
-/// though the target verifies every emitted token.
+/// within noise and gave the lowest decode time per committed token. On a
+/// Metal host the packed arrays are then tiled into the K-quant `a4g64@t64`
+/// contract (same codes, same bf16 scale and bias per group), so a decode
+/// block's 8 rows take the tensor-op `qmm_m8_nax_t64` kernel instead of
+/// MLX's per-row affine `qmv` (which read the weights once per row: ~2.2x
+/// the bandwidth floor at M = 8). The draft reuses the target output head.
+/// A change of draft precision moves proposals and verify grouping, so it
+/// can change the transcript even though the target verifies every emitted
+/// token.
 const DRAFT_GROUP_SIZE: i32 = 64;
 const DRAFT_BITS: i32 = 4;
 
@@ -1192,6 +1697,41 @@ fn quantize_affine(
     Ok((packed, scales, biases))
 }
 
+/// Quantize a floating `[out, in]` weight to affine Q4/group64 as a
+/// `QuantizedLinear`, tiled into the `a4g64@t64` K-quant contract when this
+/// host runs the `_t64` kernels ([`QuantizedLinear::tile_kquant_layout_any_shape`]:
+/// the draft's widths were gated on their own numbers, not the generic
+/// affine shape rule; the row-major arrays are released). The shape must be tileable
+/// (`N % 64 == 0`, `K % 256 == 0`) on every host: an odd draft geometry
+/// fails here rather than silently taking a slower layout.
+fn quantize_draft_weight(weight: &MxArray, name: &str) -> Result<QuantizedLinear> {
+    use crate::models::quant_dispatch::{kquant_tileable, kquant_tiled_enabled};
+    let shape = weight.shape()?;
+    let (rows, k) = (shape[0], shape[1]);
+    if !kquant_tileable(rows, k) {
+        return Err(Error::from_reason(format!(
+            "DFlash2 draft projection '{name}' is [{rows}, {k}]; the a{DRAFT_BITS}g{DRAFT_GROUP_SIZE} \
+             Tiled64 layout needs N % 64 == 0 and K % 256 == 0"
+        )));
+    }
+    let (packed, scales, biases) = quantize_affine(weight, DRAFT_GROUP_SIZE, DRAFT_BITS)?;
+    let mut linear = QuantizedLinear::new(
+        packed,
+        scales,
+        Some(biases),
+        None,
+        DRAFT_GROUP_SIZE,
+        DRAFT_BITS,
+        "affine".to_string(),
+    );
+    if kquant_tiled_enabled() && !linear.tile_kquant_layout_any_shape()? {
+        return Err(Error::from_reason(format!(
+            "DFlash2 draft projection '{name}' [{rows}, {k}] did not tile"
+        )));
+    }
+    Ok(linear)
+}
+
 /// Builds a draft projection as affine Q4/group64. `savings` accumulates
 /// `dense − resident` bytes so the loader can report true residency rather
 /// than the bf16 file size.
@@ -1202,23 +1742,14 @@ fn draft_linear(
     output: usize,
     savings: &mut u64,
 ) -> Result<LinearProj> {
-    let weight = required(
-        params,
-        &format!("{prefix}.weight"),
-        &[output as i64, input as i64],
-    )?;
-    let (packed, scales, biases) = quantize_affine(&weight, DRAFT_GROUP_SIZE, DRAFT_BITS)?;
-    let resident = packed.nbytes() as u64 + scales.nbytes() as u64 + biases.nbytes() as u64;
+    let key = format!("{prefix}.weight");
+    let weight = required(params, &key, &[output as i64, input as i64])?;
+    let linear = quantize_draft_weight(&weight, &key)?;
+    let resident = linear.get_weight().nbytes() as u64
+        + linear.get_scales().nbytes() as u64
+        + linear.get_biases().map_or(0, |b| b.nbytes() as u64);
     *savings += (weight.nbytes() as u64).saturating_sub(resident);
-    Ok(LinearProj::Quantized(QuantizedLinear::new(
-        packed,
-        scales,
-        Some(biases),
-        None,
-        DRAFT_GROUP_SIZE,
-        DRAFT_BITS,
-        "affine".to_string(),
-    )))
+    Ok(LinearProj::Quantized(linear))
 }
 
 fn dense_linear(
@@ -1505,6 +2036,7 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
                 hidden,
                 &mut savings,
             )?,
+            qkv_proj: None,
             q_norm: norm(
                 &mut params,
                 &format!("{attention_base}.q_norm.weight"),
@@ -1551,6 +2083,7 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
                 hidden,
                 &mut savings,
             )?,
+            gate_up: None,
         };
         let input_norm = norm(
             &mut params,
@@ -1608,18 +2141,19 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         )));
     }
     let weight_bytes = weight_bytes.saturating_sub(savings);
-    Ok((
-        DFlash2Model {
-            config,
-            weight_bytes,
-            fc,
-            hidden_norm,
-            layers,
-            norm: final_norm,
-            selector,
-        },
+    let mut model = DFlash2Model {
+        config,
         weight_bytes,
-    ))
+        fc,
+        hidden_norm,
+        layers,
+        norm: final_norm,
+        selector,
+        context_kv: None,
+    };
+    model.merge_projections()?;
+    let weight_bytes = model.weight_bytes;
+    Ok((model, weight_bytes))
 }
 
 #[cfg(test)]
@@ -1632,16 +2166,18 @@ mod tests {
     use crate::models::quantized_linear::LinearProj;
     use crate::nn::{Embedding, Linear};
 
+    /// The smallest geometry whose every draft projection is tileable
+    /// (`N % 64 == 0`, `K % 256 == 0`): o_proj's K is `heads * head_dim`.
     fn checkpoint_inventory_config() -> DFlash2Config {
         DFlash2Config {
             block_size: 7,
             mask_token_id: 0,
             target_layers: vec![0, 1],
             target_num_layers: 2,
-            hidden_size: 64,
-            intermediate_size: 128,
+            hidden_size: 256,
+            intermediate_size: 256,
             num_hidden_layers: 1,
-            num_attention_heads: 1,
+            num_attention_heads: 4,
             num_key_value_heads: 1,
             head_dim: 64,
             vocab_size: 32,
@@ -1703,7 +2239,7 @@ mod tests {
         }
         params.insert(
             "fc.scales".into(),
-            MxArray::zeros(&[64, 2], Some(DType::BFloat16)).unwrap(),
+            MxArray::zeros(&[256, 2], Some(DType::BFloat16)).unwrap(),
         );
         assert!(
             super::validate_tensor_inventory(&params, &config)
@@ -1716,18 +2252,31 @@ mod tests {
     #[test]
     fn selector_linear_keeps_checkpoint_precision() {
         let mut params = checkpoint_inventory();
-        let projection = super::dense_linear(&mut params, "fc", 128, 64).unwrap();
+        let projection = super::dense_linear(&mut params, "fc", 512, 256).unwrap();
         assert!(matches!(projection, LinearProj::Standard(_)));
         assert_eq!(projection.get_weight().dtype().unwrap(), DType::BFloat16);
     }
 
+    /// The mode a draft projection carries on this host: the affine arrays
+    /// tiled into the K-quant contract where the `_t64` kernels run, MLX's
+    /// own affine route elsewhere.
+    fn draft_mode() -> &'static str {
+        if crate::models::quant_dispatch::kquant_tiled_enabled() {
+            "a4g64@t64"
+        } else {
+            "affine"
+        }
+    }
+
     /// Asserts an affine Q4/group64 projection of a bf16 `[rows, cols]`
-    /// weight: 8 codes per u32 and one bf16 scale/offset pair per 64 inputs.
+    /// weight: 8 codes per u32 and one bf16 scale/offset pair per 64 inputs
+    /// (the Tiled64 permutation keeps the 2-D shapes).
     fn assert_q4_group64(projection: &LinearProj, rows: i64, cols: i64, name: &str) {
         let LinearProj::Quantized(packed) = projection else {
             panic!("{name}: draft projection must load quantized");
         };
-        assert_eq!(packed.mode(), "affine", "{name}");
+        assert_eq!(packed.mode(), draft_mode(), "{name}");
+        assert_eq!(packed.bits(), 4, "{name}");
         assert_eq!(
             packed.get_weight().dtype().unwrap(),
             DType::Uint32,
@@ -1739,11 +2288,17 @@ mod tests {
             "{name}: packed codes"
         );
         assert_eq!(
+            packed.get_scales().dtype().unwrap(),
+            DType::BFloat16,
+            "{name}"
+        );
+        assert_eq!(
             packed.get_scales().shape().unwrap().as_ref(),
             &[rows, cols / 64],
             "{name}: scales"
         );
         let biases = packed.get_biases().expect("affine Q4 has offsets");
+        assert_eq!(biases.dtype().unwrap(), DType::BFloat16, "{name}");
         assert_eq!(
             biases.shape().unwrap().as_ref(),
             &[rows, cols / 64],
@@ -1751,52 +2306,70 @@ mod tests {
         );
     }
 
+    /// `draft_linear` keeps the affine Q4/group64 numerics through the
+    /// tiled contract: integer endpoints spanning exactly 15 steps decode
+    /// exactly, in rows of either sign (stored offsets), on every route a
+    /// decode block reaches (M = 1, 8 and a prefill height).
     #[test]
     fn draft_linear_is_q4_group64_with_exact_endpoints_and_residency() {
-        // Integer endpoints span exactly 15 steps, so affine Q4 retains both
-        // values exactly. Opposite-sign rows also check stored offsets.
-        let values = (0..256)
+        let (rows, cols) = (64i64, 256i64);
+        let values = (0..rows * cols)
             .map(|i| {
-                if i % 2 == 0 {
+                let (row, col) = (i / cols, i % cols);
+                if col % 2 == 0 {
                     0.0
-                } else if i < 128 {
+                } else if row % 2 == 0 {
                     15.0
                 } else {
                     -15.0
                 }
             })
             .collect::<Vec<_>>();
-        let weight = MxArray::from_float32(&values, &[2, 128])
+        let weight = MxArray::from_float32(&values, &[rows, cols])
             .unwrap()
             .astype(DType::BFloat16)
             .unwrap();
-        let source_values = weight.to_float32().unwrap().to_vec();
         let mut params = std::collections::HashMap::from([("fc.weight".into(), weight.clone())]);
         let mut savings = 0;
-        let projection = super::draft_linear(&mut params, "fc", 128, 2, &mut savings).unwrap();
-        assert_q4_group64(&projection, 2, 128, "fc");
+        let projection = super::draft_linear(
+            &mut params,
+            "fc",
+            cols as usize,
+            rows as usize,
+            &mut savings,
+        )
+        .unwrap();
+        assert_q4_group64(&projection, rows, cols, "fc");
         let LinearProj::Quantized(packed) = &projection else {
             unreachable!();
         };
         let resident = packed.get_weight().nbytes()
             + packed.get_scales().nbytes()
             + packed.get_biases().map_or(0, |biases| biases.nbytes());
-        // Each row owns 64 packed bytes and two bf16 scale/offset pairs.
-        assert_eq!(resident, 2 * (64 + 4 + 4));
+        // Each row owns 128 packed bytes and four bf16 scale/offset pairs.
+        assert_eq!(resident as i64, rows * (cols / 2 + cols / 64 * 4));
         assert_eq!(savings, weight.nbytes() as u64 - resident as u64);
         assert!(params.is_empty());
-        assert_eq!(weight.dtype().unwrap(), DType::BFloat16);
-        assert_eq!(
-            weight.to_float32().unwrap().as_ref(),
-            source_values.as_slice()
-        );
 
-        let input = MxArray::from_float32(&[1.0; 128], &[1, 128])
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap();
-        let output = projection.forward(&input).unwrap().to_float32().unwrap();
-        assert_eq!(output.as_ref(), &[960.0, -960.0]);
+        // Every row sums its 128 non-zero entries: +-1920, exact in bf16.
+        let want = (0..rows)
+            .map(|row| if row % 2 == 0 { 1920.0 } else { -1920.0 })
+            .collect::<Vec<f32>>();
+        for m in [1i64, 8, 87] {
+            let input = MxArray::ones(&[1, m, cols], Some(DType::BFloat16)).unwrap();
+            let output = projection.forward(&input).unwrap().to_float32().unwrap();
+            assert_eq!(output.len() as i64, m * rows, "M={m}");
+            for (row, got) in output.chunks_exact(rows as usize).enumerate() {
+                assert_eq!(got, want.as_slice(), "M={m} input row {row}");
+            }
+        }
+
+        // An untileable geometry fails loud rather than loading slower.
+        let odd = MxArray::zeros(&[2, 128], Some(DType::BFloat16)).unwrap();
+        let Err(err) = super::quantize_draft_weight(&odd, "odd") else {
+            panic!("an untileable draft weight must be refused");
+        };
+        assert!(err.to_string().contains("N % 64 == 0"), "{err}");
     }
 
     #[test]
@@ -1865,18 +2438,30 @@ mod tests {
                 || name.ends_with("_proj.weight")
                 || name.ends_with(".kernel_projection.weight")
         };
-        let expected_bytes = shapes
+        let packed_bytes = |elements: u64| elements / 2 + elements / 64 * 4;
+        let mut expected_bytes = shapes
             .iter()
             .map(|(name, shape)| {
                 let elements = shape.iter().product::<i64>() as u64;
                 if projection(name) {
                     // u32 codes at 4 bits plus bf16 scale and offset per 64.
-                    elements / 2 + elements / 64 * 4
+                    packed_bytes(elements)
                 } else {
                     elements * 2
                 }
             })
             .sum::<u64>();
+        // The merges follow the tiled contract: on a Metal host every
+        // projection tiles, so q|k|v, gate|up and the cross-layer k|v (a
+        // second resident copy of k/v) all exist.
+        let tiled = crate::models::quant_dispatch::kquant_tiled_enabled();
+        assert_eq!(model.context_kv.is_some(), tiled);
+        assert_eq!(model.layers[0].attention.qkv_proj.is_some(), tiled);
+        assert_eq!(model.layers[0].mlp.gate_up.is_some(), tiled);
+        if model.context_kv.is_some() {
+            let kv = (config.num_key_value_heads * config.head_dim * config.hidden_size) as u64;
+            expected_bytes += 2 * packed_bytes(kv) * config.num_hidden_layers as u64;
+        }
         assert_eq!(bytes, expected_bytes);
         assert_eq!(model.weight_bytes, expected_bytes);
 
@@ -2575,16 +3160,35 @@ mod tests {
         assert_eq!(model.config.block_size, 7);
         assert_eq!(model.config.target_layers, vec![5, 19, 33, 47, 61]);
         // Q4/group64 projections: ~1.27 GB resident versus 3.85 GB bf16
-        // and ~2.17 GB at Q8/group64.
+        // and ~2.17 GB at Q8/group64, plus the cross-layer k|v copy.
         assert!(
             bytes > 1_000_000_000 && bytes < 1_500_000_000,
             "resident draft bytes {bytes}"
         );
+        // Every projection of the published geometry tiles (hidden 5120,
+        // 32/8 heads of 128, intermediate 17408, fc K = 25600, conv N =
+        // 1280) and the merges follow.
+        let tiled = crate::models::quant_dispatch::kquant_tiled_enabled();
+        assert_q4_group64(&model.fc, 5120, 25600, "fc");
+        for layer in &model.layers {
+            assert_eq!(layer.attention.qkv_proj.is_some(), tiled, "q|k|v merge");
+            assert_eq!(layer.mlp.gate_up.is_some(), tiled, "gate|up merge");
+            assert_q4_group64(&layer.attention.o_proj, 5120, 4096, "o_proj");
+            assert_q4_group64(&layer.mlp.down_proj, 5120, 17408, "down_proj");
+            assert_q4_group64(
+                &layer.attention_conv.kernel_projection,
+                1280,
+                5120,
+                "attention_conv",
+            );
+        }
+        assert_eq!(model.context_kv.is_some(), tiled, "cross-layer k|v merge");
     }
 
     fn three_layer_tiny_draft() -> super::DFlash2Model {
         let target = super::super::config::Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: 64,
             num_layers: 4,
@@ -2649,7 +3253,7 @@ mod tests {
     ) -> MxArray {
         let mut hidden = embedding.forward(block_ids).unwrap();
         for (index, layer) in model.layers.iter().enumerate() {
-            let cached = context.layers[index].get_cached_kv();
+            let cached = context.layers[index].view();
             let live_len = cached
                 .as_ref()
                 .map(|(keys, _)| keys.shape_at(2).unwrap())
@@ -2661,15 +3265,41 @@ mod tests {
                 .prepare(&layer.input_norm.forward(&hidden).unwrap())
                 .unwrap();
             let mut fresh = None;
-            let attention = layer
-                .attention
+            // The pre-window path: the block's K/V concatenated after a copy
+            // of the context, the three projections and the four-op
+            // norm/rope chain.
+            let attention = &layer.attention;
+            let (batch, seq) = (prepared.shape_at(0).unwrap(), prepared.shape_at(1).unwrap());
+            let queries = attention
+                .q_proj
+                .forward(&prepared)
+                .unwrap()
+                .reshape(&[batch, seq, attention.num_heads, attention.head_dim])
+                .unwrap();
+            let queries = attention
+                .rope
                 .forward(
-                    &prepared,
-                    cached.as_ref(),
-                    context_base,
-                    query_base,
-                    &mut fresh,
+                    &attention
+                        .q_norm
+                        .forward(&queries)
+                        .unwrap()
+                        .transpose(Some(&[0, 2, 1, 3]))
+                        .unwrap(),
+                    Some(query_base),
                 )
+                .unwrap();
+            let (block_keys, block_values) =
+                attention.project_context(&prepared, query_base).unwrap();
+            let (keys, values, key_base) = match &cached {
+                Some((context_keys, context_values)) => (
+                    MxArray::concatenate(context_keys, &block_keys, 2).unwrap(),
+                    MxArray::concatenate(context_values, &block_values, 2).unwrap(),
+                    context_base,
+                ),
+                None => (block_keys, block_values, query_base),
+            };
+            let attention = attention
+                .attend(&queries, &keys, &values, key_base, query_base, &mut fresh)
                 .unwrap();
             hidden = residual
                 .add(&layer.attention_conv.finish(&attention, &dynamic).unwrap())
@@ -2682,12 +3312,383 @@ mod tests {
                 .add(
                     &layer
                         .mlp_conv
-                        .finish(&layer.mlp.forward(&prepared).unwrap(), &dynamic)
+                        .finish(&layer.mlp.forward(&prepared, 8).unwrap(), &dynamic)
                         .unwrap(),
                 )
                 .unwrap();
         }
         model.norm.forward(&hidden).unwrap()
+    }
+
+    /// A draft at the published Qwen3.8 attention geometry (hidden 5120,
+    /// 32/8 heads of 128, affine Q4/g64 as `draft_linear` loads it) with
+    /// random weights.
+    fn quantized_draft_model(layers: usize, intermediate: usize) -> super::DFlash2Model {
+        use super::{DFlash2Attention, DFlash2Layer, DFlash2Mlp, GroupedDynamicCausalConv};
+        use crate::nn::{RMSNorm, RoPE};
+        let (hidden, heads, kv_heads, head_dim) = (5120usize, 32i64, 8i64, 128i64);
+        let eps = 1e-6;
+        let quantized = |input: usize, output: usize| -> LinearProj {
+            let weight = MxArray::random_normal(
+                &[output as i64, input as i64],
+                0.0,
+                0.02,
+                Some(DType::BFloat16),
+            )
+            .unwrap();
+            LinearProj::Quantized(super::quantize_draft_weight(&weight, "test").unwrap())
+        };
+        let norm = |size: i64| {
+            RMSNorm::from_weight(
+                &MxArray::random_normal(&[size], 1.0, 0.2, Some(DType::BFloat16)).unwrap(),
+                Some(eps),
+            )
+            .unwrap()
+        };
+        let conv = || GroupedDynamicCausalConv {
+            base_kernel: MxArray::random_normal(
+                &[2, 2, hidden as i64],
+                0.0,
+                0.02,
+                Some(DType::BFloat16),
+            )
+            .unwrap(),
+            kernel_projection: quantized(hidden, 4 * (hidden / 16)),
+            kernel_size: 2,
+            group_size: 16,
+        };
+        let config = super::DFlash2Config {
+            block_size: 7,
+            mask_token_id: 0,
+            target_layers: vec![1, 3],
+            target_num_layers: 4,
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            num_hidden_layers: layers,
+            num_attention_heads: heads as usize,
+            num_key_value_heads: kv_heads as usize,
+            head_dim: head_dim as usize,
+            vocab_size: 64,
+            rms_norm_eps: eps,
+            max_position_embeddings: 262_144,
+            sliding_window: 2048,
+            conv_group_size: 16,
+            conv_kernel_size: 2,
+            selector_rank: 8,
+            selector_top_k: 4,
+            rope_theta: 10_000_000.0,
+        };
+        super::DFlash2Model {
+            fc: quantized(hidden * 2, hidden),
+            hidden_norm: norm(hidden as i64),
+            norm: norm(hidden as i64),
+            selector: test_selector(64, 4, 8, hidden),
+            layers: (0..layers)
+                .map(|_| DFlash2Layer {
+                    attention: DFlash2Attention {
+                        q_proj: quantized(hidden, (heads * head_dim) as usize),
+                        k_proj: quantized(hidden, (kv_heads * head_dim) as usize),
+                        v_proj: quantized(hidden, (kv_heads * head_dim) as usize),
+                        o_proj: quantized((heads * head_dim) as usize, hidden),
+                        qkv_proj: None,
+                        q_norm: norm(head_dim),
+                        k_norm: norm(head_dim),
+                        rope: RoPE::new(
+                            head_dim as i32,
+                            Some(false),
+                            Some(config.rope_theta),
+                            None,
+                        ),
+                        num_heads: heads,
+                        num_kv_heads: kv_heads,
+                        head_dim,
+                        sliding_window: config.sliding_window as i64,
+                    },
+                    mlp: DFlash2Mlp {
+                        gate_proj: quantized(hidden, intermediate),
+                        up_proj: quantized(hidden, intermediate),
+                        down_proj: quantized(intermediate, hidden),
+                        gate_up: None,
+                    },
+                    input_norm: norm(hidden as i64),
+                    post_attention_norm: norm(hidden as i64),
+                    attention_conv: conv(),
+                    mlp_conv: conv(),
+                })
+                .collect(),
+            config,
+            weight_bytes: 0,
+            context_kv: None,
+        }
+    }
+
+    fn bits(array: &MxArray) -> Vec<u16> {
+        array.eval();
+        array.to_uint16_native().unwrap()
+    }
+
+    /// The merge gate admits K-quant projections (a tiled one only at whole
+    /// tile widths) and declines MLX's affine route and dense projections.
+    #[test]
+    fn merge_rows_gate_follows_the_packed_contract() {
+        use super::kquant_rows_merge;
+        use crate::models::quantized_linear::QuantizedLinear;
+        let packed = |mode: &str| {
+            QuantizedLinear::new(
+                MxArray::zeros(&[64, 32], Some(DType::Uint32)).unwrap(),
+                MxArray::zeros(&[64, 4], Some(DType::BFloat16)).unwrap(),
+                Some(MxArray::zeros(&[64, 4], Some(DType::BFloat16)).unwrap()),
+                None,
+                64,
+                4,
+                mode.to_string(),
+            )
+        };
+        assert!(kquant_rows_merge(&packed("a4g64@t64"), &[64, 1024]));
+        assert!(!kquant_rows_merge(&packed("a4g64@t64"), &[64, 96]));
+        assert!(kquant_rows_merge(&packed("q4k@t64"), &[128]));
+        assert!(!kquant_rows_merge(&packed("q4k"), &[64]));
+        assert!(!kquant_rows_merge(&packed("affine"), &[64]));
+        assert!(!kquant_rows_merge(&packed("mxfp4"), &[64]));
+    }
+
+    /// The flat window holds exactly the newest `window` appended rows in
+    /// order through growth, reallocation and over-window appends, and
+    /// `with_block` presents the window followed by the block, bit for bit
+    /// like a concatenation — while the block rows it parks past the window
+    /// never leak into later views.
+    #[test]
+    fn draft_kv_window_matches_rolling_concatenation() {
+        let (heads, dim, window) = (2i64, 16i64, 20i64);
+        let rows = |t: i64| {
+            (
+                MxArray::random_normal(&[1, heads, t, dim], 0.0, 1.0, Some(DType::BFloat16))
+                    .unwrap(),
+                MxArray::random_normal(&[1, t, heads, dim], 0.0, 1.0, Some(DType::BFloat16))
+                    .unwrap()
+                    .transpose(Some(&[0, 2, 1, 3]))
+                    .unwrap(),
+            )
+        };
+        let mut live = super::DraftKvWindow::new(window, 3);
+        let mut all_keys: Option<MxArray> = None;
+        let mut all_values: Option<MxArray> = None;
+        for (appends, t) in [
+            1i64, 3, 8, 1, 7, 5, 2, 25, 1, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (block_keys, block_values) = rows(t);
+            let (keys, values) = live.with_block(&block_keys, &block_values).unwrap();
+            let (want_keys, want_values) = match (&all_keys, &all_values) {
+                (Some(k), Some(v)) => {
+                    let n = k.shape_at(2).unwrap();
+                    let (k, v) = (
+                        k.slice_axis(2, (n - window).max(0), n).unwrap(),
+                        v.slice_axis(2, (n - window).max(0), n).unwrap(),
+                    );
+                    (
+                        MxArray::concatenate(&k, &block_keys, 2).unwrap(),
+                        MxArray::concatenate(&v, &block_values, 2).unwrap(),
+                    )
+                }
+                _ => (block_keys.clone(), block_values.clone()),
+            };
+            assert_eq!(
+                bits(&keys),
+                bits(&want_keys),
+                "append {appends}: block view keys"
+            );
+            assert_eq!(
+                bits(&values),
+                bits(&want_values),
+                "append {appends}: block view values"
+            );
+            let (context_keys, context_values) = rows(t);
+            live.append(&context_keys, &context_values).unwrap();
+            all_keys = Some(match all_keys {
+                Some(k) => MxArray::concatenate(&k, &context_keys, 2).unwrap(),
+                None => context_keys,
+            });
+            all_values = Some(match all_values {
+                Some(v) => MxArray::concatenate(&v, &context_values, 2).unwrap(),
+                None => context_values,
+            });
+            let n = all_keys.as_ref().unwrap().shape_at(2).unwrap();
+            let (keys, values) = live.view().unwrap();
+            assert_eq!(live.len(), n.min(window));
+            assert_eq!(
+                bits(&keys),
+                bits(
+                    &all_keys
+                        .as_ref()
+                        .unwrap()
+                        .slice_axis(2, (n - window).max(0), n)
+                        .unwrap()
+                ),
+                "append {appends}: window keys"
+            );
+            assert_eq!(
+                bits(&values),
+                bits(
+                    &all_values
+                        .as_ref()
+                        .unwrap()
+                        .slice_axis(2, (n - window).max(0), n)
+                        .unwrap()
+                ),
+                "append {appends}: window values"
+            );
+        }
+    }
+
+    /// bf16 bit patterns `got` against `want`: identical when `exact`, else
+    /// (the M = 8 heights, where the merged width changes the tensor-op
+    /// split-K and so the fp32 summation order) every element within 2^-6
+    /// of the tensor's largest magnitude and at most 5% of them differing
+    /// at all — last-bit flips, not a wrong row or slice.
+    fn assert_bits_match(got: &[u16], want: &[u16], exact: bool, label: &str) {
+        assert_eq!(got.len(), want.len(), "{label}: length");
+        if exact {
+            assert!(got == want, "{label}: bits differ");
+            return;
+        }
+        let f = |b: u16| half::bf16::from_bits(b).to_f32();
+        let scale = want.iter().map(|&w| f(w).abs()).fold(0f32, f32::max);
+        let worst = got
+            .iter()
+            .zip(want)
+            .map(|(&g, &w)| (f(g) - f(w)).abs())
+            .fold(0f32, f32::max);
+        let differing = got.iter().zip(want).filter(|(g, w)| g != w).count();
+        assert!(
+            worst <= scale / 64.0 && differing * 20 <= got.len(),
+            "{label}: max |diff| {worst} of scale {scale}, {differing}/{} elements differ",
+            got.len()
+        );
+    }
+
+    /// The merged `q|k|v`, `gate|up` and cross-layer `k|v` matmuls, the
+    /// fused q/k norm + RoPE kernel and the one RoPE over all layers' keys
+    /// must reproduce the separate projections and the four-op chain at the
+    /// real head geometry. Bit for bit at 1..=7 rows (the tiled `qmv_t64` /
+    /// `qmv_wide_t64` kernels reduce each row the same way at any width) and
+    /// at a prefill-high 87 rows (the merge is bypassed: the GEMM split-K
+    /// follows N). At 8 rows the `qmm_m8_nax_t64` split-K count follows N
+    /// too (`qmm_m8_nax_splits`: k/v at N = 1024 split 8 ways, the merged
+    /// q|k|v at 6144 4 ways), so the merged widths round the fp32 partial
+    /// sums differently in a few last bits: `assert_bits_match` bounds it.
+    #[test]
+    fn merged_draft_projections_match_separate_bits() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            eprintln!("skipping: Metal only");
+            return;
+        }
+        let mut model = quantized_draft_model(3, 4096);
+        let heights = [1i64, 2, 3, 4, 5, 6, 7, 8, 87];
+        let inputs = heights
+            .iter()
+            .map(|&t| {
+                MxArray::random_normal(&[1, t, 5120], 0.0, 1.0, Some(DType::BFloat16)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let base = 1234;
+        // References from the unmerged model: the four-op norm/rope chain,
+        // separate matmuls, per-layer context projections.
+        let mut want = Vec::new();
+        for x in &inputs {
+            let seq = x.shape_at(1).unwrap();
+            let mut per_layer = Vec::new();
+            for layer in &model.layers {
+                let attention = &layer.attention;
+                let queries = attention
+                    .q_proj
+                    .forward(x)
+                    .unwrap()
+                    .reshape(&[1, seq, attention.num_heads, attention.head_dim])
+                    .unwrap();
+                let queries = attention
+                    .rope
+                    .forward(
+                        &attention
+                            .q_norm
+                            .forward(&queries)
+                            .unwrap()
+                            .transpose(Some(&[0, 2, 1, 3]))
+                            .unwrap(),
+                        Some(base),
+                    )
+                    .unwrap();
+                let (keys, values) = attention.project_context(x, base).unwrap();
+                per_layer.push((
+                    bits(&queries),
+                    bits(&keys),
+                    bits(&values),
+                    bits(&layer.mlp.forward(x, 0).unwrap()),
+                ));
+            }
+            let context = model
+                .project_context(x, base)
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (bits(k), bits(v)))
+                .collect::<Vec<_>>();
+            want.push((per_layer, context));
+        }
+        model.merge_projections().unwrap();
+        assert!(model.context_kv.is_some(), "cross-layer k|v merge");
+        let probe = |heads: i64| {
+            MxArray::random_normal(&[1, 8, heads, 128], 0.0, 1.0, Some(DType::BFloat16)).unwrap()
+        };
+        assert!(
+            model.layers[0]
+                .attention
+                .fused_qk_norm_rope(&probe(32), &probe(8), base)
+                .is_some(),
+            "the fused norm/rope kernel must serve the draft geometry"
+        );
+        // Bitwise equality between the merged and separate projections
+        // holds only where the width change keeps the reduction order:
+        // below the GEMM limit that pairing was calibrated on gen-17
+        // (`qmv_t64` / `qmv_wide_t64` reduce each row identically at any
+        // width; the M = 8 NAX tier is the documented exception). Other
+        // GPUs pair different kernels at the merged width and differ in
+        // ulps — and unseeded inputs make that marginal equality flaky,
+        // as the CI VM GPU showed at T = 1. The CPU reference is
+        // bit-identical on every device.
+        let nax_exact = !unsafe { mlx_sys::mlx_metal_is_available() }
+            || unsafe { mlx_sys::mlx_gpu_architecture_gen() } == 17;
+        for (x, (per_layer, context)) in inputs.iter().zip(&want) {
+            let seq = x.shape_at(1).unwrap();
+            let exact = nax_exact && seq != model.merged_rows();
+            for (index, layer) in model.layers.iter().enumerate() {
+                assert!(layer.attention.qkv_proj.is_some(), "q|k|v merge");
+                assert!(layer.mlp.gate_up.is_some(), "gate|up merge");
+                let (queries, keys, values) = layer
+                    .attention
+                    .project_block(x, base, model.merged_rows())
+                    .unwrap();
+                let (want_q, want_k, want_v, want_mlp) = &per_layer[index];
+                let label = |what: &str| format!("T={seq} layer {index}: {what}");
+                assert_bits_match(&bits(&queries), want_q, exact, &label("queries"));
+                assert_bits_match(&bits(&keys), want_k, exact, &label("block keys"));
+                assert_bits_match(&bits(&values), want_v, exact, &label("block values"));
+                assert_bits_match(
+                    &bits(&layer.mlp.forward(x, model.merged_rows()).unwrap()),
+                    want_mlp,
+                    exact,
+                    &label("mlp"),
+                );
+            }
+            let got = model.project_context(x, base).unwrap();
+            assert_eq!(got.len(), context.len());
+            for (index, ((k, v), (want_k, want_v))) in got.iter().zip(context).enumerate() {
+                let label = |what: &str| format!("T={seq} layer {index}: {what}");
+                assert_bits_match(&bits(k), want_k, exact, &label("context keys"));
+                assert_bits_match(&bits(v), want_v, exact, &label("context values"));
+            }
+        }
     }
 
     /// `forward_hidden` fuses each residual sum into the next norm and shares
@@ -2717,7 +3718,7 @@ mod tests {
             let base = context.logical_len;
             let block = MxArray::from_int32(&[7, 0, 0], &[1, 3]).unwrap();
             let got = model
-                .forward_hidden(&embedding, &block, base, &context)
+                .forward_hidden(&embedding, &block, base, &mut context)
                 .unwrap();
             let want = reference_forward_hidden(&model, &embedding, &block, base, &context);
             got.eval();

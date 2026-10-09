@@ -5,8 +5,11 @@ use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
-use super::gated_delta::{GdnKernelTape, gated_delta_update, gated_delta_update_with_tape};
-use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
+use super::gated_delta::{
+    GdnCompleteOut, GdnKernelTape, GdnPrologue, GdnTail, gated_delta_fused_complete,
+    gated_delta_update, gated_delta_update_fused, gated_delta_update_with_tape,
+};
+use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, LinearProj, QuantizedLinear};
 
 /// Per-GDN-layer tape recorded during the eager MTP verify forward.
 ///
@@ -18,6 +21,12 @@ use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 ///     rebuild the conv state by slicing the accepted prefix).
 ///   * `conv_kernel_dim` — depthwise conv kernel size; `keep = conv_kernel_dim
 ///     - 1` is the conv-state window length.
+///   * `final_state` / `final_conv` — the recurrent state `[1, Hv, Dv, Dk]`
+///     and conv history `[K-1, W]` after the WHOLE window, when the verify
+///     wrote them into the DFlash2 spare blob rows (compiled verify with
+///     destinations; the layer records the history, the compiled unpack
+///     the state). With the f32 carry the state equals the replay of every
+///     window token, so a full accept adopts both instead of replaying.
 ///
 /// All array fields are lazy `MxArray` clones (no eval, no copy) so recording
 /// stays inside the fused lazy MLX graph.
@@ -26,6 +35,8 @@ pub(crate) struct GdnLayerTape {
     pub kernel: GdnKernelTape,
     pub qkv: MxArray,
     pub conv_kernel_dim: i32,
+    pub final_state: Option<MxArray>,
+    pub final_conv: Option<MxArray>,
 }
 
 /// Rebuild the convolution history from the pre-verify snapshot and accepted rows.
@@ -83,6 +94,8 @@ impl GdnLayerTape {
             },
             qkv: combine(|row| &row.qkv)?,
             conv_kernel_dim: first.conv_kernel_dim,
+            final_state: None,
+            final_conv: None,
         })
     }
 
@@ -108,14 +121,16 @@ impl GdnLayerTape {
             },
             qkv: select(&self.qkv)?,
             conv_kernel_dim: self.conv_kernel_dim,
+            final_state: None,
+            final_conv: None,
         })
     }
 
     /// Replay the accepted prefix into the pre-verify snapshot caches.
     ///
     /// `accepted_steps = accepted_drafts + 1`. Rebuilds BOTH the recurrent
-    /// state (per-step T=1 kernel replay from `snapshot_recurrent`, threading
-    /// bf16 between calls = AR round-trip) and the conv state (slice the
+    /// state (per-step T=1 kernel replay from the f32 `snapshot_recurrent`,
+    /// = AR decode bit-for-bit) and the conv state (slice the
     /// accepted prefix of the recorded `qkv` onto `snapshot_conv`), then writes
     /// them into the live cache slots (slot 0 = conv_state, slot 1 =
     /// recurrent_state).
@@ -131,10 +146,10 @@ impl GdnLayerTape {
         accepted_steps: usize,
     ) -> Result<()> {
         // --- Recurrent state ---------------------------------------------
-        // Start from the pre-verify (bf16) recurrent state. If the snapshot
+        // Start from the pre-verify (f32) recurrent state. If the snapshot
         // had no recurrent state (cold cache — should not happen at decode
-        // time), zero-init to the recorded shapes via the kernel's own
-        // zero-state default by re-deriving from `v`.
+        // time), zero-init to the recorded shapes, f32 like the kernel's own
+        // zero-state default.
         let start_state = match snapshot_recurrent {
             Some(s) => s.clone(),
             None => {
@@ -142,10 +157,7 @@ impl GdnLayerTape {
                 let num_v_heads = self.kernel.v.shape_at(2)?;
                 let v_dim = self.kernel.v.shape_at(3)?;
                 let k_dim = self.kernel.q.shape_at(3)?;
-                MxArray::zeros(
-                    &[batch, num_v_heads, v_dim, k_dim],
-                    Some(self.kernel.v.dtype()?),
-                )?
+                MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(DType::Float32))?
             }
         };
         let new_recurrent = self
@@ -338,6 +350,13 @@ impl GatedDeltaNet {
     /// keep working and no duplicate storage is retained. Incompatible pairs
     /// (mixed modes, split in_proj variants, special layouts) keep the
     /// unfused two-matmul path.
+    ///
+    /// A Tiled64 K-quant `in_proj_qkvz` (`QuantizedLinear::tile_kquant_layout`)
+    /// only merges with a tiled `in_proj_ba`, whose `2 * num_v_heads` rows (96
+    /// on Qwen3.8) are not whole tiles: it is zero-padded to the next tile
+    /// (128) and tiled here first. The padded rows decode to exactly-zero
+    /// output columns that `forward` drops (`split_ba_padded`), so the merge
+    /// stays one dispatch per layer with the numerics of the unpadded pair.
     pub fn finalize_after_load(&mut self) -> Result<()> {
         let mut derived = vec![&self.a_log, &self.qk_norm_w_q, &self.qk_norm_w_k];
         derived.extend(
@@ -354,6 +373,9 @@ impl GatedDeltaNet {
         match (&self.in_proj_qkvz, &self.in_proj_ba) {
             (LinearProj::Standard(_), LinearProj::Standard(_)) => {}
             (LinearProj::Quantized(_), LinearProj::Quantized(_)) => {
+                if self.in_proj_qkvz_ba_q.is_none() && self.ba_pads_to_tiled_qkvz() {
+                    self.in_proj_ba.tile_kquant_layout_padded()?;
+                }
                 if self.in_proj_qkvz_ba_q.is_none()
                     && let Some(merged) = self.in_proj_qkvz.concat_rows(&self.in_proj_ba)?
                 {
@@ -379,6 +401,42 @@ impl GatedDeltaNet {
         stacked_t.eval();
         self.in_proj_qkvz_ba_t = Some(stacked_t);
         Ok(())
+    }
+
+    /// Whether `in_proj_ba` should be zero-padded to whole tiles and tiled so
+    /// it can merge with `in_proj_qkvz`: both quantized in the same contract
+    /// (the same K-quant mode, or MLX affine at the (bits, group) the tiled
+    /// qkvz reads through: `affine` 4/64 pads into `a4g64@t64`), qkvz already
+    /// Tiled64, ba still row-major.
+    fn ba_pads_to_tiled_qkvz(&self) -> bool {
+        use crate::models::quant_dispatch::{kquant_affine_mode_params, split_kquant_layout};
+        match (&self.in_proj_qkvz, &self.in_proj_ba) {
+            (LinearProj::Quantized(qkvz), LinearProj::Quantized(ba)) => {
+                let base = split_kquant_layout(qkvz.mode()).0;
+                let ba_contract = if ba.mode() == DEFAULT_QUANT_MODE {
+                    kquant_affine_mode_params(ba.bits(), ba.group_size())
+                        .map_or(ba.mode(), |kq| kq.mode_str)
+                } else {
+                    ba.mode()
+                };
+                qkvz.is_kquant_tiled() && !ba.is_kquant_tiled() && base == ba_contract
+            }
+            _ => false,
+        }
+    }
+
+    /// `[B, T, >= 2 * num_v_heads]` -> `(b, a)`, each `[B, T, num_v_heads]`.
+    /// Columns past `2 * num_v_heads` are the exactly-zero outputs of the
+    /// Tiled64 row padding of `in_proj_ba` (see `finalize_after_load`) and
+    /// are dropped; an unpadded projection keeps the plain two-way split.
+    fn split_ba_padded(&self, ba: &MxArray) -> Result<(MxArray, MxArray)> {
+        let nv = self.num_v_heads as i64;
+        let parts = if ba.shape_at(2)? == 2 * nv {
+            ba.split_sections(&[nv], 2)?
+        } else {
+            ba.split_sections(&[nv, 2 * nv], 2)?
+        };
+        Ok((parts[0].clone(), parts[1].clone()))
     }
 
     /// Forward pass for GatedDeltaNet.
@@ -452,8 +510,7 @@ impl GatedDeltaNet {
             } else {
                 self.in_proj_ba.forward(x)?
             };
-            let ba_split = ba.split_sections(&[self.num_v_heads as i64], 2)?;
-            (ba_split[0].clone(), ba_split[1].clone())
+            self.split_ba_padded(&ba)?
         };
 
         // Apply mask before conv to prevent masked values leaking through convolution
@@ -477,6 +534,48 @@ impl GatedDeltaNet {
         } else {
             None
         };
+
+        // Whole GDN core in ONE dispatch (prep + recurrence + gated norm +
+        // z gate): the decode/verify geometry with compact tiled heads. Same
+        // bits as the gdn_prepare -> fused step chain below, which stays the
+        // fallback (as does the generic path after it).
+        if let Some(complete) = self.forward_complete(
+            &qkv,
+            &z,
+            &a,
+            &b,
+            conv_state.as_ref(),
+            cache.as_deref(),
+            mask,
+            use_kernel,
+            batch,
+            seq_len,
+        ) {
+            if let Some(cache) = cache {
+                cache.set(
+                    0,
+                    complete.history.reshape(&[
+                        1,
+                        (self.conv_kernel_dim - 1) as i64,
+                        self.conv_dim as i64,
+                    ])?,
+                )?;
+                cache.set(1, complete.state)?;
+            }
+            if let (Some(sink), Some(qkv)) = (tape_sink.take(), tape_qkv) {
+                // The kernel's own history output (not the reshaped cache
+                // view): a sibling of the gated output, so it is evaluated
+                // with it and a full accept can adopt it in place.
+                *sink = Some(GdnLayerTape {
+                    kernel: complete.tape,
+                    qkv,
+                    conv_kernel_dim: self.conv_kernel_dim,
+                    final_state: None,
+                    final_conv: Some(complete.history),
+                });
+            }
+            return self.out_proj.forward(&complete.out);
+        }
 
         // Fully-fused prep: conv + SiLU + q|k|v split + q/k L2-norm + decay/beta
         // gating in ONE Metal dispatch (`mlx_qwen4_gdn_prepare` — hardcoded to
@@ -579,6 +678,52 @@ impl GatedDeltaNet {
 
         // Run gated delta recurrence
         let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
+
+        // Fused tail: recurrence + gated norm + z gate in one dispatch (the
+        // production decode/verify geometry). Slot 2 of the cache, when a
+        // caller provides it, is the buffer the new state is written into.
+        {
+            let mut kernel_sink: Option<GdnKernelTape> = None;
+            let fused = gated_delta_update_fused(
+                &q,
+                &k,
+                &v,
+                &a,
+                &b,
+                &self.a_log,
+                &self.dt_bias,
+                recurrent_state,
+                mask,
+                use_kernel,
+                self.tiled_gguf_layout,
+                precomputed.as_ref().map(|(d, b)| (d, b)),
+                GdnTail {
+                    z: &z,
+                    norm_weight: self.norm.weight(),
+                    eps: self.norm.eps(),
+                    state_dst: cache.as_deref().and_then(|c| c.get(2)),
+                },
+                tape_sink.is_some().then_some(&mut kernel_sink),
+            )?;
+            if let Some((gated, new_state)) = fused {
+                if let Some(cache) = cache {
+                    cache.set(1, new_state)?;
+                }
+                if let (Some(sink), Some(kernel), Some(qkv)) =
+                    (tape_sink.take(), kernel_sink, tape_qkv)
+                {
+                    *sink = Some(GdnLayerTape {
+                        kernel,
+                        qkv,
+                        conv_kernel_dim: self.conv_kernel_dim,
+                        final_state: None,
+                        final_conv: None,
+                    });
+                }
+                return self.out_proj.forward(&gated);
+            }
+        }
+
         let (y, new_state) = if tape_sink.is_some() {
             // Record the per-step kernel inputs into a local sink, then fold
             // them (plus the recorded qkv) into the layer tape below.
@@ -604,6 +749,8 @@ impl GatedDeltaNet {
                     kernel,
                     qkv,
                     conv_kernel_dim: self.conv_kernel_dim,
+                    final_state: None,
+                    final_conv: None,
                 });
             }
             result
@@ -663,6 +810,96 @@ impl GatedDeltaNet {
 
         // Output projection
         self.out_proj.forward(&y_flat)
+    }
+
+    /// The whole GDN core as one dispatch (`gated_delta_fused_complete`):
+    /// `gdn_prepare`'s contract (batch 1, 4-tap conv, 128-wide heads, bf16
+    /// activations, the f32 conv/scale/dt sidecars) plus the fused tail's
+    /// (unmasked, T <= 16, bf16 gate and norm weight, f32 state) and compact
+    /// tiled heads (`hv % Hk`; standard checkpoints repeat-expand q/k and
+    /// stay on the chain below). `None` leaves the chain to run.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_complete(
+        &self,
+        qkv: &MxArray,
+        z: &MxArray,
+        a: &MxArray,
+        b: &MxArray,
+        conv_state: Option<&MxArray>,
+        cache: Option<&ArraysCache>,
+        mask: Option<&MxArray>,
+        use_kernel: bool,
+        batch: i64,
+        seq_len: i64,
+    ) -> Option<GdnCompleteOut> {
+        use crate::array::DType;
+        if batch != 1
+            || !(1..=16).contains(&seq_len)
+            || mask.is_some()
+            || !use_kernel
+            || self.conv_kernel_dim != 4
+            || self.key_head_dim != 128
+            || self.value_head_dim != 128
+            || !(self.tiled_gguf_layout || self.num_k_heads == self.num_v_heads)
+            || !crate::engine::persistence::compiled_forward_backend_available()
+        {
+            return None;
+        }
+        let conv = self.conv1d_w4_f32.as_ref()?;
+        let scale = self.gdn_scale_f32.as_ref()?;
+        let dt_bias = self.dt_bias_f32.as_ref()?;
+        let recurrent = cache.and_then(|c| c.get(1));
+        if [qkv, z, a, b, self.norm.weight()]
+            .iter()
+            .any(|x| x.dtype().ok() != Some(DType::BFloat16))
+            || recurrent.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
+        {
+            return None;
+        }
+        let history = match conv_state {
+            Some(s) => s.squeeze(Some(&[0])).ok()?,
+            None => MxArray::zeros(
+                &[(self.conv_kernel_dim - 1) as i64, self.conv_dim as i64],
+                Some(DType::BFloat16),
+            )
+            .ok()?,
+        };
+        let zero_state;
+        let state = match recurrent {
+            Some(s) => s,
+            None => {
+                zero_state = MxArray::zeros(
+                    &[
+                        1,
+                        self.num_v_heads as i64,
+                        self.value_head_dim as i64,
+                        self.key_head_dim as i64,
+                    ],
+                    Some(DType::Float32),
+                )
+                .ok()?;
+                &zero_state
+            }
+        };
+        gated_delta_fused_complete(
+            &GdnPrologue {
+                qkv,
+                a,
+                b,
+                conv,
+                history: &history,
+                scale,
+                dt_bias,
+                history_dst: cache.and_then(|c| c.get(3)),
+            },
+            state,
+            &GdnTail {
+                z,
+                norm_weight: self.norm.weight(),
+                eps: self.norm.eps(),
+                state_dst: cache.and_then(|c| c.get(2)),
+            },
+        )
     }
 
     /// Generic prep path: depthwise conv (fused `window_conv` when possible)
@@ -973,6 +1210,30 @@ impl GatedDeltaNet {
         (qkv_z, b_a)
     }
 
+    /// The quantization modes of `in_proj_qkvz`, `in_proj_ba` and the merged
+    /// `[qkvz; ba]` projection (`None` when unmerged or dense).
+    #[cfg(test)]
+    pub(crate) fn in_proj_modes(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let mode = |proj: &LinearProj| match proj {
+            LinearProj::Quantized(ql) => Some(ql.mode().to_string()),
+            LinearProj::Standard(_) => None,
+        };
+        (
+            mode(&self.in_proj_qkvz),
+            mode(&self.in_proj_ba),
+            self.in_proj_qkvz_ba_q.as_ref().and_then(mode),
+        )
+    }
+
+    /// The quantization mode of `out_proj` (`None` when dense).
+    #[cfg(test)]
+    pub(crate) fn out_proj_mode(&self) -> Option<&str> {
+        match &self.out_proj {
+            LinearProj::Quantized(ql) => Some(ql.mode()),
+            LinearProj::Standard(_) => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn prism_hadamard_sites(&self) -> (bool, bool, bool, bool) {
         let qkv = self
@@ -1121,6 +1382,7 @@ mod tests {
     fn kernel_geometry_net_with(weight: impl Fn(&[i64]) -> MxArray) -> GatedDeltaNet {
         let config = Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: 64,
             num_layers: 4,
@@ -1428,6 +1690,167 @@ mod tests {
             }
         }
         assert_eq!(cases, 32);
+        Ok(())
+    }
+
+    /// A random q4k `[n, k]` projection (uint8 (sc, m) scales, f16 (d, dmin));
+    /// the same seed gives the same bytes.
+    fn q4k(n: i64, k: i64, seed: u32) -> QuantizedLinear {
+        let mut st = seed;
+        let mut lcg = move || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            st
+        };
+        let words: Vec<u32> = (0..n * k / 8).map(|_| lcg()).collect();
+        let scales: Vec<u8> = (0..n * k / 16).map(|_| (lcg() % 48 + 1) as u8).collect();
+        let half_scales = [0x2800u16, 0x2c00, 0x3000, 0x3200];
+        let biases: Vec<u16> = (0..n * k / 128)
+            .map(|_| half_scales[(lcg() as usize) % half_scales.len()])
+            .collect();
+        QuantizedLinear::new(
+            MxArray::from_uint32(&words, &[n, k / 8]).unwrap(),
+            MxArray::from_uint8(&scales, &[n, k / 16]).unwrap(),
+            Some(MxArray::from_float16(&biases, &[n, k / 128]).unwrap()),
+            None,
+            32,
+            4,
+            "q4k".to_string(),
+        )
+    }
+
+    /// Kernel geometry on a 256-wide hidden (whole K-quant super-blocks) with
+    /// q4k in_proj_qkvz (16384 rows) and in_proj_ba (96 rows); `tile_qkvz`
+    /// repacks the qkvz into Tiled64 before it is installed, as the loader does.
+    fn quantized_in_proj_net(tile_qkvz: bool) -> GatedDeltaNet {
+        let hidden = 256i64;
+        let config = Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
+            kv_format: None,
+            vocab_size: 32,
+            hidden_size: hidden as i32,
+            num_layers: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            intermediate_size: 32,
+            rms_norm_eps: 1e-6,
+            head_dim: 8,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 2,
+            linear_num_value_heads: 48,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: Some(true),
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        };
+        // Deterministic dense sidecars so both nets share every weight.
+        let dense = |shape: &[i64], seed: u32| {
+            let n: i64 = shape.iter().product();
+            let mut st = seed;
+            let values: Vec<f32> = (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((st >> 16) as i32 - 32_768) as f32 / 32_768.0 * 0.3
+                })
+                .collect();
+            MxArray::from_float32(&values, shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap()
+        };
+        let mut net = GatedDeltaNet::new(&config).unwrap();
+        let mut qkvz = q4k(16384, hidden, 31);
+        if tile_qkvz {
+            assert!(qkvz.tile_kquant_layout().unwrap());
+        }
+        net.set_quantized_in_proj_qkvz(qkvz);
+        net.set_quantized_in_proj_ba(q4k(96, hidden, 32));
+        net.set_conv1d_weight(&dense(&[10240, 1, 4], 33), DType::BFloat16)
+            .unwrap();
+        net.set_norm_weight(&dense(&[128], 34), DType::BFloat16)
+            .unwrap();
+        net.set_out_proj_weight(&dense(&[hidden, 6144], 35))
+            .unwrap();
+        net.set_dt_bias(&dense(&[48], 36));
+        net.set_a_log(&dense(&[48], 37)).unwrap();
+        net.finalize_after_load().unwrap();
+        net
+    }
+
+    /// A Tiled64 `in_proj_qkvz` only merges with a tiled `in_proj_ba`, whose 96
+    /// rows are not whole tiles: `finalize_after_load` must zero-pad it to 128
+    /// rows, merge into one 16512-row projection, and `forward` must drop the
+    /// padding so the block reproduces the all-row-major merge for the M = 1
+    /// decode, the M = 8 verify and a 64-token prefill.
+    #[test]
+    fn tiled_qkvz_pads_and_merges_row_major_ba() -> Result<()> {
+        let reference = quantized_in_proj_net(false);
+        let tiled = quantized_in_proj_net(true);
+        let merged_rm = reference
+            .in_proj_qkvz_ba_q
+            .as_ref()
+            .expect("row-major pair merges");
+        assert_eq!(merged_rm.packed_out_features()?, 16384 + 96);
+        let merged_t = tiled
+            .in_proj_qkvz_ba_q
+            .as_ref()
+            .expect("tiled qkvz + padded ba must merge into one projection");
+        assert_eq!(merged_t.packed_out_features()?, 16384 + 128);
+        assert_eq!(tiled.in_proj_ba.packed_out_features()?, 128);
+        assert!(matches!(
+            &tiled.in_proj_ba,
+            LinearProj::Quantized(ql) if ql.is_kquant_tiled()
+        ));
+        assert!(matches!(
+            merged_t,
+            LinearProj::Quantized(ql) if ql.is_kquant_tiled()
+        ));
+        // SAFETY: nullary predicate that catches internally.
+        let gpu = unsafe { sys::mlx_metal_is_available() };
+        for t in [1i64, 8, 64] {
+            let mut st = 40 + t as u32;
+            let n = t * 256;
+            let values: Vec<f32> = (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((st >> 16) as i32 - 32_768) as f32 / 32_768.0
+                })
+                .collect();
+            let x = MxArray::from_float32(&values, &[1, t, 256])?.astype(DType::BFloat16)?;
+            let out_ref = reference.forward(&x, None, None, true)?;
+            let out = tiled.forward(&x, None, None, true)?;
+            assert_eq!(out.shape()?.as_ref(), &[1, t, 256]);
+            let diff = max_abs_diff(&out, &out_ref);
+            // T = 64 takes the prefill matmul, the same kernel in both
+            // layouts (and the CPU reference always is): bit-identical. The
+            // GPU M = 1 / M = 8 routes change kernels with the layout, so the
+            // in_proj differs at bf16 rounding and the block follows.
+            if !gpu || t == 64 {
+                assert_eq!(diff, 0.0, "T={t}: padded merge changed the block output");
+            } else {
+                let peak = out_ref
+                    .astype(DType::Float32)?
+                    .to_float32()?
+                    .iter()
+                    .fold(0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    diff <= 3e-2 * peak,
+                    "T={t}: padded merge off by {diff} of peak {peak}"
+                );
+            }
+        }
         Ok(())
     }
 }

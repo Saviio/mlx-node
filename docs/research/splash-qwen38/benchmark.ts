@@ -48,9 +48,12 @@ const environment = Object.fromEntries(
     'MLX_DFLASH2_PHASE_TIME',
     'MLX_MAX_OPS_PER_BUFFER',
     'MLX_MAX_MB_PER_BUFFER',
+    'MLX_DFLASH2_TF_DIR',
+    'MLX_DFLASH2_TF_RECORD',
+    'MLX_DFLASH2_TF_LABEL',
   ].map((name) => [name, process.env[name] ?? null]),
 );
-const target = resolve('.cache/models/qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf');
+const target = resolve(process.env.MLX_BENCH_TARGET ?? '.cache/models/qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf');
 const draft = resolve('.cache/models/qwen3.8-27b-dflash2');
 const started = performance.now();
 const model = await core.Qwen35Model.load(target, mode === 'dflash' ? { draftModelPath: draft } : undefined);
@@ -84,7 +87,11 @@ const config: ChatConfig = {
 await model.chatSessionStart(cases[0].messages, { ...config, maxNewTokens: 16 });
 for (let run = 1; run <= Number(count); run++) {
   for (const name of names.split(',')) {
-    const item = cases.find((c) => c.name === name);
+    // `<case>:<k>` = the first k messages of a fixture conversation (more
+    // prompts for the teacher-forced acceptance runs; token counts unchecked).
+    const [base, cut] = name.split(':');
+    const found = cases.find((c) => c.name === base);
+    const item = found && cut ? { name, messages: found.messages.slice(0, Number(cut)) } : found;
     if (!item) throw new Error(`Unknown case ${name}`);
     await model.resetCaches();
     console.log(JSON.stringify({ event: 'benchmark-start', name, run }));
@@ -100,7 +107,7 @@ for (let run = 1; run <= Number(count); run++) {
       ...result,
       memory: core.memoryStats(),
     };
-    if (result.cachedTokens !== 0 || result.numTokens !== Number(tokenLimit))
+    if (result.cachedTokens !== 0 || (result.numTokens !== Number(tokenLimit) && !cut))
       throw new Error(`Invalid cold sample: ${JSON.stringify(result.performance)}`);
     if (item.promptTokens && result.promptTokens !== item.promptTokens)
       throw new Error('Fixture prompt token count drift');

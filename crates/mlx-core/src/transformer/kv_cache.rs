@@ -1,18 +1,103 @@
-use crate::array::MxArray;
+use crate::array::kv_int8::Int8KvRows;
+use crate::array::{DType, MxArray};
 use napi::bindgen_prelude::*;
+
+/// Element format of a flat [`KVCache`]'s rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum KvFormat {
+    /// Rows stored as produced (BF16 for the Qwen3.5 family).
+    #[default]
+    Bf16,
+    /// Per-(token, head) symmetric int8 rows with one fp32 scale each
+    /// (Splash's target KV format); see `crate::array::kv_int8`.
+    Int8,
+}
+
+impl KvFormat {
+    /// `"int8"` / `"bf16"` (case-insensitive); `None` is BF16.
+    pub fn parse(value: Option<&str>) -> std::result::Result<Self, String> {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("bf16") => Ok(Self::Bf16),
+            Some("int8") => Ok(Self::Int8),
+            Some(other) => Err(format!(
+                "unknown kv_format {other:?}: expected \"int8\" or \"bf16\""
+            )),
+        }
+    }
+
+    /// The format a cache takes when none is requested: int8 (Splash's
+    /// default) where the int8 segmented SDPA kernels serve the geometry —
+    /// the Metal device and a 256-wide head — and BF16 everywhere else, so a
+    /// geometry the kernels do not cover never lands on the dequantizing
+    /// fallback by default.
+    pub fn default_for_geometry(head_dim: i64) -> Self {
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        if metal && head_dim == 256 {
+            Self::Int8
+        } else {
+            Self::Bf16
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Int8 => "int8",
+        }
+    }
+
+    /// Bytes one (token, head) row of `head_dim` costs in one K or V tensor,
+    /// including the int8 row's fp32 scale.
+    pub fn row_bytes(self, head_dim: i64, activation_bytes: u64) -> u64 {
+        match self {
+            Self::Bf16 => head_dim.max(0) as u64 * activation_bytes,
+            Self::Int8 => head_dim.max(0) as u64 + 4,
+        }
+    }
+}
+
+/// One layer's block of new rows in the cache's element format, for
+/// [`KVCache::store_block`].
+pub(crate) enum KvBlock {
+    /// BF16 `[B, H, T, D]` rows (any strides).
+    Bf16 { keys: MxArray, values: MxArray },
+    /// Quantized rows plus scales.
+    Int8(Int8KvRows),
+}
+
+/// One cache's share of a fused row store: the (cache, block) handle pairs
+/// and the row the block lands on.
+struct StorePlan {
+    dst: Vec<*mut mlx_sys::mlx_array>,
+    src: Vec<*mut mlx_sys::mlx_array>,
+    offset: i32,
+    seq_len: i32,
+}
 
 /// Key-Value cache for efficient transformer inference.
 ///
 /// Uses pre-allocated buffers with in-place assignment to avoid O(N²) concatenation overhead.
 /// Allocates memory in 256-token chunks (matching MLX-LM's step size).
+///
+/// In [`KvFormat::Int8`] mode `keys` / `values` are int8 `[B, H, capacity,
+/// D]` and `key_scales` / `value_scales` float32 `[B, H, capacity]`; rows are
+/// quantized on write ([`Self::update_and_fetch_int8`]) or arrive quantized
+/// ([`Self::append_quantized`]) and are read through [`Self::int8_view`].
+/// `reserve`, `trim`, `capacity` and the offset bookkeeping are format
+/// independent.
 pub struct KVCache {
     keys: Option<MxArray>,
     values: Option<MxArray>,
+    /// Int8 mode only: fp32 scales `[B, H, capacity]` of `keys` / `values`.
+    key_scales: Option<MxArray>,
+    value_scales: Option<MxArray>,
     offset: i32,
     step: i32,
     /// Rows the first allocation must hold (set by [`Self::reserve`] while
     /// the cache is still empty); 0 when nothing is reserved.
     pending_rows: i64,
+    format: KvFormat,
 }
 
 impl Default for KVCache {
@@ -24,16 +109,89 @@ impl Default for KVCache {
 impl KVCache {
     /// Creates a new empty KV cache.
     pub fn new() -> Self {
+        Self::with_format(KvFormat::Bf16)
+    }
+
+    /// Creates a new empty KV cache holding rows in `format`.
+    pub fn with_format(format: KvFormat) -> Self {
         Self {
             keys: None,
             values: None,
+            key_scales: None,
+            value_scales: None,
             offset: 0,
             step: 256, // Pre-allocate 256 tokens at a time (matching MLX-LM)
             pending_rows: 0,
+            format,
         }
     }
 
+    /// Element format of the rows this cache holds.
+    pub fn format(&self) -> KvFormat {
+        self.format
+    }
+
+    /// Grow the buffers so rows `[prev, prev + seq_len)` exist; `k_dtype` /
+    /// `v_dtype` and the head dims describe the row buffers (int8 for the
+    /// int8 format). Allocates scale buffers in int8 mode.
+    fn ensure_rows(
+        &mut self,
+        batch_size: i64,
+        n_kv_heads: i64,
+        seq_len: i32,
+        k_head_dim: i64,
+        v_head_dim: i64,
+        k_dtype: DType,
+        v_dtype: DType,
+    ) -> Result<()> {
+        let prev = self.offset;
+        let needs_grow = match &self.keys {
+            Some(cached_keys) => (prev + seq_len) > cached_keys.shape_at(2)? as i32,
+            None => true,
+        };
+        if !needs_grow {
+            return Ok(());
+        }
+        // Calculate how many steps we need to allocate
+        let n_steps = (self.step + seq_len - 1) / self.step;
+        let step_rows = n_steps as i64 * self.step as i64;
+        let new_rows = if self.keys.is_some() {
+            step_rows
+        } else {
+            step_rows.max(std::mem::take(&mut self.pending_rows))
+        };
+        let k_shape = [batch_size, n_kv_heads, new_rows, k_head_dim];
+        let v_shape = [batch_size, n_kv_heads, new_rows, v_head_dim];
+
+        // Pre-allocate new buffer filled with zeros
+        let new_k = MxArray::zeros(&k_shape, Some(k_dtype))?;
+        let new_v = MxArray::zeros(&v_shape, Some(v_dtype))?;
+        let new_scales = match self.format {
+            KvFormat::Bf16 => None,
+            KvFormat::Int8 => {
+                let shape = [batch_size, n_kv_heads, new_rows];
+                Some((
+                    MxArray::zeros(&shape, Some(DType::Float32))?,
+                    MxArray::zeros(&shape, Some(DType::Float32))?,
+                ))
+            }
+        };
+
+        // Align to step boundary if needed; only concatenate when growing
+        // the buffer (rare!)
+        let keep_rows = if prev % self.step != 0 {
+            Some(prev as i64)
+        } else {
+            None
+        };
+        self.append_rows(keep_rows, new_k, new_v, new_scales)
+    }
+
     /// Updates the cache with new keys and values, and returns all cached keys/values.
+    ///
+    /// BF16 format only: an int8 cache quantizes through
+    /// [`Self::update_and_fetch_int8`] (or [`Self::append_quantized`]) and is
+    /// read through [`Self::int8_view`].
     ///
     /// # Arguments
     /// * `keys` - New keys to add, shape: (batch, n_kv_heads, seq_len, head_dim)
@@ -46,6 +204,12 @@ impl KVCache {
         keys: &MxArray,
         values: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
+        if self.format == KvFormat::Int8 {
+            return Err(Error::from_reason(
+                "KVCache::update_and_fetch on an int8 cache: use update_and_fetch_int8 / \
+                 append_quantized",
+            ));
+        }
         // Extract dimensions without copying entire shape vectors
         let batch_size = keys.shape_at(0)?;
         let n_kv_heads = keys.shape_at(1)?;
@@ -54,37 +218,15 @@ impl KVCache {
         let v_head_dim = values.shape_at(3)?;
 
         let prev = self.offset;
-
-        // Check if we need to grow the buffer
-        let needs_grow = match &self.keys {
-            Some(cached_keys) => (prev + seq_len) > cached_keys.shape_at(2)? as i32,
-            None => true,
-        };
-        if needs_grow {
-            // Calculate how many steps we need to allocate
-            let n_steps = (self.step + seq_len - 1) / self.step;
-            let step_rows = n_steps as i64 * self.step as i64;
-            let new_rows = if self.keys.is_some() {
-                step_rows
-            } else {
-                step_rows.max(std::mem::take(&mut self.pending_rows))
-            };
-            let k_shape = [batch_size, n_kv_heads, new_rows, k_head_dim];
-            let v_shape = [batch_size, n_kv_heads, new_rows, v_head_dim];
-
-            // Pre-allocate new buffer filled with zeros
-            let new_k = MxArray::zeros(&k_shape, Some(keys.dtype()?))?;
-            let new_v = MxArray::zeros(&v_shape, Some(values.dtype()?))?;
-
-            // Align to step boundary if needed; only concatenate when growing
-            // the buffer (rare!)
-            let keep_rows = if prev % self.step != 0 {
-                Some(prev as i64)
-            } else {
-                None
-            };
-            self.append_rows(keep_rows, new_k, new_v)?;
-        }
+        self.ensure_rows(
+            batch_size,
+            n_kv_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            keys.dtype()?,
+            values.dtype()?,
+        )?;
 
         // In-place assignment: write new keys/values to pre-allocated buffer
         // This is O(N) instead of O(N²) concatenation!
@@ -115,10 +257,249 @@ impl KVCache {
         Ok((result_keys, result_values))
     }
 
+    /// Int8 format: quantize the BF16 `keys` / `values` block
+    /// `[B, H, T, D]` per row and append it; returns the whole cache
+    /// `[0:offset]` as int8 views plus scales.
+    pub fn update_and_fetch_int8(
+        &mut self,
+        keys: &MxArray,
+        values: &MxArray,
+    ) -> Result<Int8KvRows> {
+        let rows = Int8KvRows::quantize(keys, values)?;
+        self.append_quantized(&rows)
+    }
+
+    /// Int8 format: append rows that are already quantized (the compiled
+    /// verify tape emits them); returns the whole cache `[0:offset]`.
+    pub fn append_quantized(&mut self, rows: &Int8KvRows) -> Result<Int8KvRows> {
+        if self.format != KvFormat::Int8 {
+            return Err(Error::from_reason(
+                "KVCache::append_quantized on a BF16 cache: use update_and_fetch",
+            ));
+        }
+        if rows.keys.dtype()? != DType::Int8
+            || rows.values.dtype()? != DType::Int8
+            || rows.key_scales.dtype()? != DType::Float32
+            || rows.value_scales.dtype()? != DType::Float32
+        {
+            return Err(Error::from_reason(
+                "KVCache::append_quantized expects int8 rows with float32 scales",
+            ));
+        }
+        let batch_size = rows.keys.shape_at(0)?;
+        let n_kv_heads = rows.keys.shape_at(1)?;
+        let seq_len = rows.keys.shape_at(2)? as i32;
+        let k_head_dim = rows.keys.shape_at(3)?;
+        let v_head_dim = rows.values.shape_at(3)?;
+        let prev = self.offset;
+        self.ensure_rows(
+            batch_size,
+            n_kv_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            DType::Int8,
+            DType::Int8,
+        )?;
+        self.offset += seq_len;
+        let (start, end) = (prev as i64, self.offset as i64);
+        for (buffer, update) in [
+            (&mut self.keys, &rows.keys),
+            (&mut self.values, &rows.values),
+            (&mut self.key_scales, &rows.key_scales),
+            (&mut self.value_scales, &rows.value_scales),
+        ] {
+            let Some(buffer) = buffer.as_mut() else {
+                return Err(Error::from_reason(
+                    "KV cache int8 buffers missing after buffer update",
+                ));
+            };
+            buffer.slice_assign_axis_inplace(2, start, end, update)?;
+        }
+        self.int8_view()
+            .ok_or_else(|| Error::from_reason("KV cache int8 buffers missing after append"))
+    }
+
+    /// Append a block of rows with ONE store dispatch for the whole layer
+    /// (BF16: K and V rows; int8: rows plus scales, already quantized), in
+    /// place into the cache buffers — the DFlash2 verify's write path. The
+    /// bytes equal the slice_update path ([`Self::update_and_fetch`] /
+    /// [`Self::append_quantized`]), which stays the fallback when the fused
+    /// store declines (no Metal, a geometry it does not serve).
+    pub(crate) fn store_block(&mut self, block: &KvBlock) -> Result<()> {
+        let plan = self.plan_store(block)?;
+        let mut out: [*mut mlx_sys::mlx_array; 4] = [std::ptr::null_mut(); 4];
+        let offsets = [plan.offset; 4];
+        // SAFETY: every pointer is a live array handle for the call; `out`
+        // receives owned handles (same buffers as `dst`) or stays null.
+        let ok = unsafe {
+            mlx_sys::mlx_kv_store_rows(
+                plan.dst.len() as i32,
+                plan.dst.as_ptr(),
+                plan.src.as_ptr(),
+                offsets.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if !ok {
+            return self.store_block_unfused(block);
+        }
+        self.adopt_store(&out[..plan.dst.len()], plan.seq_len)
+    }
+
+    /// [`Self::store_block`] for several caches at once: every block of every
+    /// cache lands in ONE store dispatch (the Metal primitive reads the
+    /// buffers through an address table). Falls back to per-cache stores
+    /// when the batched primitive declines (no residency sets, no Metal).
+    pub(crate) fn store_blocks(entries: &mut [(&mut KVCache, KvBlock)]) -> Result<()> {
+        if entries.len() <= 1 {
+            for (cache, block) in entries.iter_mut() {
+                cache.store_block(block)?;
+            }
+            return Ok(());
+        }
+        let mut plans = Vec::with_capacity(entries.len());
+        for (cache, block) in entries.iter_mut() {
+            plans.push(cache.plan_store(block)?);
+        }
+        let mut dst = Vec::new();
+        let mut src = Vec::new();
+        let mut offsets = Vec::new();
+        for plan in &plans {
+            dst.extend_from_slice(&plan.dst);
+            src.extend_from_slice(&plan.src);
+            offsets.extend(std::iter::repeat_n(plan.offset, plan.dst.len()));
+        }
+        let mut out: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); dst.len()];
+        // SAFETY: as in `store_block`; `out` receives one owned handle per
+        // `dst` entry or stays null.
+        let ok = unsafe {
+            mlx_sys::mlx_kv_store_rows(
+                dst.len() as i32,
+                dst.as_ptr(),
+                src.as_ptr(),
+                offsets.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if !ok {
+            for (cache, block) in entries.iter_mut() {
+                cache.store_block(block)?;
+            }
+            return Ok(());
+        }
+        let mut cursor = 0;
+        for ((cache, _), plan) in entries.iter_mut().zip(&plans) {
+            cache.adopt_store(&out[cursor..cursor + plan.dst.len()], plan.seq_len)?;
+            cursor += plan.dst.len();
+        }
+        Ok(())
+    }
+
+    /// Grow for `block` and gather the store's (cache, rows) handle pairs:
+    /// K, V and, for int8, their scales. The pointers stay valid while the
+    /// cache and block are untouched.
+    fn plan_store(&mut self, block: &KvBlock) -> Result<StorePlan> {
+        let (keys, values) = match block {
+            KvBlock::Bf16 { keys, values } => (keys, values),
+            KvBlock::Int8(rows) => (&rows.keys, &rows.values),
+        };
+        let (k_dtype, v_dtype) = match block {
+            KvBlock::Bf16 { .. } => {
+                if self.format != KvFormat::Bf16 {
+                    return Err(Error::from_reason(
+                        "KVCache::store_block: BF16 rows on an int8 cache",
+                    ));
+                }
+                (keys.dtype()?, values.dtype()?)
+            }
+            KvBlock::Int8(_) => {
+                if self.format != KvFormat::Int8 {
+                    return Err(Error::from_reason(
+                        "KVCache::store_block: int8 rows on a BF16 cache",
+                    ));
+                }
+                (DType::Int8, DType::Int8)
+            }
+        };
+        let seq_len = keys.shape_at(2)? as i32;
+        let offset = self.offset;
+        self.ensure_rows(
+            keys.shape_at(0)?,
+            keys.shape_at(1)?,
+            seq_len,
+            keys.shape_at(3)?,
+            values.shape_at(3)?,
+            k_dtype,
+            v_dtype,
+        )?;
+        let mut dst = Vec::with_capacity(4);
+        let mut src = Vec::with_capacity(4);
+        let (Some(cached_keys), Some(cached_values)) = (&self.keys, &self.values) else {
+            return Err(Error::from_reason(
+                "KV cache buffers missing after buffer update",
+            ));
+        };
+        dst.extend([cached_keys.as_raw_ptr(), cached_values.as_raw_ptr()]);
+        src.extend([keys.as_raw_ptr(), values.as_raw_ptr()]);
+        if let KvBlock::Int8(rows) = block {
+            let (Some(ks), Some(vs)) = (&self.key_scales, &self.value_scales) else {
+                return Err(Error::from_reason(
+                    "KV cache int8 scale buffers missing after buffer update",
+                ));
+            };
+            dst.extend([ks.as_raw_ptr(), vs.as_raw_ptr()]);
+            src.extend([rows.key_scales.as_raw_ptr(), rows.value_scales.as_raw_ptr()]);
+        }
+        Ok(StorePlan {
+            dst,
+            src,
+            offset,
+            seq_len,
+        })
+    }
+
+    /// Replace the buffer handles with the store primitive's outputs (same
+    /// buffers) and advance the offset.
+    fn adopt_store(&mut self, out: &[*mut mlx_sys::mlx_array], seq_len: i32) -> Result<()> {
+        self.keys = Some(MxArray::from_handle(out[0], "kv_store_rows:keys")?);
+        self.values = Some(MxArray::from_handle(out[1], "kv_store_rows:values")?);
+        if out.len() == 4 {
+            self.key_scales = Some(MxArray::from_handle(out[2], "kv_store_rows:key_scales")?);
+            self.value_scales = Some(MxArray::from_handle(out[3], "kv_store_rows:value_scales")?);
+        }
+        self.offset += seq_len;
+        Ok(())
+    }
+
+    fn store_block_unfused(&mut self, block: &KvBlock) -> Result<()> {
+        match block {
+            KvBlock::Bf16 { keys, values } => self.update_and_fetch(keys, values).map(|_| ()),
+            KvBlock::Int8(rows) => self.append_quantized(rows).map(|_| ()),
+        }
+    }
+
+    /// Int8 format: views of rows `[0:offset]` (keys, values, scales), or
+    /// `None` before the first allocation or on a BF16 cache.
+    pub fn int8_view(&self) -> Option<Int8KvRows> {
+        if self.format != KvFormat::Int8 {
+            return None;
+        }
+        let end = self.offset as i64;
+        Some(Int8KvRows {
+            keys: self.keys.as_ref()?.slice_axis(2, 0, end).ok()?,
+            values: self.values.as_ref()?.slice_axis(2, 0, end).ok()?,
+            key_scales: self.key_scales.as_ref()?.slice_axis(2, 0, end).ok()?,
+            value_scales: self.value_scales.as_ref()?.slice_axis(2, 0, end).ok()?,
+        })
+    }
+
     /// Resets the cache, clearing all stored keys and values.
     pub fn reset(&mut self) {
         self.keys = None;
         self.values = None;
+        self.key_scales = None;
+        self.value_scales = None;
         self.offset = 0;
         self.pending_rows = 0;
     }
@@ -164,7 +545,17 @@ impl KVCache {
         };
         let new_k = zeros_like(keys)?;
         let new_v = zeros_like(values)?;
-        self.append_rows(Some(self.offset as i64), new_k, new_v)
+        let new_scales = match self.format {
+            KvFormat::Bf16 => None,
+            KvFormat::Int8 => {
+                let shape = [keys.shape_at(0)?, keys.shape_at(1)?, extra];
+                Some((
+                    MxArray::zeros(&shape, Some(DType::Float32))?,
+                    MxArray::zeros(&shape, Some(DType::Float32))?,
+                ))
+            }
+        };
+        self.append_rows(Some(self.offset as i64), new_k, new_v, new_scales)
     }
 
     /// Rows the key buffer can hold without growing (0 before the first
@@ -174,14 +565,21 @@ impl KVCache {
     }
 
     /// Replace the buffers with `buffer[0:keep_rows]` (the whole buffer when
-    /// `None`) followed by `new_k` / `new_v`, or with `new_k` / `new_v` alone
-    /// before the first allocation or when no row is kept.
+    /// `None`) followed by `new_k` / `new_v` (and, in int8 mode, the matching
+    /// scale rows), or with the new buffers alone before the first allocation
+    /// or when no row is kept.
     fn append_rows(
         &mut self,
         keep_rows: Option<i64>,
         new_k: MxArray,
         new_v: MxArray,
+        new_scales: Option<(MxArray, MxArray)>,
     ) -> Result<()> {
+        if (self.format == KvFormat::Int8) != new_scales.is_some() {
+            return Err(Error::from_reason(
+                "KV cache append_rows: scale buffers must accompany int8 rows only",
+            ));
+        }
         let (Some(cached_keys), Some(cached_values)) = (&self.keys, &self.values) else {
             if self.keys.is_some() {
                 return Err(Error::from_reason(
@@ -190,11 +588,19 @@ impl KVCache {
             }
             self.keys = Some(new_k);
             self.values = Some(new_v);
+            if let Some((ks, vs)) = new_scales {
+                self.key_scales = Some(ks);
+                self.value_scales = Some(vs);
+            }
             return Ok(());
         };
         if keep_rows == Some(0) {
             self.keys = Some(new_k);
             self.values = Some(new_v);
+            if let Some((ks, vs)) = new_scales {
+                self.key_scales = Some(ks);
+                self.value_scales = Some(vs);
+            }
             return Ok(());
         }
         let keep = |cached: &MxArray| -> Result<MxArray> {
@@ -204,8 +610,20 @@ impl KVCache {
             }
         };
         let (kept_keys, kept_values) = (keep(cached_keys)?, keep(cached_values)?);
-        self.keys = Some(MxArray::concatenate(&kept_keys, &new_k, 2)?);
-        self.values = Some(MxArray::concatenate(&kept_values, &new_v, 2)?);
+        let new_keys = MxArray::concatenate(&kept_keys, &new_k, 2)?;
+        let new_values = MxArray::concatenate(&kept_values, &new_v, 2)?;
+        if let Some((new_ks, new_vs)) = new_scales {
+            let (Some(cached_ks), Some(cached_vs)) = (&self.key_scales, &self.value_scales) else {
+                return Err(Error::from_reason(
+                    "KV cache int8 scale buffers missing while rows are present",
+                ));
+            };
+            let (kept_ks, kept_vs) = (keep(cached_ks)?, keep(cached_vs)?);
+            self.key_scales = Some(MxArray::concatenate(&kept_ks, &new_ks, 2)?);
+            self.value_scales = Some(MxArray::concatenate(&kept_vs, &new_vs, 2)?);
+        }
+        self.keys = Some(new_keys);
+        self.values = Some(new_values);
         Ok(())
     }
 
@@ -222,6 +640,16 @@ impl KVCache {
     /// Get a reference to the cached values.
     pub fn values_ref(&self) -> Option<&MxArray> {
         self.values.as_ref()
+    }
+
+    /// Int8 format: the whole key-scale buffer `[B, H, capacity]`.
+    pub fn key_scales_ref(&self) -> Option<&MxArray> {
+        self.key_scales.as_ref()
+    }
+
+    /// Int8 format: the whole value-scale buffer `[B, H, capacity]`.
+    pub fn value_scales_ref(&self) -> Option<&MxArray> {
+        self.value_scales.as_ref()
     }
 
     /// Consume the cache and transfer its backing arrays to a different
@@ -285,6 +713,235 @@ mod tests {
     fn test_cache_creation() {
         let cache = KVCache::new();
         assert_eq!(cache.get_offset(), 0);
+    }
+
+    fn rand_bf16(shape: &[i64]) -> MxArray {
+        MxArray::random_normal(shape, 0.0, 1.0, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    fn bits_equal(a: &MxArray, b: &MxArray) -> bool {
+        let af = a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let bf = b.astype(DType::Float32).unwrap().to_float32().unwrap();
+        a.shape().unwrap().as_ref() == b.shape().unwrap().as_ref()
+            && af
+                .as_ref()
+                .iter()
+                .zip(bf.as_ref().iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// The fused store must leave the cache buffers byte-identical to the
+    /// slice_update path: BF16 with the transposed `values` view the verify
+    /// emits, and int8 rows plus scales, across a prefill, two verify blocks
+    /// and a trim in between (the DFlash2 cycle shape).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn store_block_matches_slice_update_path() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let (b, h, d) = (1i64, 4i64, 256i64);
+        for format in [KvFormat::Bf16, KvFormat::Int8] {
+            let mut reference = KVCache::with_format(format);
+            let mut fused = KVCache::with_format(format);
+            // Verify-shaped blocks: `values` is a [B, T, H, D] -> [B, H, T, D]
+            // transpose view, keys contiguous.
+            let make = |t: i64| {
+                let keys = rand_bf16(&[b, h, t, d]);
+                let values = rand_bf16(&[b, t, h, d])
+                    .transpose(Some(&[0, 2, 1, 3]))
+                    .unwrap();
+                (keys, values)
+            };
+            let steps: [(i64, Option<i32>); 4] =
+                [(300, None), (8, Some(303)), (8, Some(306)), (8, None)];
+            for (t, trim_to) in steps {
+                let (keys, values) = make(t);
+                match format {
+                    KvFormat::Bf16 => {
+                        reference.update_and_fetch(&keys, &values).unwrap();
+                        fused
+                            .store_block(&KvBlock::Bf16 {
+                                keys: keys.clone(),
+                                values: values.clone(),
+                            })
+                            .unwrap();
+                    }
+                    KvFormat::Int8 => {
+                        let rows = Int8KvRows::quantize(&keys, &values).unwrap();
+                        reference.append_quantized(&rows).unwrap();
+                        fused.store_block(&KvBlock::Int8(rows)).unwrap();
+                    }
+                }
+                if let Some(to) = trim_to {
+                    reference.trim(to);
+                    fused.trim(to);
+                }
+                assert_eq!(reference.get_offset(), fused.get_offset());
+            }
+            let pairs: Vec<(Option<&MxArray>, Option<&MxArray>)> = vec![
+                (reference.keys_ref(), fused.keys_ref()),
+                (reference.values_ref(), fused.values_ref()),
+                (reference.key_scales_ref(), fused.key_scales_ref()),
+                (reference.value_scales_ref(), fused.value_scales_ref()),
+            ];
+            for (i, (r, f)) in pairs.into_iter().enumerate() {
+                match (r, f) {
+                    (Some(r), Some(f)) => {
+                        assert!(bits_equal(r, f), "{format:?} buffer {i} differs")
+                    }
+                    (None, None) => {}
+                    _ => panic!("{format:?} buffer {i} presence differs"),
+                }
+            }
+        }
+    }
+
+    /// One store dispatch per block, writing in place (the cache handle keeps
+    /// its buffer).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn store_block_is_one_in_place_dispatch() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let mut cache = KVCache::with_format(KvFormat::Int8);
+        let first =
+            Int8KvRows::quantize(&rand_bf16(&[1, 2, 20, 256]), &rand_bf16(&[1, 2, 20, 256]))
+                .unwrap();
+        cache.store_block(&KvBlock::Int8(first)).unwrap();
+        let before = cache.keys_ref().unwrap().clone();
+        before.eval();
+        let block =
+            Int8KvRows::quantize(&rand_bf16(&[1, 2, 8, 256]), &rand_bf16(&[1, 2, 8, 256])).unwrap();
+        MxArray::eval_arrays(&block.arrays()).unwrap();
+        unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+        cache.store_block(&KvBlock::Int8(block.clone())).unwrap();
+        let after = cache.keys_ref().unwrap().clone();
+        after.eval();
+        let stores = unsafe { mlx_sys::mlx_test_kquant_family_count(c"kv_store_rows".as_ptr()) };
+        unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+        assert_eq!(stores, 1, "one KvStoreRows evaluation for the block");
+        // In place: the pre-store handle sees the new rows too.
+        assert!(
+            bits_equal(&before, &after),
+            "store must write into the same buffer"
+        );
+        assert!(bits_equal(
+            &after.slice_axis(2, 20, 28).unwrap(),
+            &block.keys
+        ));
+    }
+
+    /// Sixteen layers' blocks stored by ONE batched dispatch leave every
+    /// cache byte-identical (buffers, offsets, capacities) to sixteen
+    /// single-layer stores — BF16 and int8, with the verify's transposed
+    /// values view, differing per-cache offsets and a growth boundary.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn store_blocks_matches_single_layer_stores() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let (b, h, d, layers) = (1i64, 2i64, 256i64, 16usize);
+        for format in [KvFormat::Bf16, KvFormat::Int8] {
+            let make = |t: i64| {
+                let keys = rand_bf16(&[b, h, t, d]);
+                let values = rand_bf16(&[b, t, h, d])
+                    .transpose(Some(&[0, 2, 1, 3]))
+                    .unwrap();
+                match format {
+                    KvFormat::Bf16 => KvBlock::Bf16 { keys, values },
+                    KvFormat::Int8 => KvBlock::Int8(Int8KvRows::quantize(&keys, &values).unwrap()),
+                }
+            };
+            let clone_block = |block: &KvBlock| match block {
+                KvBlock::Bf16 { keys, values } => KvBlock::Bf16 {
+                    keys: keys.clone(),
+                    values: values.clone(),
+                },
+                KvBlock::Int8(rows) => KvBlock::Int8(rows.clone()),
+            };
+            let mut single: Vec<KVCache> =
+                (0..layers).map(|_| KVCache::with_format(format)).collect();
+            let mut batched: Vec<KVCache> =
+                (0..layers).map(|_| KVCache::with_format(format)).collect();
+            // Prefill lengths differ per layer so the offsets differ; the
+            // third block crosses a 256-row step for the longer caches.
+            for (step, trim_to) in [(0i64, None), (8, Some(3)), (8, None), (8, None)] {
+                let mut entries = Vec::with_capacity(layers);
+                for (layer, cache) in batched.iter_mut().enumerate() {
+                    let rows = if step == 0 { 240 + layer as i64 } else { step };
+                    let block = make(rows);
+                    single[layer].store_block(&clone_block(&block)).unwrap();
+                    entries.push((cache, block));
+                }
+                if step > 0 {
+                    unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+                }
+                KVCache::store_blocks(&mut entries).unwrap();
+                for cache in &batched {
+                    let mut arrays = Vec::new();
+                    arrays.extend(cache.keys_ref());
+                    arrays.extend(cache.values_ref());
+                    arrays.extend(cache.key_scales_ref());
+                    arrays.extend(cache.value_scales_ref());
+                    MxArray::eval_arrays(&arrays).unwrap();
+                }
+                if step > 0 {
+                    let stores =
+                        unsafe { mlx_sys::mlx_test_kquant_family_count(c"kv_store_rows".as_ptr()) };
+                    unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+                    // One table dispatch where residency sets exist; otherwise
+                    // the per-layer fallback.
+                    let expected = if unsafe { mlx_sys::mlx_kv_store_batched_available() } {
+                        1
+                    } else {
+                        layers as u64
+                    };
+                    assert_eq!(
+                        stores, expected,
+                        "{format:?}: KvStoreRows dispatches for all layers"
+                    );
+                }
+                if let Some(back) = trim_to {
+                    for (s, bt) in single.iter_mut().zip(batched.iter_mut()) {
+                        s.trim(s.get_offset() - back);
+                        bt.trim(bt.get_offset() - back);
+                    }
+                }
+            }
+            for (layer, (s, bt)) in single.iter().zip(&batched).enumerate() {
+                assert_eq!(
+                    s.get_offset(),
+                    bt.get_offset(),
+                    "{format:?} layer {layer} offset"
+                );
+                assert_eq!(
+                    s.capacity().unwrap(),
+                    bt.capacity().unwrap(),
+                    "{format:?} layer {layer} capacity"
+                );
+                let pairs = [
+                    (s.keys_ref(), bt.keys_ref()),
+                    (s.values_ref(), bt.values_ref()),
+                    (s.key_scales_ref(), bt.key_scales_ref()),
+                    (s.value_scales_ref(), bt.value_scales_ref()),
+                ];
+                for (i, (r, f)) in pairs.into_iter().enumerate() {
+                    match (r, f) {
+                        (Some(r), Some(f)) => {
+                            assert!(bits_equal(r, f), "{format:?} layer {layer} buffer {i}")
+                        }
+                        (None, None) => {}
+                        _ => panic!("{format:?} layer {layer} buffer {i} presence differs"),
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -570,6 +1227,219 @@ mod tests {
         let (k, v) = rows(300, 1.0);
         cache.update_and_fetch(&k, &v).unwrap();
         assert_eq!(cache.capacity().unwrap(), 512);
+    }
+
+    /// BF16 `[1, H, n, 256]` rows for the int8 tests (the int8 format is
+    /// defined at D = 256).
+    fn rows256(heads: i64, n: i64, seed: f64) -> (MxArray, MxArray) {
+        let k =
+            MxArray::random_normal(&[1, heads, n, 256], seed, 1.0, Some(DType::BFloat16)).unwrap();
+        let v =
+            MxArray::random_normal(&[1, heads, n, 256], -seed, 1.0, Some(DType::BFloat16)).unwrap();
+        (k, v)
+    }
+
+    fn metal() -> bool {
+        unsafe { mlx_sys::mlx_metal_is_available() }
+    }
+
+    /// Quantize -> dequantize keeps every element within half a quantization
+    /// step of its row (`max|x| / 127 / 2`, plus the BF16 rounding of the
+    /// dequantized value), and every row's scale is `max|x| / 127`.
+    #[test]
+    fn int8_round_trip_error_is_bounded_by_the_row_step() {
+        if !metal() {
+            return;
+        }
+        let (k, v) = rows256(4, 40, 3.0);
+        let quantized = Int8KvRows::quantize(&k, &v).unwrap();
+        assert_eq!(quantized.keys.dtype().unwrap(), DType::Int8);
+        assert_eq!(quantized.key_scales.dtype().unwrap(), DType::Float32);
+        assert_eq!(
+            quantized.key_scales.shape().unwrap().to_vec(),
+            vec![1, 4, 40]
+        );
+        let (dk, dv) = quantized.dequantize().unwrap();
+        for (orig, deq, scales) in [
+            (&k, &dk, &quantized.key_scales),
+            (&v, &dv, &quantized.value_scales),
+        ] {
+            let x = orig.to_float32().unwrap();
+            let y = deq.to_float32().unwrap();
+            let s = scales.to_float32().unwrap();
+            let mut worst_ratio = 0f32;
+            for row in 0..(4 * 40) {
+                let xs = &x[row * 256..(row + 1) * 256];
+                let ys = &y[row * 256..(row + 1) * 256];
+                let max = xs.iter().fold(0f32, |m, a| m.max(a.abs()));
+                let scale = s[row];
+                assert!(
+                    (scale - max / 127.0).abs() <= max / 127.0 * 1e-6 + 1e-12,
+                    "row {row}: scale {scale} != max/127 {}",
+                    max / 127.0
+                );
+                // Half a step plus the BF16 rounding of the dequantized value
+                // (|y| <= max, so <= max * 2^-8).
+                let bound = scale / 2.0 + max / 256.0;
+                for (a, b) in xs.iter().zip(ys) {
+                    let diff = (a - b).abs();
+                    assert!(
+                        diff <= bound + 1e-6,
+                        "row {row}: |{a} - {b}| = {diff} > {bound}"
+                    );
+                    worst_ratio = worst_ratio.max(diff / bound.max(1e-12));
+                }
+            }
+            assert!(worst_ratio > 0.0, "the data must exercise the rounding");
+        }
+    }
+
+    /// The Metal quantizer and the MLX-op reference produce identical int8
+    /// rows and scales.
+    #[test]
+    fn int8_quantizer_matches_its_mlx_op_reference() {
+        if !metal() {
+            return;
+        }
+        let (k, _) = rows256(4, 37, 11.0);
+        // A row of zeros quantizes to zeros with scale 0.
+        let zeros = MxArray::zeros(&[1, 4, 1, 256], Some(DType::BFloat16)).unwrap();
+        let k = MxArray::concatenate(&k, &zeros, 2).unwrap();
+        let (q, s) = crate::array::kv_int8::quantize_kv_rows(&k).unwrap();
+        let (rq, rs) = crate::array::kv_int8::quantize_kv_rows_reference(&k).unwrap();
+        assert_eq!(q.to_int8().unwrap(), rq.to_int8().unwrap());
+        assert_eq!(bits(&s), bits(&rs));
+        let s = s.to_float32().unwrap();
+        for head in 0..4 {
+            assert_eq!(s[head * 38 + 37], 0.0, "zero row scale");
+        }
+        let q = q.to_int8().unwrap();
+        assert!(q.iter().all(|&x| (-127..=127).contains(&x)));
+        assert!(
+            q.iter().any(|&x| x == 127 || x == -127),
+            "every row hits its max"
+        );
+    }
+
+    /// An int8 cache grows, reserves, trims and appends like the BF16 one;
+    /// its views carry the scales and its rows survive a reserve copy
+    /// bit-for-bit.
+    #[test]
+    fn int8_cache_reserve_trim_append_round_trip() {
+        if !metal() {
+            return;
+        }
+        let mut cache = KVCache::with_format(KvFormat::Int8);
+        assert_eq!(cache.format(), KvFormat::Int8);
+        assert!(cache.int8_view().is_none(), "nothing allocated yet");
+        let (k, v) = rows256(4, 300, 1.0);
+        assert!(
+            cache.update_and_fetch(&k, &v).is_err(),
+            "the BF16 entry point refuses an int8 cache"
+        );
+        let view = cache.update_and_fetch_int8(&k, &v).unwrap();
+        assert_eq!(cache.get_offset(), 300);
+        assert_eq!(cache.capacity().unwrap(), 512);
+        assert_eq!(view.keys.shape().unwrap().to_vec(), vec![1, 4, 300, 256]);
+        assert_eq!(view.key_scales.shape().unwrap().to_vec(), vec![1, 4, 300]);
+        assert_eq!(cache.key_scales_ref().unwrap().shape().unwrap()[2], 512);
+        let expected = Int8KvRows::quantize(&k, &v).unwrap();
+        assert_eq!(bits(&view.keys), bits(&expected.keys));
+        assert_eq!(bits(&view.value_scales), bits(&expected.value_scales));
+
+        // Reserve copies the prefix once into a larger buffer.
+        cache.reserve(2000).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 2048);
+        let after = cache.int8_view().unwrap();
+        assert_eq!(bits(&after.keys), bits(&expected.keys));
+        assert_eq!(bits(&after.key_scales), bits(&expected.key_scales));
+        assert_eq!(bits(&after.values), bits(&expected.values));
+
+        // Verify-style cycles: append 8, keep some, repeat across the 512
+        // boundary without growing; the kept rows equal a fresh quantization
+        // of the kept BF16 rows.
+        let mut kept_k = k.clone();
+        let mut kept_v = v.clone();
+        for (cycle, keep) in [8, 1, 5, 8, 3, 8, 2, 7].iter().cycle().take(60).enumerate() {
+            let (nk, nv) = rows256(4, 8, cycle as f64 * 0.1 + 0.05);
+            let base = cache.get_offset();
+            cache.update_and_fetch_int8(&nk, &nv).unwrap();
+            assert_eq!(cache.get_offset(), base + 8);
+            cache.trim(base + keep);
+            assert_eq!(cache.capacity().unwrap(), 2048, "cycle={cycle}");
+            kept_k = MxArray::concatenate(&kept_k, &nk.slice_axis(2, 0, *keep as i64).unwrap(), 2)
+                .unwrap();
+            kept_v = MxArray::concatenate(&kept_v, &nv.slice_axis(2, 0, *keep as i64).unwrap(), 2)
+                .unwrap();
+        }
+        assert!(
+            cache.get_offset() > 512,
+            "the trace crosses the 512 boundary"
+        );
+        let live = cache.int8_view().unwrap();
+        let fresh = Int8KvRows::quantize(&kept_k, &kept_v).unwrap();
+        assert_eq!(live.len().unwrap(), kept_k.shape_at(2).unwrap());
+        assert_eq!(bits(&live.keys), bits(&fresh.keys));
+        assert_eq!(bits(&live.values), bits(&fresh.values));
+        assert_eq!(bits(&live.key_scales), bits(&fresh.key_scales));
+        assert_eq!(bits(&live.value_scales), bits(&fresh.value_scales));
+
+        // Already-quantized rows append as they are.
+        let (nk, nv) = rows256(4, 3, 99.0);
+        let pre = Int8KvRows::quantize(&nk, &nv).unwrap();
+        let base = cache.get_offset() as i64;
+        let all = cache.append_quantized(&pre).unwrap();
+        let tail = all.slice_tokens(base, base + 3).unwrap();
+        assert_eq!(bits(&tail.keys), bits(&pre.keys));
+        assert_eq!(bits(&tail.key_scales), bits(&pre.key_scales));
+        assert!(
+            KVCache::new().append_quantized(&pre).is_err(),
+            "a BF16 cache refuses quantized rows"
+        );
+
+        cache.reset();
+        assert_eq!(cache.get_offset(), 0);
+        assert!(cache.int8_view().is_none());
+        assert!(cache.key_scales_ref().is_none());
+    }
+
+    /// Growth across the step boundary without a reservation concatenates
+    /// the scale buffers alongside the rows.
+    #[test]
+    fn int8_cache_grows_scale_buffers_with_rows() {
+        if !metal() {
+            return;
+        }
+        let mut cache = KVCache::with_format(KvFormat::Int8);
+        let (k, v) = rows256(2, 250, 5.0);
+        cache.update_and_fetch_int8(&k, &v).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 256);
+        let (k2, v2) = rows256(2, 20, 6.0);
+        let view = cache.update_and_fetch_int8(&k2, &v2).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 250 + 256);
+        assert_eq!(
+            cache.key_scales_ref().unwrap().shape().unwrap()[2],
+            250 + 256
+        );
+        let expected = Int8KvRows::quantize(
+            &MxArray::concatenate(&k, &k2, 2).unwrap(),
+            &MxArray::concatenate(&v, &v2, 2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bits(&view.keys), bits(&expected.keys));
+        assert_eq!(bits(&view.key_scales), bits(&expected.key_scales));
+        assert_eq!(bits(&view.value_scales), bits(&expected.value_scales));
+    }
+
+    #[test]
+    fn kv_format_parses_its_two_names() {
+        assert_eq!(KvFormat::parse(None), Ok(KvFormat::Bf16));
+        assert_eq!(KvFormat::parse(Some("")), Ok(KvFormat::Bf16));
+        assert_eq!(KvFormat::parse(Some("bf16")), Ok(KvFormat::Bf16));
+        assert_eq!(KvFormat::parse(Some(" INT8 ")), Ok(KvFormat::Int8));
+        assert!(KvFormat::parse(Some("fp8")).is_err());
+        assert_eq!(KvFormat::Bf16.row_bytes(256, 2), 512);
+        assert_eq!(KvFormat::Int8.row_bytes(256, 2), 260);
     }
 
     #[test]

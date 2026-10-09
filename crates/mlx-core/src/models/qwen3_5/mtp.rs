@@ -47,8 +47,9 @@ use super::decoder_layer::{AttentionType, DecoderLayer};
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::{
     LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, is_quantized_checkpoint,
-    try_build_kquant_quantized_linear, try_build_mxfp4_quantized_linear,
-    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
+    release_tiled_kquant_sources, try_build_affine_quantized_linear_tiled,
+    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
 };
 
 /// Reject unsupported plain-E4M3 state before any MTP dense setter can see raw
@@ -292,9 +293,14 @@ impl Qwen3_5MTPModule {
     ///   - `mtp.pre_fc_norm_embedding.weight`
     ///   - `mtp.layers.{i}.<suffix>` for every standard per-layer key
     ///     understood by the main decoder loop.
+    ///
+    /// `params` is `&mut` for the same reason as the dense loader's: a K-quant
+    /// or bf16-companion affine projection repacked into the Tiled64 layout
+    /// has its row-major source arrays released from the map once its owner
+    /// is installed (`release_tiled_kquant_sources`).
     pub fn apply_weights(
         &mut self,
-        params: &HashMap<String, MxArray>,
+        params: &mut HashMap<String, MxArray>,
         default_plq: PerLayerQuant,
         per_layer_quant: &HashMap<String, PerLayerQuant>,
         compute_dtype: DType,
@@ -307,6 +313,16 @@ impl Qwen3_5MTPModule {
             "Qwen3_5MTPModule::apply_weights",
         )?;
         let is_quantized = is_quantized_checkpoint(params);
+        // For the completion trace below: judged on the checkpoint, before
+        // a tiled `mtp.fc` releases its sidecars from the map.
+        let fc_quant = if params.contains_key("mtp.fc.scales") {
+            "quantized"
+        } else if params.contains_key("mtp.fc.weight") {
+            "dense"
+        } else {
+            "MISSING"
+        };
+        let tiled_prefixes = std::cell::RefCell::new(Vec::<String>::new());
 
         // Fresh per-prefix quant resolver, duplicating the closure in
         // `apply_weights_inner`. Surgical duplication is preferred over a
@@ -322,9 +338,16 @@ impl Qwen3_5MTPModule {
                     // storage. A body-level FP8 default with BF16 MTP weights may
                     // still resolve here and correctly takes the dense fallback.
                     PerLayerMode::Fp8E4m3 => None,
-                    PerLayerMode::Affine => {
-                        try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
-                    }
+                    // Tiled64 into the affine K-quant contract as in the dense
+                    // loader's `try_build_ql` (no activation-fp8 site is ever
+                    // an `mtp.*` prefix, so no calibrated amax to honour).
+                    PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
+                        params,
+                        prefix,
+                        plq.group_size,
+                        plq.bits,
+                        &mut tiled_prefixes.borrow_mut(),
+                    )?,
                     // Unreachable in practice: `apply_weights_inner` skips the MTP
                     // load entirely for sym8 checkpoints (the dense loader
                     // disables speculative MTP under sym8). `None` here keeps the
@@ -336,10 +359,26 @@ impl Qwen3_5MTPModule {
                     | PerLayerMode::Q4K
                     | PerLayerMode::Q5K
                     | PerLayerMode::Q3K
+                    | PerLayerMode::Q2K
                     | PerLayerMode::IQ4NL
                     | PerLayerMode::IQ4XS
-                    | PerLayerMode::IQ3S => {
-                        try_build_kquant_quantized_linear(params, prefix, plq.mode, "qwen3_5_mtp")?
+                    | PerLayerMode::IQ3S
+                    | PerLayerMode::IQ2XXS
+                    | PerLayerMode::IQ2XS
+                    | PerLayerMode::IQ2S
+                    | PerLayerMode::IQ3XXS
+                    | PerLayerMode::IQ1S
+                    | PerLayerMode::IQ1M => {
+                        // Tiled64 repack as in the dense loader's `try_build_ql`,
+                        // recording the prefix for the post-install release.
+                        try_build_kquant_quantized_linear_tiled(
+                            params,
+                            prefix,
+                            plq.mode,
+                            plq.layout,
+                            "qwen3_5_mtp",
+                            &mut tiled_prefixes.borrow_mut(),
+                        )?
                     }
                 })
             };
@@ -362,6 +401,7 @@ impl Qwen3_5MTPModule {
         // stays a `LinearProj::Standard` and uses the dense matmul as before.
         if let Some(ql) = try_build_ql(params, "mtp.fc")? {
             self.fc.set_quantized(ql);
+            release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
         } else if let Some(w) = params.get("mtp.fc.weight") {
             self.fc.set_weight(w, "mtp.fc")?;
         }
@@ -500,15 +540,11 @@ impl Qwen3_5MTPModule {
             if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
                 layer.set_post_attention_layernorm_weight(w, compute_dtype)?;
             }
+            // The layer owns its tiled projections now; drop the map's
+            // row-major originals (see the dense loader's layer loop).
+            release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
         }
 
-        let fc_quant = if params.contains_key("mtp.fc.scales") {
-            "quantized"
-        } else if params.contains_key("mtp.fc.weight") {
-            "dense"
-        } else {
-            "MISSING"
-        };
         tracing::debug!(
             target: "mlx_core::mtp",
             is_quantized,
@@ -661,6 +697,7 @@ mod tests {
         // makes layer 3 a full-attention layer; n_mtp_layers=1.
         Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 4,
@@ -764,12 +801,13 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
 
         let Some((mut mtp, _)) = build_mtp_or_skip(label) else {
             return;
         };
-        let stored_fp8 = HashMap::from([
+        let mut stored_fp8 = HashMap::from([
             (
                 "mtp.fc.weight".to_string(),
                 MxArray::from_uint8(&[0; 8], &[2, 4]).unwrap(),
@@ -780,7 +818,12 @@ mod tests {
             ),
         ]);
         let err = mtp
-            .apply_weights(&stored_fp8, default_plq, &HashMap::new(), DType::BFloat16)
+            .apply_weights(
+                &mut stored_fp8,
+                default_plq,
+                &HashMap::new(),
+                DType::BFloat16,
+            )
             .expect_err("raw Uint8 MTP storage must not reach Linear::set_weight");
         assert!(err.reason.contains("Uint8 MTP storage"), "{}", err.reason);
         assert!(err.reason.contains("dense fallback"), "{}", err.reason);
@@ -792,7 +835,7 @@ mod tests {
         let Some((mut mtp, _)) = build_mtp_or_skip(label) else {
             return;
         };
-        let stale_mxfp8 = HashMap::from([
+        let mut stale_mxfp8 = HashMap::from([
             (
                 "mtp.fc.weight".to_string(),
                 MxArray::from_uint8(&[0; 8], &[2, 4]).unwrap(),
@@ -803,7 +846,12 @@ mod tests {
             ),
         ]);
         let err = mtp
-            .apply_weights(&stale_mxfp8, default_plq, &HashMap::new(), DType::BFloat16)
+            .apply_weights(
+                &mut stale_mxfp8,
+                default_plq,
+                &HashMap::new(),
+                DType::BFloat16,
+            )
             .expect_err("MXFP8 MTP storage with stale affine metadata must reject");
         assert!(err.reason.contains("MXFP8 MTP storage"), "{}", err.reason);
         assert!(err.reason.contains("resolves to Affine"), "{}", err.reason);
@@ -811,7 +859,7 @@ mod tests {
         let Some((mut mtp, _)) = build_mtp_or_skip(label) else {
             return;
         };
-        let dense = HashMap::from([(
+        let mut dense = HashMap::from([(
             "mtp.fc.weight".to_string(),
             MxArray::from_float32(&[0.0; 8], &[2, 4])
                 .unwrap()
@@ -825,10 +873,11 @@ mod tests {
                 group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
                 mode: PerLayerMode::Fp8E4m3,
                 input_amax: None,
+                layout: Default::default(),
             },
         )]);
         let err = mtp
-            .apply_weights(&dense, default_plq, &explicit, DType::BFloat16)
+            .apply_weights(&mut dense, default_plq, &explicit, DType::BFloat16)
             .expect_err("explicit fp8_e4m3 MTP metadata must reject even with dense bytes");
         assert!(err.reason.contains("explicit fp8_e4m3"), "{}", err.reason);
     }
@@ -926,7 +975,7 @@ mod tests {
     /// MLX/Metal is unavailable so the caller bails cleanly.
     fn apply_fc_or_skip(
         mtp: &mut Qwen3_5MTPModule,
-        params: &HashMap<String, MxArray>,
+        params: &mut HashMap<String, MxArray>,
         default_plq: PerLayerQuant,
         per_layer_quant: &HashMap<String, PerLayerQuant>,
         label: &str,
@@ -996,6 +1045,7 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
 
         // (a) affine quantized fc → Quantized (mode "affine").
@@ -1015,9 +1065,10 @@ mod tests {
                     group_size: 32,
                     mode: PerLayerMode::Affine,
                     input_amax: None,
+                    layout: Default::default(),
                 },
             );
-            if !apply_fc_or_skip(&mut mtp, &params, default_plq, &plq, label) {
+            if !apply_fc_or_skip(&mut mtp, &mut params, default_plq, &plq, label) {
                 return;
             }
             assert!(
@@ -1050,9 +1101,10 @@ mod tests {
                     group_size: MXFP8_GROUP_SIZE,
                     mode: PerLayerMode::Mxfp8,
                     input_amax: None,
+                    layout: Default::default(),
                 },
             );
-            if !apply_fc_or_skip(&mut mtp, &params, default_plq, &plq, label) {
+            if !apply_fc_or_skip(&mut mtp, &mut params, default_plq, &plq, label) {
                 return;
             }
             assert!(
@@ -1071,7 +1123,7 @@ mod tests {
             };
             let mut params: HashMap<String, MxArray> = HashMap::new();
             params.insert("mtp.fc.weight".into(), bf16_arr(&[out, inp], 0.01));
-            if !apply_fc_or_skip(&mut mtp, &params, default_plq, &HashMap::new(), label) {
+            if !apply_fc_or_skip(&mut mtp, &mut params, default_plq, &HashMap::new(), label) {
                 return;
             }
             assert!(

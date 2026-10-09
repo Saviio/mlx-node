@@ -379,7 +379,11 @@ loads Google's QAT checkpoint without a separate conversion command.
 
 The first load creates an application cache, preserving supported quantized weights
 in packed form and preparing the media companion in the same transaction.
-Supported K formats are Q3_K, Q4_K, Q5_K, and Q6_K.
+Supported source types are F32/F16/BF16, the affine blocks Q4_0, Q4_1, Q5_0,
+Q5_1 and Q8_0, MXFP4, the K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+IQ4_NL and IQ4_XS, and the grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
+IQ2_S, IQ3_XXS and IQ3_S (so every Unsloth `UD-IQ*` / `UD-Q2_K_XL` mix loads
+at ggml's byte size).
 Later loads reuse it. `MLX_NATIVE_GGUF_CACHE_DIR` overrides the cache directory;
 source files are not modified. Changes to the source, companion, or tokenizer
 assets invalidate the cache. A directory with multiple text GGUFs requires an
@@ -441,11 +445,13 @@ when present, DFlash. It checks loading and generation, not performance targets.
 mlx convert --input ./model.gguf --output ./model-mlx
 ```
 
-Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, Q4_0, Q4_1 and
-Q8_0 source types directly, plus the ggml K-quants Q6_K, Q4_K and Q5_K behind
+Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, the affine
+blocks Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and MXFP4 source types directly, plus the
+ggml K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and the
+grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S behind
 `--gguf-kquant`.
 
-#### K-quants (Q6_K, Q4_K, Q5_K)
+#### K-quants (Q2_K .. Q6_K, IQ4_NL, IQ4_XS, IQ1_*, IQ2_*, IQ3_XXS, IQ3_S)
 
 ```bash
 mlx convert --input ./model-UD-Q6_K_XL.gguf --output ./model-mlx --gguf-kquant
@@ -463,34 +469,70 @@ two-level decode:
 
 ```
 Q4_K/Q5_K   y = d*sc[j]*q - dmin*m[j]   ->  scale = d*sc[j]   bias = -dmin*m[j]
+Q2_K        the same at 16-value groups  (sc, m are the two nibbles of one byte)
 Q6_K        y = d*sc[j]*(q-32)          ->  scale = d*sc[j]   bias = -32*d*sc[j]
+Q3_K        y = d*sc[j]*(q-4)           ->  scale = d*sc[j]   bias = -4*d*sc[j]
+IQ4_NL/XS   y = d*sc[j]*grid[q]         ->  the 16-entry codebook, no bias
 ```
 
-| source | mlx-node   | ggml   | note                           |
-| ------ | ---------- | ------ | ------------------------------ |
-| Q6_K   | 6.5625 bpw | 6.5625 | exact parity                   |
-| Q4_K   | 4.6250 bpw | 4.5000 | +0.125 for unpacked sub-scales |
-| Q5_K   | 5.6250 bpw | 5.5000 | +0.125, same reason            |
+The grid formats are not affine and keep ggml's native words: `.weight` holds
+the grid-index words of each 32-value unit, `.scales` the unit's sign indices /
+`qh` / scale nibbles, `.biases` the f16 `d`, and the kernels look the values up
+in ggml's grid tables (`kquant_grid.h`, the same source for Metal and the CPU
+reference), bit-identical to `dequantize_row_*`:
 
-The sub-scales are stored unpacked rather than in ggml's 6-bit packing: packing
-would preserve the exact 4.5 bpw but breaks the affine pointer-walk contract and
-puts a divergent branch in the innermost loop of the matvec kernel.
+```
+IQ2_XXS/XS/S  y = d*(1+2*sc)/8 * (+-grid8[idx][j])    sc a nibble per 32 (XXS) or 16 (XS, S)
+IQ3_XXS       y = d*(1+2*sc)/4 * (+-grid4[idx][j])
+IQ3_S         y = d*(1+2*sc)   * (+-grid4[idx][j])    9-bit idx (qh), one sign bit per value
+IQ1_S/M       y = d*(2*sc+1) * (grid[idx][j] +- 1/8)  computed as d*(2*sc+1)/8 * (8*g +- 1)
+```
+
+| source | mlx-node   | ggml   | note                                |
+| ------ | ---------- | ------ | ----------------------------------- |
+| Q6_K   | 6.5625 bpw | 6.5625 | exact parity                        |
+| Q4_K   | 4.6250 bpw | 4.5000 | +0.125 for unpacked sub-scales      |
+| Q5_K   | 5.6250 bpw | 5.5000 | +0.125, same reason                 |
+| Q2_K   | 3.1250 bpw | 2.6250 | +0.5 for unpacked (sc, m) nibbles   |
+| Q3_K   | 3.5625 bpw | 3.4375 | +0.125 for unpacked sub-scales      |
+| IQ2_XXS | 2.0625 bpw | 2.0625 | native words, exact parity        |
+| IQ2_XS | 2.3125 bpw | 2.3125 | native words, exact parity          |
+| IQ2_S  | 2.5625 bpw | 2.5625 | native words, exact parity          |
+| IQ3_XXS | 3.0625 bpw | 3.0625 | native words, exact parity        |
+| IQ3_S  | 3.5625 bpw | 3.4375 | +4 B/256 for whole-byte scale nibbles |
+| IQ1_S  | 1.5625 bpw | 1.5625 | native words, exact parity          |
+| IQ1_M  | 1.8125 bpw | 1.7500 | +2 B/256 for the explicit f16 `d`   |
+
+The sub-scales are stored unpacked rather than in ggml's 6-bit (4-bit for Q2_K)
+packing: packing would preserve the exact ggml density but breaks the affine
+pointer-walk contract and puts a divergent branch in the innermost loop of the
+matvec kernel. The codes themselves stay at their ggml width.
 
 `--gguf-kquant` cannot be combined with `--quantize`, `--q-recipe`, `--q-mxfp` or
 `--imatrix-path` — the blocks are imported bit-for-bit and never dequantized, so
 there is nothing for a re-quantizer to act on. The combination is rejected
 upfront rather than silently ignored.
 
-Producing K-quants is not supported; they are consume-only. IQ4_XS is a 16-entry
-non-uniform codebook rather than a scale/bias grid, does not share the kernel
-shape, and is not supported.
+Producing K-quants is not supported; they are consume-only.
 
-#### Symmetric formats (Q4_0, Q8_0)
+#### MXFP4
+
+ggml's MXFP4 block (one E8M0 shared exponent, 32 E2M1 codes) is the OCP MX
+format MLX decodes natively, so it lands on MLX's `mxfp4` mode without
+`--gguf-kquant`: the importer un-interleaves ggml's nibble halves into MLX's
+code order and copies the exponent byte into the uint8 `.scales`; there are no
+`.biases`. The decode is bit-identical to llama.cpp's for every exponent code
+from 2 up (the only codes real weights use); `config.json` names each tensor
+`{bits: 4, group_size: 32, mode: "mxfp4"}`, and 3-D MoE expert stacks take the
+existing `mxfp4` gather path.
+
+#### Symmetric formats (Q4_0, Q5_0, Q8_0)
 
 ggml stores these as `w = d * (q - Z)` — one f16 scale per 32 weights, with the
-offset derived rather than stored. MLX's affine format is `w = scale * q + bias`,
-so the import used to write a `.biases` array whose every entry was `-Z * scale`:
-0.5 bpw of pure redundancy, 681 MB on Gemma-4-12B-QAT.
+offset derived rather than stored (Z = 8, 16, 128). MLX's affine format is
+`w = scale * q + bias`, so the import used to write a `.biases` array whose
+every entry was `-Z * scale`: 0.5 bpw of pure redundancy, 681 MB on
+Gemma-4-12B-QAT.
 
 The converter now records `symmetric_zero_point` in `config.json` and leaves the
 companion off disk; the loader rebuilds it before any layer is constructed. The
@@ -595,17 +637,18 @@ kl_topk          0.13782  (K=512, teacher tail mass 0.04045)
 top1_agreement   77.64%
 ```
 
-| Flag            | Purpose                                                                   |
-| --------------- | ------------------------------------------------------------------------- |
-| `--teacher`     | Reference checkpoint, normally bf16 (`cache` mode, required)              |
-| `--model`, `-m` | Candidate checkpoint to score (`score` mode, required)                    |
-| `--dataset`     | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)             |
-| `--cache`       | Teacher cache directory (required in both modes)                          |
-| `--rows`        | Dataset rows to capture (default `64`)                                    |
-| `--seq`         | Tokens kept per row (default `512`, minimum `2`)                          |
-| `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary) |
-| `--logit-chunk` | Positions per head projection (default `64`)                              |
-| `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting      |
+| Flag            | Purpose                                                                                                                            |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `--teacher`     | Reference checkpoint, normally bf16 (`cache` mode, required)                                                                       |
+| `--model`, `-m` | Candidate checkpoint to score (`score` mode, required)                                                                             |
+| `--dataset`     | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)                                                                      |
+| `--cache`       | Teacher cache directory (required in both modes)                                                                                   |
+| `--rows`        | Dataset rows to capture (default `64`)                                                                                             |
+| `--seq`         | Tokens kept per row (default `512`, minimum `2`)                                                                                   |
+| `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary)                                                          |
+| `--logit-chunk` | Positions per head projection (default `64`)                                                                                       |
+| `--kv-format`   | Candidate flat K/V cache format, `int8` or `bf16` (dense qwen3_5; unset = the load default, int8 on Metal at head 256)             |
+| `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting                                                               |
 
 **Reading the numbers.** `nll`, `perplexity` and `top1_agreement` are exact over
 the full vocabulary. `kl_topk` is a KL over a `K+1`-way partition: one term per
@@ -789,7 +832,7 @@ overall output limit. These options also work with `mlx delegate`.
 
 ### Model selection and first-run wizard
 
-`mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag. Dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` targets are also discovered when placed directly in that directory or one level inside a downloaded GGUF repository; each appears under its filename stem. Gemma 4 GGUF variants, including Q4_0 QAT and K-quant targets, and Muse-Glimmer primary GGUF variants are also discovered by filename stem. Companion files such as imatrix, mmproj, draft, or DFlash2-only checkpoints are not advertised as agent models.
+`mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag. Dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` and `Q<number>_K_M.gguf` targets are also discovered when placed directly in that directory or one level inside a downloaded GGUF repository; each appears under its filename stem. Gemma 4 GGUF variants, including Q4_0 QAT and K-quant targets, and Muse-Glimmer primary GGUF variants are also discovered by filename stem. Companion files such as imatrix, mmproj, draft, or DFlash2-only checkpoints are not advertised as agent models.
 
 Qwen3.8-27B can use the separate [DFlash2 companion](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
 (about 3.85 GB). Install it from the desktop Models page, or download it separately:

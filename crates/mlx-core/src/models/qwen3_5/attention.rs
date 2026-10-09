@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::kv_int8::{Int8KvRows, segmented_sdpa_int8};
 use crate::array::{DType, MxArray};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -13,6 +14,7 @@ use crate::models::paddleocr_vl::language::{
 };
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
+use crate::transformer::KvFormat;
 use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 #[cfg(test)]
 use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
@@ -215,20 +217,45 @@ pub struct Qwen3_5Attention {
     kv_proj: Option<(LinearProj, i64)>,
 }
 
+/// The K/V prefix a compiled verify forward reads: views into the flat
+/// `KVCache` buffers in the cache's format.
+pub(crate) enum VerifyPrefix<'a> {
+    /// BF16 `[B, Hkv, P, D]` keys and values.
+    Bf16 {
+        keys: &'a MxArray,
+        values: &'a MxArray,
+    },
+    /// int8 `[B, Hkv, P, D]` keys and values with their fp32 `[B, Hkv, P]`
+    /// scales (`KVCache::int8_view`).
+    Int8 {
+        keys: &'a MxArray,
+        values: &'a MxArray,
+        key_scales: &'a MxArray,
+        value_scales: &'a MxArray,
+    },
+}
+
+/// The post-RoPE K/V block a compiled verify forward emits, in the layout the
+/// cache stores: BF16 rows, or int8 rows plus scales (quantized inside the
+/// graph, so the verify attention reads the new rows in the same format as
+/// the prefix and the cache write is a plain slice assignment).
+pub(crate) enum VerifyKvOut {
+    Bf16(MxArray, MxArray),
+    Int8(Int8KvRows),
+}
+
 /// IO bundle for [`Qwen3_5Attention::forward_verify`] (the compiled DFlash2
 /// verify path): the graph reads position and the K/V prefix as array inputs
 /// and returns the post-RoPE block through `out_kv`, so nothing host-baked —
 /// cache offsets, prefix lengths, write bounds — enters the traced region.
 pub(crate) struct AttentionVerifyIo<'a> {
-    /// Live K prefix `[B, Hkv, P, D]` — a view into the flat KVCache buffer.
-    pub prefix_keys: &'a MxArray,
-    /// Live V prefix `[B, Hkv, P, D]`.
-    pub prefix_values: &'a MxArray,
+    /// Live K/V prefix views into the flat KVCache buffers.
+    pub prefix: VerifyPrefix<'a>,
     /// Per-batch RoPE position of this block's first row, `[B] int32`.
     pub rope_offsets: &'a MxArray,
-    /// Receives `(new_k, new_v)` `[B, Hkv, T, D]` post-RoPE — the layout
-    /// `KVCache::update_and_fetch` would store.
-    pub out_kv: &'a mut Option<(MxArray, MxArray)>,
+    /// Receives the post-RoPE `[B, Hkv, T, D]` block in the cache's format —
+    /// what `KVCache::update_and_fetch` / `append_quantized` store.
+    pub out_kv: &'a mut Option<VerifyKvOut>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -654,6 +681,21 @@ impl Qwen3_5Attention {
         let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
 
+        // An int8 cache quantizes the block on write and reads the int8 rows
+        // through its own kernels; see `forward_int8_cached`.
+        if cache
+            .as_deref()
+            .is_some_and(|c| c.format() == KvFormat::Int8)
+        {
+            let c = cache.ok_or_else(|| Error::from_reason("int8 KV cache vanished"))?;
+            let output = self.forward_int8_cached(&queries, &keys, &values, mask, c, seq_len)?;
+            let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+            let output =
+                output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+            let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+            return self.o_proj.forward(&gated_output);
+        }
+
         // Update KV cache (expects [B, H, T, D])
         let (keys, values) = if let Some(c) = cache {
             c.update_and_fetch(&keys, &values)?
@@ -738,6 +780,114 @@ impl Qwen3_5Attention {
         self.o_proj.forward(&gated_output)
     }
 
+    /// SDPA of `queries` `[B, Hq, T, D]` over an int8 `KVCache` after
+    /// appending the BF16 block `keys` / `values` `[B, Hkv, T, D]` to it
+    /// (quantized on write). Returns `[B, Hq, T, D]`.
+    ///
+    /// Readers by block shape:
+    ///   * `T == 1` (AR decode, MTP draft step) and `2..=8` without a mask
+    ///     (eager MTP / DFlash2 verify): the segmented int8 kernels read the
+    ///     int8 rows directly — prefix `[0, P)` and the block's own rows as
+    ///     the "new" segment, causal for a block.
+    ///   * anything else (prefill chunks, explicit masks): the cached prefix
+    ///     is dequantized to a BF16 temporary (one pass per layer per chunk)
+    ///     and MLX's fused SDPA runs over `concat(prefix, fresh block)`; the
+    ///     block's own rows stay BF16 there.
+    ///
+    /// An empty prefix has no int8 segment to bind, so it also takes the
+    /// BF16 route (the first prefill chunk, a one-token prompt's first step).
+    fn forward_int8_cached(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        values: &MxArray,
+        mask: Option<&MxArray>,
+        cache: &mut KVCache,
+        seq_len: i64,
+    ) -> Result<MxArray> {
+        let prefix_len = cache.get_offset() as i64;
+        let all = cache.update_and_fetch_int8(keys, values)?;
+        let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
+        let segmented = mask.is_none()
+            && prefix_len > 0
+            && (1..=8).contains(&seq_len)
+            && (1..=32).contains(&gqa)
+            && self.head_dim == 256
+            && queries.dtype()? == DType::BFloat16
+            && unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        if segmented {
+            let prefix = all.slice_tokens(0, prefix_len)?;
+            let new = all.slice_tokens(prefix_len, prefix_len + seq_len)?;
+            return segmented_sdpa_int8(queries, &prefix, &new, self.scale, seq_len > 1);
+        }
+        let (k, v) = if prefix_len > 0 {
+            let (pk, pv) = all.slice_tokens(0, prefix_len)?.dequantize()?;
+            (
+                MxArray::concatenate(&pk, keys, 2)?,
+                MxArray::concatenate(&pv, values, 2)?,
+            )
+        } else {
+            (keys.clone(), values.clone())
+        };
+        if let Some(m) = mask {
+            scaled_dot_product_attention(queries, &k, &v, self.scale as f64, Some(m))
+        } else if seq_len > 1 {
+            scaled_dot_product_attention_causal(queries, &k, &v, self.scale as f64)
+        } else {
+            scaled_dot_product_attention(queries, &k, &v, self.scale as f64, None)
+        }
+    }
+
+    /// `rope(q_norm(q))`, `rope(k_norm(k))` in one Metal dispatch
+    /// (`mlx_qk_norm_rope`), from `[B, T, H, D]` inputs (any strides) to the
+    /// `[B, H, T, D]` layout the verify attention reads. Bit-identical to
+    /// `fast::rms_norm` + `fast::rope` (gated by `fused_qk_norm_rope_eq`).
+    /// `None` on a contract miss (non-Metal, M-RoPE checkpoint, traditional
+    /// rope, differing eps, unsupported dtype/dims); callers keep the four-op
+    /// chain.
+    pub(crate) fn fused_qk_norm_rope(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        offsets: &MxArray,
+    ) -> Option<(MxArray, MxArray)> {
+        static METAL: OnceLock<bool> = OnceLock::new();
+        let metal = *METAL.get_or_init(|| unsafe { mlx_sys::mlx_metal_is_available() });
+        if !metal
+            || self.mrope.is_some()
+            || self.rope.traditional
+            || self.q_norm.eps_f32() != self.k_norm.eps_f32()
+        {
+            return None;
+        }
+        let mut out_q = std::ptr::null_mut();
+        let mut out_k = std::ptr::null_mut();
+        // SAFETY: every handle is a live array for the call; the outputs are
+        // owned handles or stay null when the call reports false.
+        let ok = unsafe {
+            mlx_sys::mlx_qk_norm_rope(
+                queries.handle.0,
+                keys.handle.0,
+                self.q_norm.weight().handle.0,
+                self.k_norm.weight().handle.0,
+                offsets.handle.0,
+                self.q_norm.eps_f32(),
+                self.rope.base,
+                self.rope.scale,
+                self.rope.dims,
+                &mut out_q,
+                &mut out_k,
+            )
+        };
+        if !ok {
+            return None;
+        }
+        let q = MxArray::from_handle(out_q, "qk_norm_rope:q").ok()?;
+        let k = MxArray::from_handle(out_k, "qk_norm_rope:k").ok()?;
+        Some((q, k))
+    }
+
     /// Compiled-verify forward for the DFlash2 flat-cache path.
     ///
     /// Identical math to [`Self::forward`] with `mask = None`,
@@ -787,21 +937,59 @@ impl Qwen3_5Attention {
             self.num_kv_heads as i64,
             self.head_dim as i64,
         ])?;
-        let queries = self.q_norm.forward(&queries)?;
-        let keys = self.k_norm.forward(&keys)?;
+        // One dispatch for q_norm + k_norm + rope(q) + rope(k), bit-identical
+        // to the four-op chain below (its fallback).
+        let (queries, new_keys) = match self.fused_qk_norm_rope(&queries, &keys, io.rope_offsets) {
+            Some(fused) => fused,
+            None => {
+                let queries = self.q_norm.forward(&queries)?;
+                let keys = self.k_norm.forward(&keys)?;
 
-        // RoPE rotates along axis -2: feed [B, H, T, D] directly and keep
-        // that layout — the eager path's round-trip back to [B, T, H, D]
-        // only exists to satisfy the KVCache write order, which lives in
-        // the caller here.
-        let queries = self
-            .rope
-            .forward_with_offsets(&queries.transpose(Some(&[0, 2, 1, 3]))?, io.rope_offsets)?;
-        let new_keys = self
-            .rope
-            .forward_with_offsets(&keys.transpose(Some(&[0, 2, 1, 3]))?, io.rope_offsets)?;
+                // RoPE rotates along axis -2: feed [B, H, T, D] directly
+                // and keep that layout — the eager path's round-trip back
+                // to [B, T, H, D] only exists to satisfy the KVCache write
+                // order, which lives in the caller here.
+                let queries = self.rope.forward_with_offsets(
+                    &queries.transpose(Some(&[0, 2, 1, 3]))?,
+                    io.rope_offsets,
+                )?;
+                let new_keys = self
+                    .rope
+                    .forward_with_offsets(&keys.transpose(Some(&[0, 2, 1, 3]))?, io.rope_offsets)?;
+                (queries, new_keys)
+            }
+        };
         let new_values = values.transpose(Some(&[0, 2, 1, 3]))?;
-        *io.out_kv = Some((new_keys.clone(), new_values.clone()));
+
+        let (prefix_keys, prefix_values) = match io.prefix {
+            VerifyPrefix::Bf16 { keys, values } => (keys, values),
+            VerifyPrefix::Int8 {
+                keys,
+                values,
+                key_scales,
+                value_scales,
+            } => {
+                // Quantize the block inside the graph: the cache stores
+                // exactly these rows, and the verify attention reads them
+                // in the same int8 form as the prefix (one operand type per
+                // kernel, as Splash's store-then-attend order).
+                let new = Int8KvRows::quantize(&new_keys, &new_values)?;
+                let prefix = Int8KvRows {
+                    keys: keys.clone(),
+                    values: values.clone(),
+                    key_scales: key_scales.clone(),
+                    value_scales: value_scales.clone(),
+                };
+                let output = segmented_sdpa_int8(&queries, &prefix, &new, self.scale, true)?;
+                *io.out_kv = Some(VerifyKvOut::Int8(new));
+                let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+                let output =
+                    output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+                let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+                return self.o_proj.forward(&gated_output);
+            }
+        };
+        *io.out_kv = Some(VerifyKvOut::Bf16(new_keys.clone(), new_values.clone()));
 
         let output = if seq_len > 1 {
             let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
@@ -817,7 +1005,7 @@ impl Qwen3_5Attention {
             };
             // Segmented attention serves the whole block in one call.
             let one_call = segmented_enabled
-                && io.prefix_keys.shape_at(2)? > 0
+                && prefix_keys.shape_at(2)? > 0
                 && segmented_verify_head_len(seq_len, device_max_q).is_some();
             // Otherwise the same qL·gqa verify-split as `forward` — see its
             // comment for the threadgroup-limit rationale — but the head
@@ -845,8 +1033,8 @@ impl Qwen3_5Attention {
                 let head_new_v = new_values.slice_axis(2, 0, head_len)?;
                 let out_head = verify_sdpa_without_kv_concat(
                     &q_parts[0],
-                    io.prefix_keys,
-                    io.prefix_values,
+                    prefix_keys,
+                    prefix_values,
                     &head_new_k,
                     &head_new_v,
                     self.scale,
@@ -854,8 +1042,8 @@ impl Qwen3_5Attention {
                 )?;
                 let out_tail = verify_sdpa_without_kv_concat(
                     &q_parts[1],
-                    io.prefix_keys,
-                    io.prefix_values,
+                    prefix_keys,
+                    prefix_values,
                     &new_keys,
                     &new_values,
                     self.scale,
@@ -865,8 +1053,8 @@ impl Qwen3_5Attention {
             } else {
                 verify_sdpa_without_kv_concat(
                     &queries,
-                    io.prefix_keys,
-                    io.prefix_values,
+                    prefix_keys,
+                    prefix_values,
                     &new_keys,
                     &new_values,
                     self.scale,
@@ -876,8 +1064,8 @@ impl Qwen3_5Attention {
         } else {
             verify_sdpa_without_kv_concat(
                 &queries,
-                io.prefix_keys,
-                io.prefix_values,
+                prefix_keys,
+                prefix_values,
                 &new_keys,
                 &new_values,
                 self.scale,
@@ -2014,6 +2202,20 @@ impl Qwen3_5Attention {
         self.q_proj.input_amax()
     }
 
+    /// Test-only: the q_proj quantization mode (`None` when dense) and
+    /// whether its q/gate block was merged (packed reorder or dense cache).
+    #[cfg(test)]
+    pub(crate) fn q_proj_mode_and_block(&self) -> (Option<String>, bool) {
+        let mode = match &self.q_proj {
+            LinearProj::Quantized(ql) => Some(ql.mode().to_string()),
+            LinearProj::Standard(_) => None,
+        };
+        (
+            mode,
+            self.q_gate_block_t.is_some() || self.q_proj.has_q_gate_block_layout(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn prism_hadamard_sites(&self) -> (bool, bool, bool, bool) {
         (
@@ -2024,6 +2226,9 @@ impl Qwen3_5Attention {
         )
     }
 }
+
+#[cfg(test)]
+mod kv_int8_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2641,6 +2846,761 @@ mod tests {
         assert!(!verify_plan(8, 6, 0, caps, caps).0, "partitions < 32");
     }
 
+    /// Tile planner over synthetic limits: (supported, tile keys, threads,
+    /// threadgroup bytes, partitions for `total` keys).
+    fn tile_plan(
+        rows: i32,
+        gqa: i32,
+        total: i32,
+        blocks_override: i32,
+        stage1: (usize, usize, usize),
+        device_memory: usize,
+        stage2: (usize, usize, usize),
+    ) -> (bool, u32, u32, u32, u32) {
+        let mut out = [0u32; 4];
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_verify_tile_plan(
+                rows,
+                gqa,
+                total,
+                blocks_override,
+                stage1.0,
+                stage1.1,
+                stage1.2,
+                device_memory,
+                stage2.0,
+                stage2.1,
+                stage2.2,
+                out.as_mut_ptr(),
+            )
+        } == 1;
+        (supported, out[0], out[1], out[2], out[3])
+    }
+
+    /// The simdgroup-matrix verify kernel: 2 simdgroups per 8 queries of
+    /// M = gqa x rows, a K/V tile of `tile_n x (256 + 8)` BF16 within three
+    /// quarters of the device's threadgroup memory limit plus the score
+    /// exchange (simdgroups x 32 x tile_n / 4 floats), and contiguous
+    /// partitions of about 8 tiles (32..=1024, multiples of 32).
+    #[test]
+    fn segmented_verify_tile_planner_follows_device_limits() {
+        let caps = (32, 1024, 0);
+        let kib = 1024;
+        // 24 q heads / 4 kv heads, 8 rows: M = 48 -> 12 simdgroups.
+        assert_eq!(
+            tile_plan(8, 6, 32776, 0, caps, 32 * kib, caps),
+            (true, 32, 384, 32 * 264 * 2 + 12 * 32 * 8 * 4, 160)
+        );
+        assert_eq!(tile_plan(8, 6, 95, 0, caps, 32 * kib, caps).4, 32);
+        assert_eq!(tile_plan(8, 6, 6227, 0, caps, 32 * kib, caps).4, 32);
+        assert_eq!(tile_plan(8, 6, 16392, 0, caps, 32 * kib, caps).4, 96);
+        assert_eq!(tile_plan(8, 6, 1 << 20, 0, caps, 32 * kib, caps).4, 1024);
+        // MLX_SDPA_BLOCKS rounds up to 32, as the vector policy.
+        assert_eq!(tile_plan(8, 6, 32776, 100, caps, 32 * kib, caps).4, 128);
+        assert_eq!(tile_plan(8, 6, 32776, 4096, caps, 32 * kib, caps).4, 1024);
+        // The tile follows the memory limit: 16 KiB -> 16 keys; 32 keys is
+        // the ceiling (64 measured slower); 8 KiB fits nothing.
+        assert_eq!(tile_plan(8, 6, 32776, 0, caps, 16 * kib, caps).1, 16);
+        assert_eq!(tile_plan(8, 6, 32776, 0, caps, 64 * kib, caps).1, 32);
+        assert!(!tile_plan(8, 6, 32776, 0, caps, 8 * kib, caps).0);
+        // M must be a multiple of 8 and the block at least 2 rows.
+        assert!(tile_plan(4, 6, 1000, 0, caps, 32 * kib, caps).0);
+        assert!(!tile_plan(5, 6, 1000, 0, caps, 32 * kib, caps).0);
+        assert!(!tile_plan(1, 8, 1000, 0, caps, 32 * kib, caps).0);
+        assert!(tile_plan(2, 8, 1000, 0, caps, 32 * kib, caps).0);
+        // 32 x 8 = 256 queries need 64 simdgroups: over 1024 threads. Wider
+        // exchanges shrink the tile: 16 simdgroups (gqa 8) and 32 (gqa 16)
+        // take 16 keys.
+        assert!(!tile_plan(8, 32, 1000, 0, caps, 32 * kib, caps).0);
+        assert_eq!(
+            tile_plan(8, 16, 1000, 0, caps, 32 * kib, caps),
+            (true, 16, 1024, 16 * 264 * 2 + 32 * 32 * 4 * 4, 32)
+        );
+        assert_eq!(tile_plan(8, 8, 1000, 0, caps, 32 * kib, caps).1, 16);
+        assert_eq!(tile_plan(8, 8, 1000, 0, caps, 32 * kib, caps).2, 512);
+        // The pipeline's own limits rule: width, threads, static memory.
+        assert!(!tile_plan(8, 6, 1000, 0, (16, 1024, 0), 32 * kib, caps).0);
+        assert!(!tile_plan(8, 6, 1000, 0, (32, 256, 0), 32 * kib, caps).0);
+        assert_eq!(
+            tile_plan(8, 6, 1000, 0, (32, 1024, 12 * kib), 32 * kib, caps).1,
+            16
+        );
+        assert!(!tile_plan(8, 6, 1000, 0, (32, 1024, 26 * kib), 32 * kib, caps).0);
+        assert!(!tile_plan(8, 6, 1000, 0, caps, 32 * kib, (32, 512, 0)).0);
+    }
+
+    /// Tensor-op planner over synthetic limits: (supported, M, tile keys,
+    /// threads, threadgroup bytes, partitions for `total` keys).
+    fn nax_plan(
+        rows: i32,
+        gqa: i32,
+        total: i32,
+        blocks_override: i32,
+        stage1: (usize, usize, usize),
+        device_memory: usize,
+        stage2: (usize, usize, usize),
+    ) -> (bool, u32, u32, u32, u32, u32) {
+        let mut out = [0u32; 5];
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_verify_nax_plan(
+                rows,
+                gqa,
+                total,
+                blocks_override,
+                stage1.0,
+                stage1.1,
+                stage1.2,
+                device_memory,
+                stage2.0,
+                stage2.1,
+                stage2.2,
+                out.as_mut_ptr(),
+            )
+        } == 1;
+        (supported, out[0], out[1], out[2], out[3], out[4])
+    }
+
+    /// The tensor-op verify kernel: 256 threads whatever M, M = gqa x rows a
+    /// compiled multiple of 8 up to 64, the scratch (fp32 scores + BF16
+    /// probabilities [M][tile_n], fp32 scale [M], two flags) within three
+    /// quarters of the device's threadgroup memory limit choosing 64 or 32
+    /// keys, and the tile kernel's partition policy at that tile size.
+    #[test]
+    fn segmented_verify_nax_planner_follows_device_limits() {
+        // The tensor-op pipeline reports 256 threads; MLX's reduction 1024.
+        let caps = (32, 256, 0);
+        let red = (32, 1024, 0);
+        let kib = 1024;
+        let scratch = |m: u32, n: u32| m * n * 6 + m * 4 + 8;
+        // 24 q heads / 4 kv heads, 8 rows: M = 48 -> 64 keys, 512 keys per
+        // partition.
+        assert_eq!(
+            nax_plan(8, 6, 32776, 0, caps, 32 * kib, red),
+            (true, 48, 64, 256, scratch(48, 64), 96)
+        );
+        assert_eq!(nax_plan(8, 6, 95, 0, caps, 32 * kib, red).5, 32);
+        assert_eq!(nax_plan(8, 6, 16392, 0, caps, 32 * kib, red).5, 64);
+        assert_eq!(nax_plan(8, 6, 1 << 20, 0, caps, 32 * kib, red).5, 1024);
+        assert_eq!(nax_plan(8, 6, 32776, 100, caps, 32 * kib, red).5, 128);
+        // M = 64 (gqa 8) exceeds the 64-key budget at 32 KiB: 32 keys and
+        // 256 keys per partition; M = 56 still fits 64 keys.
+        assert_eq!(
+            nax_plan(8, 8, 32776, 0, caps, 32 * kib, red),
+            (true, 64, 32, 256, scratch(64, 32), 160)
+        );
+        assert_eq!(nax_plan(7, 8, 1000, 0, caps, 32 * kib, red).2, 64);
+        assert_eq!(nax_plan(8, 8, 1000, 0, caps, 64 * kib, red).2, 64);
+        // 16 KiB: 64 keys up to M = 24, 32 keys to M = 56, nothing at 64;
+        // 8 KiB: 32 keys up to M = 24.
+        assert_eq!(nax_plan(4, 6, 1000, 0, caps, 16 * kib, red).2, 64);
+        assert_eq!(nax_plan(8, 6, 1000, 0, caps, 16 * kib, red).2, 32);
+        assert_eq!(nax_plan(7, 8, 1000, 0, caps, 16 * kib, red).2, 32);
+        assert!(!nax_plan(8, 8, 1000, 0, caps, 16 * kib, red).0);
+        assert!(!nax_plan(8, 6, 1000, 0, caps, 8 * kib, red).0);
+        assert_eq!(nax_plan(4, 6, 1000, 0, caps, 8 * kib, red).2, 32);
+        // Every compiled M: multiples of 8 from 8 (gqa 4 x 2) to 64.
+        for rows in 2..=8 {
+            for gqa in 1..=32 {
+                let m = rows * gqa;
+                let plan = nax_plan(rows, gqa, 1000, 0, caps, 32 * kib, red);
+                assert_eq!(plan.0, m % 8 == 0 && m <= 64, "rows={rows} gqa={gqa}");
+                if plan.0 {
+                    assert_eq!(plan.1, m as u32);
+                }
+            }
+        }
+        assert!(!nax_plan(1, 8, 1000, 0, caps, 32 * kib, red).0, "rows < 2");
+        // The pipeline's own limits rule: width, 256 threads, static memory.
+        assert!(!nax_plan(8, 6, 1000, 0, (16, 256, 0), 32 * kib, red).0);
+        assert!(!nax_plan(8, 6, 1000, 0, (32, 128, 0), 32 * kib, red).0);
+        assert!(nax_plan(8, 6, 1000, 0, (32, 1024, 0), 32 * kib, red).0);
+        assert_eq!(
+            nax_plan(8, 6, 1000, 0, (32, 256, 8 * kib), 32 * kib, red).2,
+            32
+        );
+        assert!(!nax_plan(8, 6, 1000, 0, (32, 256, 26 * kib), 32 * kib, red).0);
+        assert!(!nax_plan(8, 6, 1000, 0, caps, 32 * kib, (32, 512, 0)).0);
+    }
+
+    /// `[B, H, prefix, D]` inputs for a verify block of `rows` over `prefix`
+    /// keys from `[B, H, capacity, D]` caches with NaN past the prefix.
+    #[cfg(target_os = "macos")]
+    struct TileCase {
+        q: MxArray,
+        pk: MxArray,
+        pv: MxArray,
+        nk: MxArray,
+        nv: MxArray,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn tile_case(
+        base_k: &MxArray,
+        base_v: &MxArray,
+        q_heads: i64,
+        rows: i64,
+        prefix: i64,
+        salt: u32,
+        exponent_shift: u16,
+    ) -> Result<TileCase> {
+        const D: i64 = 256;
+        let kv_heads = base_k.shape_at(1)?;
+        let mut q_bits = deterministic_bf16((q_heads * rows * D) as usize, salt);
+        // Adding to the exponent scales exactly: sharper softmax, larger
+        // score magnitudes and more running-max changes between tiles.
+        q_bits.iter_mut().for_each(|b| *b += exponent_shift << 7);
+        Ok(TileCase {
+            q: MxArray::from_bfloat16(&q_bits, &[1, q_heads, rows, D])?,
+            pk: nan_tailed_prefix(base_k, prefix)?,
+            pv: nan_tailed_prefix(base_v, prefix)?,
+            nk: MxArray::from_bfloat16(
+                &deterministic_bf16((kv_heads * rows * D) as usize, salt ^ 0x5a5a),
+                &[1, kv_heads, rows, D],
+            )?,
+            nv: MxArray::from_bfloat16(
+                &deterministic_bf16((kv_heads * rows * D) as usize, salt ^ 0xa5a5),
+                &[1, kv_heads, rows, D],
+            )?,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn strict_tile_for_test(c: &TileCase) -> Result<MxArray> {
+        let handle = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_forward_tile(
+                c.q.as_raw_ptr(),
+                c.pk.as_raw_ptr(),
+                c.pv.as_raw_ptr(),
+                c.nk.as_raw_ptr(),
+                c.nv.as_raw_ptr(),
+                0.0625,
+            )
+        };
+        MxArray::from_handle(handle, "strict tile segmented SDPA test")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn strict_nax_for_test(c: &TileCase) -> Result<MxArray> {
+        let handle = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_forward_nax(
+                c.q.as_raw_ptr(),
+                c.pk.as_raw_ptr(),
+                c.pv.as_raw_ptr(),
+                c.nk.as_raw_ptr(),
+                c.nv.as_raw_ptr(),
+                0.0625,
+            )
+        };
+        MxArray::from_handle(handle, "strict tensor-op segmented SDPA test")
+    }
+
+    /// Whether this device plans the tensor-op kernel for a verify block of
+    /// `rows` over `total` keys at `q_heads` / `kv_heads`; `plan` receives
+    /// M, tile keys, threads, threadgroup bytes, partitions, pipeline max
+    /// threads.
+    #[cfg(target_os = "macos")]
+    fn nax_supported(
+        q_heads: i64,
+        kv_heads: i64,
+        rows: i64,
+        total: i64,
+        plan: &mut [u32; 6],
+    ) -> bool {
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_nax_plan(
+                q_heads as i32,
+                kv_heads as i32,
+                rows as i32,
+                total as i32,
+                plan.as_mut_ptr(),
+            )
+        };
+        supported == 1
+    }
+
+    /// BF16 spacing at `x` (subnormals share the smallest normal spacing).
+    fn bf16_ulp(x: f32) -> f32 {
+        let exponent = x.abs().max(f32::from_bits(0x0080_0000)).log2().floor();
+        2f32.powf(exponent - 7.0)
+    }
+
+    /// Max and mean |diff| in BF16 ulps of the output's magnitude (its
+    /// largest |expected|). The tile route rounds P to BF16, so its error
+    /// is absolute at that scale rather than relative per element.
+    fn tile_error(got: &[f32], expected: &[f32]) -> (f32, f64) {
+        assert_eq!(got.len(), expected.len());
+        let magnitude = expected.iter().fold(0f32, |m, e| m.max(e.abs()));
+        let ulp = bf16_ulp(magnitude);
+        let mut max_diff = 0f32;
+        let mut sum = 0f64;
+        for (&g, &e) in got.iter().zip(expected) {
+            assert!(g.is_finite(), "non-finite tile output {g}");
+            let diff = (g - e).abs();
+            max_diff = max_diff.max(diff);
+            sum += f64::from(diff);
+        }
+        (max_diff / ulp, sum / got.len() as f64 / f64::from(ulp))
+    }
+
+    /// The block routes sum in another order (fp32 MMAs, BF16 P), so they
+    /// are not bit-identical to the vector route; each must stay within 2
+    /// BF16 ulps of it over every prefix boundary and block width, with
+    /// random and large-magnitude (peaked softmax) scores, on NaN-tailed
+    /// caches and the production [B, T, H, D] layout. The tensor-op (NAX)
+    /// route is checked on the same blocks wherever this device plans it
+    /// (gen-17+, M = gqa x rows <= 64) and must refuse a Q whose heads are
+    /// not contiguous with its rows. Runs by default on Metal.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn segmented_verify_tile_matches_vector_route_within_tolerance() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            assert!(
+                !crate::test_support::metal_required(),
+                "MLX_TEST_REQUIRE_METAL=1 but no Metal device"
+            );
+            eprintln!("SKIP tile verify tolerance: no Metal device");
+            return Ok(());
+        }
+        const D: i64 = 256;
+        const HKV: i64 = 4;
+        const CAPACITY: i64 = 32_768;
+        let mut plan = [0u32; 5];
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_tile_plan(24, HKV as i32, 8, 32_776, plan.as_mut_ptr())
+        };
+        if supported != 1 {
+            // Unlike the no-Metal arm above this is a device capability, not
+            // an absent backend: a GPU without GPUFamilyApple7 cannot launch
+            // the tile kernel, so MLX_TEST_REQUIRE_METAL=1 stays satisfied.
+            eprintln!(
+                "SKIP tile verify tolerance: this device cannot launch the tile kernel ({supported})"
+            );
+            return Ok(());
+        }
+        eprintln!(
+            "tile plan 24/4 rows 8: tile_n={} threads={} tg_bytes={} partitions@32776={} \
+             pipeline_max_threads={}",
+            plan[0], plan[1], plan[2], plan[3], plan[4]
+        );
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16((HKV * CAPACITY * D) as usize, 0x1234_5678),
+            &[1, HKV, CAPACITY, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16((HKV * CAPACITY * D) as usize, 0x8765_4321),
+            &[1, HKV, CAPACITY, D],
+        )?;
+        base_k.eval();
+        base_v.eval();
+        // The segmented primitive rejects an empty prefix (the Rust caller
+        // concatenates there), so prefix 0 has no tile route to compare.
+        let prefixes = [
+            1_i64, 7, 31, 32, 33, 87, 1023, 1024, 4095, 4096, 6219, 32768,
+        ];
+        // gqa 6 tiles rows 4 and 8 (M % 8), gqa 8 every width 2..=8.
+        let layouts: [(i64, Vec<i64>); 2] = [(24, vec![4, 8]), (32, (2..=8).collect())];
+        let mut nax_plan = [0u32; 6];
+        let nax_any = nax_supported(24, HKV, 8, 32_776, &mut nax_plan);
+        if nax_any {
+            eprintln!(
+                "nax plan 24/4 rows 8: m={} tile_n={} threads={} tg_bytes={} partitions@32776={} \
+                 pipeline_max_threads={}",
+                nax_plan[0], nax_plan[1], nax_plan[2], nax_plan[3], nax_plan[4], nax_plan[5]
+            );
+        } else {
+            eprintln!("nax route unsupported on this device; checking the tile route only");
+        }
+        let mut worst = (0f32, 0f64);
+        let mut worst_nax = (0f32, 0f64);
+        let mut checked = 0usize;
+        let mut checked_nax = 0usize;
+        for (q_heads, rows_list) in &layouts {
+            for &rows in rows_list {
+                for &prefix in &prefixes {
+                    let nax_here =
+                        nax_any && nax_supported(*q_heads, HKV, rows, prefix + rows, &mut nax_plan);
+                    // Random, sharp (x8) and adversarial (x64: scores in
+                    // the tens, a few keys own the softmax).
+                    for (set, shift) in [0u16, 3, 6].into_iter().enumerate() {
+                        let salt =
+                            0x1357_9bdf ^ (prefix as u32 * 31) ^ (rows as u32) ^ (set as u32);
+                        let c = tile_case(&base_k, &base_v, *q_heads, rows, prefix, salt, shift)?;
+                        let got = strict_tile_for_test(&c)?.to_float32()?;
+                        let expected = segmented_or_concat_split_for_test(
+                            &c.q, &c.pk, &c.pv, &c.nk, &c.nv, true,
+                        )?
+                        .to_float32()?;
+                        let (max_ulps, mean_ulps) = tile_error(got.as_ref(), expected.as_ref());
+                        assert!(
+                            max_ulps <= 2.0 && mean_ulps <= 0.25,
+                            "q_heads={q_heads} rows={rows} prefix={prefix} set={set}: \
+                             max {max_ulps} / mean {mean_ulps:.4} BF16 ulps of the output magnitude"
+                        );
+                        worst.0 = worst.0.max(max_ulps);
+                        worst.1 = worst.1.max(mean_ulps);
+                        checked += 1;
+                        if nax_here {
+                            let nax = strict_nax_for_test(&c)?.to_float32()?;
+                            let (max_ulps, mean_ulps) = tile_error(nax.as_ref(), expected.as_ref());
+                            assert!(
+                                max_ulps <= 2.0 && mean_ulps <= 0.25,
+                                "nax q_heads={q_heads} rows={rows} prefix={prefix} set={set}: \
+                                 max {max_ulps} / mean {mean_ulps:.4} BF16 ulps of the output \
+                                 magnitude"
+                            );
+                            worst_nax.0 = worst_nax.0.max(max_ulps);
+                            worst_nax.1 = worst_nax.1.max(mean_ulps);
+                            checked_nax += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Production layout: [B, T, H, D] projections transposed into
+        // [B, H, T, D] views, batch 2, the prefix from a [B, P, H, D] cache.
+        for prefix in [87_i64, 4096, 32766] {
+            let q = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 32 * D) as usize, 0x90a0_b0c0),
+                &[2, 8, 32, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let nk = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 4 * D) as usize, 0xd0e0_f001),
+                &[2, 8, 4, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let nv = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 4 * D) as usize, 0x1234_abcd),
+                &[2, 8, 4, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let pk = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * prefix * 4 * D) as usize, 0x1020_3040),
+                &[2, prefix, 4, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let pv = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * prefix * 4 * D) as usize, 0x5060_7080),
+                &[2, prefix, 4, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let c = TileCase { q, pk, pv, nk, nv };
+            let got = strict_tile_for_test(&c)?.to_float32()?;
+            let expected =
+                segmented_or_concat_split_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv, true)?
+                    .to_float32()?;
+            let (max_ulps, mean_ulps) = tile_error(got.as_ref(), expected.as_ref());
+            assert!(
+                max_ulps <= 2.0 && mean_ulps <= 0.25,
+                "production layout prefix={prefix}: max {max_ulps} / mean {mean_ulps:.4} BF16 ulps"
+            );
+            worst.0 = worst.0.max(max_ulps);
+            worst.1 = worst.1.max(mean_ulps);
+            checked += 1;
+            if nax_any {
+                // A [B, T, H, D] view interleaves the heads of a row: the
+                // tensor-op route refuses it (the production entry takes the
+                // tile kernel there) ...
+                assert!(
+                    strict_nax_for_test(&c).is_err(),
+                    "prefix={prefix}: the nax route accepted a Q with interleaved heads"
+                );
+                // ... and takes the contiguous [B, H, T, D] Q that RoPE
+                // produces in the verify path, with the same K/V views.
+                let q = MxArray::from_bfloat16(
+                    &deterministic_bf16((2 * 32 * 8 * D) as usize, 0x90a0_b0c0),
+                    &[2, 32, 8, D],
+                )?;
+                let c = TileCase {
+                    q,
+                    pk: c.pk,
+                    pv: c.pv,
+                    nk: c.nk,
+                    nv: c.nv,
+                };
+                let nax = strict_nax_for_test(&c)?.to_float32()?;
+                let expected =
+                    segmented_or_concat_split_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv, true)?
+                        .to_float32()?;
+                let (max_ulps, mean_ulps) = tile_error(nax.as_ref(), expected.as_ref());
+                assert!(
+                    max_ulps <= 2.0 && mean_ulps <= 0.25,
+                    "nax production K/V layout prefix={prefix}: max {max_ulps} / mean \
+                     {mean_ulps:.4} BF16 ulps"
+                );
+                worst_nax.0 = worst_nax.0.max(max_ulps);
+                worst_nax.1 = worst_nax.1.max(mean_ulps);
+                checked_nax += 1;
+            }
+        }
+        eprintln!(
+            "tile verify: {checked} blocks within tolerance; worst max {} / mean {:.4} BF16 ulps \
+             of the output magnitude",
+            worst.0, worst.1
+        );
+        if nax_any {
+            assert!(checked_nax > 0, "nax supported but no block took it");
+            eprintln!(
+                "nax verify: {checked_nax} blocks within tolerance; worst max {} / mean {:.4} \
+                 BF16 ulps of the output magnitude",
+                worst_nax.0, worst_nax.1
+            );
+        }
+        Ok(())
+    }
+
+    /// The strict vector entry never dispatches a block kernel; the tile and
+    /// tensor-op entries each dispatch their own kernel exactly once per call
+    /// (plus MLX's reduction) and never the other's.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn segmented_verify_tile_route_is_counted() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        const D: i64 = 256;
+        let mut plan = [0u32; 5];
+        if unsafe { mlx_sys::mlx_segmented_sdpa_test_tile_plan(24, 4, 8, 1008, plan.as_mut_ptr()) }
+            != 1
+        {
+            eprintln!("SKIP tile route counters: this device cannot launch the tile kernel");
+            return Ok(());
+        }
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16((4 * 1100 * D) as usize, 1),
+            &[1, 4, 1100, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16((4 * 1100 * D) as usize, 2),
+            &[1, 4, 1100, D],
+        )?;
+        let c = tile_case(&base_k, &base_v, 24, 8, 1000, 3, 0)?;
+        let count = |family: &std::ffi::CStr| unsafe {
+            mlx_sys::mlx_test_kquant_family_count(family.as_ptr())
+        };
+        // Enabling the counters clears them.
+        unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+        let tile = strict_tile_for_test(&c).and_then(|o| o.to_float32());
+        let tile_counts = [
+            count(c"segmented_sdpa_route_tile"),
+            count(c"segmented_sdpa_verify_tile_2pass_1"),
+            count(c"segmented_sdpa_2pass_2"),
+        ];
+        let tile_nax_counts = [
+            count(c"segmented_sdpa_route_nax"),
+            count(c"segmented_sdpa_verify_nax_2pass_1"),
+        ];
+        unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+        tile?;
+        assert_eq!(tile_counts, [1, 1, 1], "tile route counters");
+        assert_eq!(tile_nax_counts, [0, 0], "tile entry touched the nax route");
+        let mut nax_plan = [0u32; 6];
+        if nax_supported(24, 4, 8, 1008, &mut nax_plan) {
+            unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+            let nax = strict_nax_for_test(&c).and_then(|o| o.to_float32());
+            let nax_counts = [
+                count(c"segmented_sdpa_route_nax"),
+                count(c"segmented_sdpa_verify_nax_2pass_1"),
+                count(c"segmented_sdpa_2pass_2"),
+                count(c"segmented_sdpa_route_tile"),
+                count(c"segmented_sdpa_verify_tile_2pass_1"),
+            ];
+            unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+            nax?;
+            assert_eq!(nax_counts, [1, 1, 1, 0, 0], "nax route counters");
+        } else {
+            eprintln!("nax route unsupported on this device; tile counters only");
+        }
+        // Its own counting window: the vector entry never reaches a block
+        // kernel.
+        let (_, route) = strict_segmented_routed(&c.q, &c.pk, &c.pv, &c.nk, &c.nv)?;
+        let after_vector = [
+            count(c"segmented_sdpa_route_tile"),
+            count(c"segmented_sdpa_verify_tile_2pass_1"),
+            count(c"segmented_sdpa_route_nax"),
+            count(c"segmented_sdpa_verify_nax_2pass_1"),
+        ];
+        assert_eq!(
+            after_vector,
+            [0, 0, 0, 0],
+            "vector entry (route {route}) touched a block route"
+        );
+        Ok(())
+    }
+
+    /// The crossover selector over synthetic timings (pure, no GPU): the
+    /// smallest count from which the block route stays at least as fast
+    /// through the largest count; one past the largest when it never is; a
+    /// win followed by a loss is not a crossover; non-positive or NaN
+    /// timings lose; the result is clamped to [256, 8192].
+    #[test]
+    fn segmented_block_min_keys_selection_follows_timings() {
+        fn select(keys: &[i32], vector: &[f64], block: &[f64]) -> i32 {
+            assert_eq!(keys.len(), vector.len());
+            assert_eq!(keys.len(), block.len());
+            unsafe {
+                mlx_sys::mlx_segmented_sdpa_test_select_block_min_keys(
+                    keys.as_ptr(),
+                    vector.as_ptr(),
+                    block.as_ptr(),
+                    keys.len(),
+                )
+            }
+        }
+        let keys = [256, 512, 1024, 2048, 4096];
+        let vector = [10.0, 12.0, 20.0, 40.0, 80.0];
+        // Equal at 1024, block ahead above: 2048 (a tie keeps the exact
+        // vector route; the block route must win by kSegmentedBlockMinGain).
+        assert_eq!(
+            select(&keys, &vector, &[13.0, 14.0, 20.0, 30.0, 60.0]),
+            2048
+        );
+        // Ahead at 1024 by less than the required gain: still 2048.
+        assert_eq!(
+            select(&keys, &vector, &[13.0, 14.0, 19.5, 30.0, 60.0]),
+            2048
+        );
+        // Block ahead by the gain everywhere: the floor.
+        assert_eq!(select(&keys, &vector, &[9.0, 11.0, 19.0, 30.0, 60.0]), 256);
+        // Never ahead: one past the largest count.
+        assert_eq!(
+            select(&keys, &vector, &[11.0, 13.0, 21.0, 41.0, 81.0]),
+            4097
+        );
+        // Ahead at 512, behind at 1024: 2048 (a win followed by a loss).
+        assert_eq!(
+            select(&keys, &vector, &[11.0, 11.0, 21.0, 30.0, 60.0]),
+            2048
+        );
+        // A NaN or zero block sample is a loss at that point.
+        assert_eq!(
+            select(&keys, &vector, &[9.0, 11.0, f64::NAN, 30.0, 60.0]),
+            2048
+        );
+        assert_eq!(select(&keys, &vector, &[9.0, 11.0, 19.0, 30.0, 0.0]), 4097);
+        // So is a zero vector sample.
+        assert_eq!(
+            select(
+                &keys,
+                &[10.0, 12.0, 20.0, 0.0, 80.0],
+                &[9.0, 11.0, 19.0, 30.0, 60.0]
+            ),
+            4096
+        );
+        // Clamp below the floor and above the ceiling.
+        assert_eq!(select(&[64, 128], &[1.0, 2.0], &[0.5, 1.0]), 256);
+        assert_eq!(select(&[8192, 16384], &[1.0, 2.0], &[2.0, 3.0]), 8192);
+        assert_eq!(select(&[16384], &[1.0], &[0.5]), 8192);
+        assert_eq!(select(&[], &[], &[]), 8192);
+        assert_eq!(
+            unsafe {
+                mlx_sys::mlx_segmented_sdpa_test_select_block_min_keys(
+                    std::ptr::null(),
+                    vector.as_ptr(),
+                    vector.as_ptr(),
+                    keys.len(),
+                )
+            },
+            -1
+        );
+    }
+
+    /// This process calibrates the block-kernel crossover once on a
+    /// production-shaped verify block; the result lies in the clamp range
+    /// and the production entry switches exactly there: a rows-8 block over
+    /// `min_keys - 1` keys takes a vector route, over `min_keys` keys a block
+    /// kernel. Runs by default on Metal.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn segmented_block_crossover_is_calibrated_and_routes() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        const D: i64 = 256;
+        let mut keys = [0i32; 8];
+        let mut vector_s = [0f64; 8];
+        let mut block_s = [0f64; 8];
+        let (mut elapsed_ms, mut kernel, mut result) = (0f64, 0i32, 0i32);
+        let points = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_block_calibration(
+                keys.as_mut_ptr(),
+                vector_s.as_mut_ptr(),
+                block_s.as_mut_ptr(),
+                keys.len(),
+                &mut elapsed_ms,
+                &mut kernel,
+                &mut result,
+            )
+        };
+        assert!(points >= 0, "calibration query failed");
+        let kernel_name = ["none", "tile", "nax"][kernel as usize];
+        eprintln!(
+            "block crossover: {result} keys ({kernel_name}), calibrated in {elapsed_ms:.3} ms"
+        );
+        for i in 0..points as usize {
+            eprintln!(
+                "  {:>5} keys: vector {:>8.2} us, block {:>8.2} us",
+                keys[i],
+                vector_s[i] * 1e6,
+                block_s[i] * 1e6
+            );
+        }
+        assert!(
+            (256..=8192).contains(&result),
+            "calibrated crossover {result} outside the clamp range"
+        );
+        assert!(
+            points == 0 || elapsed_ms < 100.0,
+            "calibration took {elapsed_ms:.3} ms"
+        );
+        let min_keys = i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_test_block_min_keys() });
+        assert_eq!(
+            min_keys,
+            i64::from(result),
+            "effective crossover is the calibrated one"
+        );
+        let mut plan = [0u32; 5];
+        if unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_tile_plan(24, 4, 8, min_keys as i32, plan.as_mut_ptr())
+        } != 1
+        {
+            eprintln!("SKIP route switch: this device cannot launch a block kernel");
+            return Ok(());
+        }
+        assert!(points > 0, "a device with a block kernel must calibrate");
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16((4 * min_keys * D) as usize, 0x7a7a),
+            &[1, 4, min_keys, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16((4 * min_keys * D) as usize, 0x7b7b),
+            &[1, 4, min_keys, D],
+        )?;
+        let count = |family: &std::ffi::CStr| unsafe {
+            mlx_sys::mlx_test_kquant_family_count(family.as_ptr())
+        };
+        for (prefix, expect_block) in [(min_keys - 9, false), (min_keys - 8, true)] {
+            let c = tile_case(&base_k, &base_v, 24, 8, prefix, 11, 0)?;
+            unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+            let out = segmented_verify_sdpa(&c.q, &c.pk, &c.pv, &c.nk, &c.nv, 0.0625, true)
+                .and_then(|o| o.to_float32());
+            let block = count(c"segmented_sdpa_route_tile") + count(c"segmented_sdpa_route_nax");
+            let vector = count(c"segmented_sdpa_route_single")
+                + count(c"segmented_sdpa_route_one_pass")
+                + count(c"segmented_sdpa_route_unified")
+                + count(c"segmented_sdpa_route_split");
+            unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+            out?;
+            assert_eq!(
+                (block, vector),
+                (u64::from(expect_block), u64::from(!expect_block)),
+                "routes at {} keys (crossover {min_keys})",
+                prefix + 8
+            );
+        }
+        Ok(())
+    }
+
     /// MLX's vector-SDPA reduction policy per device class
     /// (`mlx_segmented_sdpa_plan.h`), used to predict the verify route
     /// independently of the C++ planner: (two-pass, partitions).
@@ -2992,7 +3952,14 @@ mod tests {
     }
 
     /// The route is chosen from the real prefix at eval time, so one shapeless
-    /// trace must stay exact while replays cross every route boundary.
+    /// trace must stay exact while replays cross every route boundary. The
+    /// production entry takes a block kernel (tensor-op where NAX exists,
+    /// else the simdgroup tile) from the key count this process calibrated
+    /// (`mlx_segmented_sdpa_test_block_min_keys`; rows 8 here; rows 6 and 7
+    /// are not multiples of 8 queries): the replay must equal the eager
+    /// production call bit for bit on either side, and the vector chunks bit
+    /// for bit on the vector routes or within the tile tolerance on a block
+    /// route.
     #[test]
     #[ignore = "requires coordinated Metal GPU validation"]
     #[cfg(target_os = "macos")]
@@ -3005,7 +3972,20 @@ mod tests {
         const HQ: i64 = 24;
         const HKV: i64 = 4;
         let max_q = i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(6) });
-        let prefixes: Vec<i64> = (1010..=1030)
+        // Calibrates before any counting window opens below.
+        let block_min_keys =
+            i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_test_block_min_keys() });
+        assert!(block_min_keys >= 0, "block crossover query failed");
+        // Rows-8 prefixes straddling the crossover (totals min_keys - 10 ..=
+        // min_keys + 10), then the vector policy's own 8192 / 32768 steps.
+        let crossover_prefixes: Vec<i64> = if block_min_keys > 0 {
+            ((block_min_keys - 8 - 10).max(1)..=block_min_keys - 8 + 10).collect()
+        } else {
+            (1010..=1030).collect()
+        };
+        let prefixes: Vec<i64> = crossover_prefixes
+            .iter()
+            .copied()
             .chain(8180..=8195)
             .chain(32755..=32770)
             .collect();
@@ -3045,28 +4025,55 @@ mod tests {
                 )?])
             };
             let mut seen = [0usize; 4];
+            let mut seen_tile = 0usize;
             for &prefix in &prefixes {
                 let pk = nan_tailed_prefix(&base_k, prefix)?;
                 let pv = nan_tailed_prefix(&base_v, prefix)?;
+                // Enabling the counters clears them; the replay evaluates on
+                // this thread.
+                unsafe { mlx_sys::mlx_test_kquant_counting(true) };
                 let compiled =
-                    invoke_compiled_graph(fn_id, &[&q, &pk, &pv, &nk, &nv], 1, true, &mut builder)?
-                        .ok_or_else(|| Error::from_reason("compiled invoke failed"))?;
-                let compiled = compiled[0].to_float32()?;
-                let eager = strict_segmented_for_test(&q, &pk, &pv, &nk, &nv)?.to_float32()?;
+                    invoke_compiled_graph(fn_id, &[&q, &pk, &pv, &nk, &nv], 1, true, &mut builder)
+                        .and_then(|out| {
+                            out.ok_or_else(|| Error::from_reason("compiled invoke failed"))
+                        })
+                        .and_then(|out| out[0].to_float32());
+                // Either block kernel (tile or tensor-op) is held to the
+                // tile tolerance.
+                let tile_route = unsafe {
+                    mlx_sys::mlx_test_kquant_family_count(c"segmented_sdpa_route_tile".as_ptr())
+                        + mlx_sys::mlx_test_kquant_family_count(
+                            c"segmented_sdpa_route_nax".as_ptr(),
+                        )
+                } > 0;
+                unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+                let compiled = compiled?;
+                let eager =
+                    segmented_verify_sdpa(&q, &pk, &pv, &nk, &nv, 0.0625, true)?.to_float32()?;
                 let chunks = segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, true)?
                     .to_float32()?;
                 let (route, _) = device_verify_route(HQ, HKV, rows, prefix);
-                seen[route.max(0) as usize] += 1;
                 assert_eq!(
                     compiled.as_ref(),
                     eager.as_ref(),
-                    "rows={rows}, prefix={prefix}, route={route}"
+                    "compiled vs eager: rows={rows}, prefix={prefix}, tile={tile_route}"
                 );
-                assert_eq!(
-                    compiled.as_ref(),
-                    chunks.as_ref(),
-                    "rows={rows}, prefix={prefix}, route={route}"
-                );
+                if tile_route {
+                    seen_tile += 1;
+                    let (max_ulps, mean_ulps) = tile_error(compiled.as_ref(), chunks.as_ref());
+                    assert!(
+                        max_ulps <= 2.0 && mean_ulps <= 0.25,
+                        "rows={rows}, prefix={prefix}: tile replay max {max_ulps} / mean \
+                         {mean_ulps:.4} ulps"
+                    );
+                } else {
+                    seen[route.max(0) as usize] += 1;
+                    assert_eq!(
+                        compiled.as_ref(),
+                        chunks.as_ref(),
+                        "rows={rows}, prefix={prefix}, route={route}"
+                    );
+                }
             }
             assert_eq!(
                 builds.get(),
@@ -3074,9 +4081,27 @@ mod tests {
                 "rows={rows}: the prefix must stay out of the trace key"
             );
             eprintln!(
-                "rows={rows} replay routes one_pass={} unified={} split={}",
+                "rows={rows} replay routes one_pass={} unified={} split={} tile={seen_tile}",
                 seen[1], seen[2], seen[3]
             );
+            let mut plan = [0u32; 5];
+            let tile_supported = unsafe {
+                mlx_sys::mlx_segmented_sdpa_test_tile_plan(
+                    HQ as i32,
+                    HKV as i32,
+                    rows as i32,
+                    2048,
+                    plan.as_mut_ptr(),
+                )
+            } == 1;
+            if tile_supported && block_min_keys > 0 {
+                // The crossover prefixes straddle `block_min_keys`.
+                assert!(seen_tile > 0, "rows={rows}: no replay took the tile route");
+                assert!(
+                    seen[1] + seen[2] + seen[3] > 0,
+                    "rows={rows}: no replay took a vector route"
+                );
+            }
         }
         Ok(())
     }
@@ -3101,7 +4126,31 @@ mod tests {
         const D: i64 = 256;
         const SETS: usize = 4;
         const SAMPLES: usize = 24;
-        for prefix in [87_i64, 6219, 32768] {
+        // Split chunks, the one-call vector route, the simdgroup-matrix tile
+        // route and the tensor-op (NAX) route (each block route skipped where
+        // this device cannot launch it).
+        const ROUTES: [&str; 4] = ["split", "one_call", "tile", "nax"];
+        let mut plan = [0u32; 5];
+        let tile_supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_tile_plan(24, 4, 8, 32_776, plan.as_mut_ptr())
+        } == 1;
+        if tile_supported {
+            eprintln!("tile pipeline maxTotalThreadsPerThreadgroup={}", plan[4]);
+        } else {
+            eprintln!("tile route unsupported on this device; timing the vector routes only");
+        }
+        let mut nax_plan = [0u32; 6];
+        let nax_supported_here = tile_supported && nax_supported(24, 4, 8, 32_776, &mut nax_plan);
+        if nax_supported_here {
+            eprintln!(
+                "nax pipeline m={} tile_n={} maxTotalThreadsPerThreadgroup={}",
+                nax_plan[0], nax_plan[1], nax_plan[5]
+            );
+        } else {
+            eprintln!("nax route unsupported on this device");
+        }
+        let routes = 2 + usize::from(tile_supported) + usize::from(nax_supported_here);
+        for prefix in [87_i64, 1024, 6219, 16384, 32768] {
             let mut cases = Vec::with_capacity(SETS);
             for i in 0..SETS {
                 let salt = 0x1234_5678u32.wrapping_add(i as u32 * 29);
@@ -3125,53 +4174,80 @@ mod tests {
                     &deterministic_bf16((4 * 8 * D) as usize, salt ^ 0x78),
                     &[1, 4, 8, D],
                 )?;
-                cases.push((q, pk, pv, nk, nv));
+                cases.push(TileCase { q, pk, pv, nk, nv });
             }
-            let run = |i: usize, one_call: bool| -> Result<MxArray> {
-                let (q, pk, pv, nk, nv) = &cases[i % SETS];
-                let out = if one_call {
-                    strict_segmented_for_test(q, pk, pv, nk, nv)?
-                } else {
-                    segmented_or_concat_split_for_test(q, pk, pv, nk, nv, true)?
+            let run = |i: usize, route: usize| -> Result<MxArray> {
+                let c = &cases[i % SETS];
+                let out = match route {
+                    0 => {
+                        segmented_or_concat_split_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv, true)?
+                    }
+                    1 => strict_segmented_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv)?,
+                    2 => strict_tile_for_test(c)?,
+                    _ => strict_nax_for_test(c)?,
                 };
                 MxArray::eval_arrays(&[&out])?;
                 Ok(out)
             };
             for i in 0..SETS * 2 {
-                let before = run(i, false)?.to_float32()?;
-                let after = run(i, true)?.to_float32()?;
+                let before = run(i, 0)?.to_float32()?;
+                let after = run(i, 1)?.to_float32()?;
                 assert_eq!(before.as_ref(), after.as_ref(), "prefix={prefix}, set={i}");
+                for (route, route_name) in ROUTES.iter().enumerate().take(routes).skip(2) {
+                    let block = run(i, route)?.to_float32()?;
+                    let (max_ulps, mean_ulps) = tile_error(block.as_ref(), before.as_ref());
+                    assert!(
+                        max_ulps <= 2.0 && mean_ulps <= 0.25,
+                        "prefix={prefix}, set={i}: {} max {max_ulps} / mean {mean_ulps:.4} ulps",
+                        route_name
+                    );
+                }
             }
-            let mut split_ms = Vec::with_capacity(SAMPLES);
-            let mut one_call_ms = Vec::with_capacity(SAMPLES);
+            let mut ms = vec![Vec::with_capacity(SAMPLES); routes];
+            let mut tile_plan = [0u32; 5];
+            if tile_supported {
+                unsafe {
+                    mlx_sys::mlx_segmented_sdpa_test_tile_plan(
+                        24,
+                        4,
+                        8,
+                        (prefix + 8) as i32,
+                        tile_plan.as_mut_ptr(),
+                    )
+                };
+            }
+            if nax_supported_here {
+                nax_supported(24, 4, 8, prefix + 8, &mut nax_plan);
+            }
             for i in 0..SAMPLES {
-                // Alternate order so the candidate is not always the second
-                // reader of a just-warmed prefix. Rotate four independent KV sets.
-                for one_call in if i % 2 == 0 {
-                    [false, true]
-                } else {
-                    [true, false]
-                } {
+                // Rotate the order so no route is always the second reader of
+                // a just-warmed prefix. Rotate four independent KV sets.
+                for k in 0..routes {
+                    let route = (k + i) % routes;
                     let started = Instant::now();
-                    let out = run(i, one_call)?;
-                    let ms = started.elapsed().as_secs_f64() * 1e3;
-                    if one_call {
-                        one_call_ms.push(ms);
-                    } else {
-                        split_ms.push(ms);
-                    }
+                    let out = run(i, route)?;
+                    ms[route].push(started.elapsed().as_secs_f64() * 1e3);
                     drop(out);
                 }
             }
-            split_ms.sort_by(f64::total_cmp);
-            one_call_ms.sort_by(f64::total_cmp);
-            eprintln!(
-                "segmented prefix={prefix} q=8 hq=24 hkv=4 sets={SETS} samples={SAMPLES} split_min_ms={:.4} split_median_ms={:.4} one_call_min_ms={:.4} one_call_median_ms={:.4}",
-                split_ms[0],
-                split_ms[SAMPLES / 2],
-                one_call_ms[0],
-                one_call_ms[SAMPLES / 2]
-            );
+            let mut line =
+                format!("segmented prefix={prefix} q=8 hq=24 hkv=4 sets={SETS} samples={SAMPLES}");
+            for (route, samples) in ms.iter_mut().enumerate() {
+                samples.sort_by(f64::total_cmp);
+                line += &format!(
+                    " {0}_min_ms={1:.4} {0}_median_ms={2:.4}",
+                    ROUTES[route],
+                    samples[0],
+                    samples[SAMPLES / 2]
+                );
+            }
+            if tile_supported {
+                line += &format!(" tile_partitions={}", tile_plan[3]);
+            }
+            if nax_supported_here {
+                line += &format!(" nax_partitions={}", nax_plan[4]);
+            }
+            eprintln!("{line}");
         }
         Ok(())
     }
@@ -3727,9 +4803,10 @@ mod tests {
         Ok(())
     }
 
-    fn tiny_cfg() -> Qwen3_5Config {
+    pub(super) fn tiny_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: 32,
             num_layers: 1,
@@ -4216,6 +5293,87 @@ mod tests {
             native_gate.to_uint16_native()?,
             "block-order Q4_K gates must be bit-identical to native per-head splitting"
         );
+        Ok(())
+    }
+
+    /// Gate for `fused_qk_norm_rope`: the one-dispatch kernel must equal
+    /// `fast::rms_norm` -> transpose -> `fast::rope(offsets)` bit-for-bit on
+    /// random BF16 data, over block rows 1..=8, several position offsets,
+    /// the Qwen3.8 head counts (24 q / 4 kv) and a smaller pair, with the
+    /// strided `[B, T, H, D]` views the verify path hands it (q is a split of
+    /// the q/gate projection, k a split of the merged k/v projection).
+    #[test]
+    fn fused_qk_norm_rope_eq() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let d = 256i64;
+        let rot = 64;
+        for (hq, hk) in [(24i64, 4i64), (4, 2)] {
+            let mut cfg = tiny_cfg();
+            cfg.head_dim = d as i32;
+            cfg.num_heads = hq as i32;
+            cfg.num_kv_heads = hk as i32;
+            cfg.partial_rotary_factor = rot as f64 / d as f64;
+            cfg.rope_theta = 10_000_000.0;
+            let mut attn = Qwen3_5Attention::new(&cfg)?;
+            assert_eq!(attn.rope.dims, rot);
+            let wq = MxArray::random_normal(&[d], 1.0, 0.25, Some(DType::BFloat16))?;
+            let wk = MxArray::random_normal(&[d], 1.0, 0.25, Some(DType::BFloat16))?;
+            attn.q_norm.set_weight(&wq)?;
+            attn.k_norm.set_weight(&wk)?;
+            for t in 1..=8i64 {
+                for offset in [0i32, 1, 7, 4096, 32_480] {
+                    let offsets = MxArray::from_int32(&[offset], &[1])?;
+                    // Strided views: q = first half of a [B, T, 2*hq*d] row,
+                    // k = first hk*d of a [B, T, 2*hk*d] row.
+                    let qg = MxArray::random_normal(
+                        &[1, t, 2 * hq * d],
+                        0.0,
+                        2.0,
+                        Some(DType::BFloat16),
+                    )?;
+                    let q = qg.split_sections(&[hq * d], 2)?[0].reshape(&[1, t, hq, d])?;
+                    let kv = MxArray::random_normal(
+                        &[1, t, 2 * hk * d],
+                        0.0,
+                        2.0,
+                        Some(DType::BFloat16),
+                    )?;
+                    let k = kv.split_sections(&[hk * d], 2)?[0].reshape(&[1, t, hk, d])?;
+
+                    let (fq, fk) = attn
+                        .fused_qk_norm_rope(&q, &k, &offsets)
+                        .expect("fused qk norm+rope must take this contract");
+                    let rq = attn.rope.forward_with_offsets(
+                        &attn.q_norm.forward(&q)?.transpose(Some(&[0, 2, 1, 3]))?,
+                        &offsets,
+                    )?;
+                    let rk = attn.rope.forward_with_offsets(
+                        &attn.k_norm.forward(&k)?.transpose(Some(&[0, 2, 1, 3]))?,
+                        &offsets,
+                    )?;
+                    for (name, fused, reference) in [("q", &fq, &rq), ("k", &fk, &rk)] {
+                        assert_eq!(fused.dtype()?, DType::BFloat16);
+                        assert_eq!(fused.shape()?.as_ref(), reference.shape()?.as_ref());
+                        let a = fused.astype(DType::Float32)?.to_float32()?;
+                        let b = reference.astype(DType::Float32)?.to_float32()?;
+                        let mismatches = a
+                            .as_ref()
+                            .iter()
+                            .zip(b.as_ref().iter())
+                            .filter(|(x, y)| x.to_bits() != y.to_bits())
+                            .count();
+                        assert_eq!(
+                            mismatches,
+                            0,
+                            "{name}: hq={hq} hk={hk} t={t} offset={offset}: {mismatches} of {} elements differ",
+                            a.len()
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

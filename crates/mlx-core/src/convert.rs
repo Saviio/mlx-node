@@ -368,9 +368,16 @@ pub(crate) mod recipe {
             | PerLayerMode::Q4K
             | PerLayerMode::Q5K
             | PerLayerMode::Q3K
+            | PerLayerMode::Q2K
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S => {
+            | PerLayerMode::IQ3S
+            | PerLayerMode::IQ2XXS
+            | PerLayerMode::IQ2XS
+            | PerLayerMode::IQ2S
+            | PerLayerMode::IQ3XXS
+            | PerLayerMode::IQ1S
+            | PerLayerMode::IQ1M => {
                 return Err(Error::from_reason(format!(
                     "Qwen vision source mode {mode:?} is not a uniform packed mode supported by the dense vision sanitizer; dequantize the vision tower before conversion"
                 )));
@@ -3511,6 +3518,21 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         return Err(Error::from_reason(
             "This checkpoint declares a prism_hadamard rotation contract; the standard converter is not rotation-aware and cannot rewrite its packed weights. Load the original GGUF instead.",
         ));
+    }
+
+    // A converted directory whose K-quant linears are stored in the 64-row
+    // tiled layout (`"layout": "t64"`, written by the GGUF importer) cannot be
+    // re-converted here: this converter treats a packed group as opaque bytes
+    // it copies through and re-emits per-layer overrides from its own recipe
+    // ladder, which knows nothing about the marker — the bytes would be
+    // written tiled and described row-major. Refuse before any tensor I/O;
+    // the GGUF source is the thing to re-convert.
+    if let Some(key) = crate::models::quant_dispatch::config_declares_tiled_kquant_layout(&config) {
+        return Err(Error::from_reason(format!(
+            "This checkpoint stores '{key}' (and possibly others) in the 64-row tiled K-quant \
+             layout (quantization entry layout=t64); the SafeTensors converter cannot re-read \
+             tiled packed bytes. Re-run `mlx convert` on the original GGUF instead."
+        )));
     }
 
     // A caller may omit `model_type` and rely on generic dtype conversion.
@@ -7502,16 +7524,7 @@ fn validate_existing_quantized_entry(
         // including the interleave factor of 2 the q4k/q5k `(sc, m)` / `(d, dmin)`
         // pairs carry, so the generic affine shape check below cannot describe
         // them — this arm validates in full and returns.
-        "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs" | "iq3s" => {
-            let format = match entry.mode.as_str() {
-                "q3k" => KQuantFormat::Q3K,
-                "q4k" => KQuantFormat::Q4K,
-                "q5k" => KQuantFormat::Q5K,
-                "q6k" => KQuantFormat::Q6K,
-                "iq4nl" => KQuantFormat::IQ4NL,
-                "iq4xs" => KQuantFormat::IQ4XS,
-                _ => KQuantFormat::IQ3S,
-            };
+        mode if let Some(format) = KQuantFormat::from_mlx_mode(mode) => {
             validate_existing_kquant_entry(weight, scales, weights, prefix, entry, format)?;
             return Ok(());
         }
@@ -12071,6 +12084,76 @@ mod tests {
             !base.exists(),
             "validation must not create converter output"
         );
+    }
+
+    /// A converted directory whose config marks a K-quant linear as stored in
+    /// the 64-row tiled layout (`layout: "t64"`) is refused from the config
+    /// alone, before any tensor file is opened or output created: this
+    /// converter copies packed groups through as opaque bytes and would
+    /// re-describe the tiled bytes as row-major.
+    #[tokio::test]
+    async fn tiled_kquant_artifact_is_refused_before_converter_io() {
+        let base = std::env::temp_dir().join(format!(
+            "mlx-tiled-kquant-reconvert-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let input = base.join("input");
+        fs::create_dir_all(&input).unwrap();
+        // config.json only — no model.safetensors — so reaching the tensor
+        // loader would fail differently.
+        fs::write(
+            input.join("config.json"),
+            serde_json::json!({
+                "model_type": "qwen3_5",
+                "quantization": {
+                    "bits": 4, "group_size": 32, "mode": "q4k",
+                    "language_model.model.layers.0.mlp.down_proj": {
+                        "bits": 4, "group_size": 32, "mode": "q4k", "layout": "t64"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for quantize in [false, true] {
+            let result = convert_model(ConversionOptions {
+                input_dir: input.to_string_lossy().to_string(),
+                output_dir: base.join("output").to_string_lossy().to_string(),
+                dtype: Some("bfloat16".to_string()),
+                verbose: Some(false),
+                model_type: None,
+                quantize: Some(quantize),
+                quant_bits: None,
+                quant_group_size: None,
+                quant_mode: Some("affine".to_string()),
+                quant_recipe: None,
+                imatrix_path: None,
+                quant_mxfp: None,
+                quant_mtp: None,
+            })
+            .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("a t64 artifact must be refused (quantize={quantize})"),
+            };
+            assert!(
+                error.reason.contains("layout=t64")
+                    && error
+                        .reason
+                        .contains("language_model.model.layers.0.mlp.down_proj"),
+                "{}",
+                error.reason
+            );
+            assert!(
+                !base.join("output").exists(),
+                "the refusal must not create converter output"
+            );
+        }
+        fs::remove_dir_all(&base).ok();
     }
 
     /// Exercise the public conversion entrypoint, not only its pure capability

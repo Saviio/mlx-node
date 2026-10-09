@@ -1,5 +1,14 @@
-//! K-quant parity gate: MLX's CPU Q4_K / Q5_K / Q6_K decode against ggml's own
-//! decoders.
+//! K-quant parity gate: MLX's CPU Q2_K / Q4_K / Q5_K / Q6_K decode against
+//! ggml's own decoders, plus the Q5_0 (affine) and MXFP4 (`mxfp4`) imports
+//! and the seven grid formats (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S /
+//! IQ1_S / IQ1_M, see `grid_...`), which are repacked losslessly and decoded
+//! bitwise.
+//!
+//! Q2_K shares Q4_K's two-level `(sc, m)` decode at 16-value groups and is
+//! compared strictly bitwise like it. Q5_0 is the symmetric affine import at
+//! 5 bits: its control is MLX's float16 affine arithmetic, not ggml's float32
+//! (see `q5_0_...`). MXFP4 lands on MLX's native `mxfp4` mode and is bitwise
+//! except for the two documented E8M0 corner codes (see `mxfp4_...`).
 //!
 //! Nothing here is a checked-in golden blob. Every vector is synthesised at test
 //! time from a fixed-seed LCG (no `time()`, no `rand()`, no wall clock), decoded
@@ -46,8 +55,10 @@ use std::ffi::CString;
 use std::path::PathBuf;
 
 use mlx_core::array::MxArray;
+use mlx_core::utils::gguf::{derived_symmetric_bias_bits, mxfp4_repack_block, q5_0_repack_block};
 use mlx_core::utils::gguf_kquant::{
-    KQuantArrays, KQuantFormat, KQuantScales, QK_K, get_scale_min_k4, q4k_code, q5k_code, q6k_code,
+    KQuantArrays, KQuantFormat, KQuantScales, QK_K, get_scale_min_k4, iq1m_d_bits,
+    iq1m_unit_scales, iq3s_unit_scale, q2k_code, q2k_scale_min, q4k_code, q5k_code, q6k_code,
     repack_kquant,
 };
 
@@ -62,6 +73,28 @@ unsafe extern "C" {
     fn dequantize_row_q5_K(x: *const u8, y: *mut f32, k: i64);
     /// `ggml-quants.c:1939`
     fn dequantize_row_q6_K(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:961`
+    fn dequantize_row_q2_K(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:500`
+    fn dequantize_row_q5_0(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:569`
+    fn dequantize_row_mxfp4(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2488`
+    fn dequantize_row_iq2_xxs(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2516`
+    fn dequantize_row_iq2_xs(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2543`
+    fn dequantize_row_iq2_s(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2575`
+    fn dequantize_row_iq3_xxs(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2607`
+    fn dequantize_row_iq3_s(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2650`
+    fn dequantize_row_iq1_s(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2675`
+    fn dequantize_row_iq1_m(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-impl.h:477`
+    fn ggml_ref_e8m0_to_fp32_half(x: u8) -> f32;
     /// `ggml-quants.c:880`
     fn ggml_ref_get_scale_min_k4(j: i32, q: *const u8, d: *mut u8, m: *mut u8);
 }
@@ -87,6 +120,7 @@ fn ggml_decode_row(format: KQuantFormat, row_blocks: &[u8], k: usize) -> Vec<f32
             KQuantFormat::Q4K => dequantize_row_q4_K(x, y, k as i64),
             KQuantFormat::Q5K => dequantize_row_q5_K(x, y, k as i64),
             KQuantFormat::Q6K => dequantize_row_q6_K(x, y, k as i64),
+            KQuantFormat::Q2K => dequantize_row_q2_K(x, y, k as i64),
             _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
         }
     }
@@ -174,6 +208,16 @@ fn q45k_set_nibble(blk: &mut [u8], qs_offset: usize, v: usize, code: u32) {
 
 fn q4k_set_code(blk: &mut [u8], v: usize, code: u32) {
     q45k_set_nibble(blk, 16, v, code);
+}
+
+/// Inverse of `q2k_code`: the 2-bit field at shift `2 * ((v % 128) / 32)` of
+/// byte `16 + 32 * (v / 128) + v % 32`.
+fn q2k_set_code(blk: &mut [u8], v: usize, code: u32) {
+    let half = v / 128;
+    let in_half = v % 128;
+    let shift = 2 * (in_half / 32);
+    let idx = 16 + half * 32 + in_half % 32;
+    blk[idx] = (blk[idx] & !(0x03u8 << shift)) | (((code & 0x03) as u8) << shift);
 }
 
 fn q5k_set_code(blk: &mut [u8], v: usize, code: u32) {
@@ -353,6 +397,33 @@ fn profile_q6k_subscales(p: Profile, rng: &mut Lcg, block_seq: usize, sc: &mut [
     }
 }
 
+/// q2k sub-scales are UNSIGNED 4-bit nibbles, `[0, 15]`, for both `sc` and
+/// `m`: 16 pairs per super-block, one scale byte each.
+fn profile_q2k_subscales(p: Profile, rng: &mut Lcg, block_seq: usize, pairs: &mut [(u8, u8); 16]) {
+    const EXTREMES: [u8; 8] = [0, 1, 2, 7, 8, 13, 14, 15];
+    for (j, slot) in pairs.iter_mut().enumerate() {
+        *slot = match p {
+            Profile::Zero => (0, 0),
+            Profile::SubscaleExtreme | Profile::SubscaleNeg => {
+                (EXTREMES[j % 8], EXTREMES[(j + 4) % 8])
+            }
+            // 16 pairs per block: every nibble value, for both, each block.
+            Profile::SubscaleSweep => (
+                ((block_seq + j) % 16) as u8,
+                ((block_seq + j + 8) % 16) as u8,
+            ),
+            Profile::Alternating => {
+                if j & 1 == 1 {
+                    (15, 0)
+                } else {
+                    (0, 15)
+                }
+            }
+            _ => (rng.below(16) as u8, rng.below(16) as u8),
+        };
+    }
+}
+
 /// q4k/q5k sub-scales are UNSIGNED 6-bit, `[0, 63]`, for both `sc` and `m`.
 fn profile_q45k_subscales(
     p: Profile,
@@ -448,6 +519,34 @@ fn gen_block(format: KQuantFormat, blk: &mut [u8], p: Profile, rng: &mut Lcg, bl
             for j in 0..8 {
                 let (sc, m) = ggml_get_scale_min_k4(j, &blk[sc_off..sc_off + 12]);
                 assert_eq!((sc, m), (ls[j], lm[j]), "scale packer disagrees at j={j}");
+            }
+        }
+        KQuantFormat::Q2K => {
+            // block_q2_K: 16 scale bytes (sc low nibble, m high), 64 code
+            // bytes, then d and dmin at 80 and 82.
+            blk[80..82].copy_from_slice(&d.to_le_bytes());
+            blk[82..84].copy_from_slice(&dmin.to_le_bytes());
+            let mut pairs = [(0u8, 0u8); 16];
+            profile_q2k_subscales(p, rng, block_seq, &mut pairs);
+            for (j, &(sc, m)) in pairs.iter().enumerate() {
+                blk[j] = (sc & 0x0f) | (m << 4);
+            }
+            for (v, &code) in codes.iter().enumerate() {
+                q2k_set_code(blk, v, code);
+            }
+            for (v, &code) in codes.iter().enumerate() {
+                assert_eq!(
+                    q2k_code(blk, v),
+                    code,
+                    "q2k writer/reader disagree at v={v}"
+                );
+            }
+            for (j, &pair) in pairs.iter().enumerate() {
+                assert_eq!(
+                    q2k_scale_min(blk, j),
+                    pair,
+                    "q2k scale byte disagrees at j={j}"
+                );
             }
         }
         _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
@@ -863,6 +962,36 @@ fn run_format(format: KQuantFormat) -> FormatRun {
                             *cov.subscales.entry(want as u8).or_default() += 1;
                         }
                     }
+                    KQuantFormat::Q2K => {
+                        let want_d = u16::from_le_bytes([blk[80], blk[81]]);
+                        let want_dmin = u16::from_le_bytes([blk[82], blk[83]]);
+                        assert_eq!(
+                            (b[2 * sb], b[2 * sb + 1]),
+                            (want_d, want_dmin),
+                            "{} {}: .biases lost (d, dmin)",
+                            format.mlx_mode(),
+                            spec.name
+                        );
+                        note_super_scale(&mut cov, want_d);
+                        let KQuantScales::Unsigned(all) = &arrays.scales else {
+                            panic!("q2k must produce unsigned scales");
+                        };
+                        let s = &all[row * scales_row..(row + 1) * scales_row];
+                        for (j, &byte) in blk[..16].iter().enumerate() {
+                            // dequantize_row_q2_K: dl = d * (sc & 0xF), ml = min * (sc >> 4)
+                            let (want_sc, want_m) = (byte & 0x0f, byte >> 4);
+                            let g = sb * 16 + j;
+                            assert_eq!(
+                                (s[2 * g], s[2 * g + 1]),
+                                (want_sc, want_m),
+                                "{} {}: .scales lost (sc, m) at j={j}",
+                                format.mlx_mode(),
+                                spec.name
+                            );
+                            *cov.subscales.entry(want_sc).or_default() += 1;
+                            *cov.submins.entry(want_m).or_default() += 1;
+                        }
+                    }
                     KQuantFormat::Q4K | KQuantFormat::Q5K => {
                         let want_d = u16::from_le_bytes([blk[0], blk[1]]);
                         let want_dmin = u16::from_le_bytes([blk[2], blk[3]]);
@@ -911,6 +1040,7 @@ fn run_format(format: KQuantFormat) -> FormatRun {
                     KQuantFormat::Q6K => q6k_code(blk, v % QK_K),
                     KQuantFormat::Q4K => q4k_code(blk, v % QK_K),
                     KQuantFormat::Q5K => q5k_code(blk, v % QK_K),
+                    KQuantFormat::Q2K => q2k_code(blk, v % QK_K),
                     _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
                 };
                 let got_code = extract_code(w, v, bits);
@@ -948,6 +1078,7 @@ fn run_format(format: KQuantFormat) -> FormatRun {
                     KQuantFormat::Q6K => q6k_code(blk, v % QK_K),
                     KQuantFormat::Q4K => q4k_code(blk, v % QK_K),
                     KQuantFormat::Q5K => q5k_code(blk, v % QK_K),
+                    KQuantFormat::Q2K => q2k_code(blk, v % QK_K),
                     _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
                 };
                 // Q6_K's folded bias turns ggml's -0.0 into +0.0 and nothing
@@ -1049,6 +1180,20 @@ fn assert_coverage(format: KQuantFormat, cov: &Coverage) {
                  its hard half was never exercised"
             );
         }
+        KQuantFormat::Q2K => {
+            for raw in 0..16u8 {
+                assert!(
+                    cov.subscales.contains_key(&raw),
+                    "{}: sub-scale nibble {raw} never generated",
+                    format.mlx_mode()
+                );
+                assert!(
+                    cov.submins.contains_key(&raw),
+                    "{}: sub-min nibble {raw} never generated",
+                    format.mlx_mode()
+                );
+            }
+        }
         _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
     }
     assert!(cov.d_subnormal > 0, "no binary16-subnormal super-scale");
@@ -1064,12 +1209,12 @@ fn assert_coverage(format: KQuantFormat, cov: &Coverage) {
         cov.super_blocks_per_row.keys().any(|&n| n > 1),
         "no case with more than one super-block per row"
     );
-    // 4-bit codes cannot cross a uint32 word: 4 divides 32. 5- and 6-bit codes
-    // do, which is why the packer needs a bit cursor at all.
-    if bits == 4 {
+    // 2- and 4-bit codes cannot cross a uint32 word: both divide 32. 5- and
+    // 6-bit codes do, which is why the packer needs a bit cursor at all.
+    if bits == 4 || bits == 2 {
         assert_eq!(
             cov.straddling_codes, 0,
-            "a 4-bit code straddled a uint32 word, which is arithmetically impossible"
+            "a {bits}-bit code straddled a uint32 word, which is arithmetically impossible"
         );
     } else {
         assert!(
@@ -1127,6 +1272,22 @@ fn q4k_matches_ggml_bitwise() {
     assert_eq!(
         run.signed_zero_only, 0,
         "q4k has no bias reassociation, so it has no signed-zero exemption"
+    );
+}
+
+/// Q2_K: ggml computes `dl * q - ml` with `dl = d * (sc & 0xF)` and
+/// `ml = dmin * (sc >> 4)`; the contract computes `scale * q + bias` with the
+/// same `scale` and `bias = -ml`, and `x - y == x + (-y)` bit for bit in
+/// IEEE-754, so like Q4_K there is no exemption at all.
+#[test]
+fn q2k_matches_ggml_bitwise() {
+    let run = run_format(KQuantFormat::Q2K);
+    report(KQuantFormat::Q2K, &run);
+    assert_coverage(KQuantFormat::Q2K, &run.coverage);
+    assert_no_mismatches(KQuantFormat::Q2K, &run);
+    assert_eq!(
+        run.signed_zero_only, 0,
+        "q2k has no bias reassociation, so it has no signed-zero exemption"
     );
 }
 
@@ -1476,15 +1637,750 @@ fn rust_get_scale_min_k4_matches_ggml_exhaustively() {
 }
 
 // ---------------------------------------------------------------------------
+// Q5_0 — the symmetric affine import at 5 bits
+// ---------------------------------------------------------------------------
+
+/// Drive MLX's affine decode over repacked blocks; `biases` is the
+/// load-time reconstruction `-16 * scale` (`derived_symmetric_bias_bits`).
+fn mlx_affine_decode_f16(
+    weight: &[u32],
+    scales: &[u16],
+    biases: &[u16],
+    rows: usize,
+    k: usize,
+    bits: i32,
+) -> Vec<f32> {
+    let rows_i = rows as i64;
+    let w = MxArray::from_uint32(weight, &[rows_i, (k * bits as usize / 32) as i64]).expect("w");
+    let s = MxArray::from_float16(scales, &[rows_i, (k / 32) as i64]).expect("scales");
+    let b = MxArray::from_float16(biases, &[rows_i, (k / 32) as i64]).expect("biases");
+    let mode = CString::new("affine").expect("mode");
+    // SAFETY: the three handles outlive the call; out_dtype 0 is float32 (the
+    // affine decode itself runs in the scales' float16, see the test below).
+    let handle = unsafe {
+        mlx_sys::mlx_dequantize(
+            w.as_raw_ptr(),
+            s.as_raw_ptr(),
+            b.as_raw_ptr(),
+            32,
+            bits,
+            0,
+            mode.as_ptr(),
+        )
+    };
+    assert!(
+        !handle.is_null(),
+        "mlx_dequantize rejected the affine group"
+    );
+    // SAFETY: non-null handle from mlx_dequantize.
+    let len = unsafe { mlx_sys::mlx_array_size(handle) };
+    assert_eq!(len, rows * k);
+    let out = read_f32_exact(handle, len);
+    // SAFETY: the handle is owned here and not referenced afterwards.
+    unsafe { mlx_sys::mlx_array_delete(handle) };
+    out
+}
+
+fn f16(x: f32) -> f32 {
+    half::f16::from_f32(x).to_f32()
+}
+
+/// Q5_0 blocks: `d * (q - 16)` with `q` the low nibble of `qs[j]` plus bit `j`
+/// of `qh` for value `j`, the high nibble plus bit `j + 16` for value
+/// `j + 16`. Three things are asserted:
+///
+/// 1. the repack is LOSSLESS — every 5-bit code read back out of the LSB-first
+///    stream equals ggml's `(qs & 0xF) | xh`, and `.scales` is `d` verbatim;
+/// 2. MLX's affine decode equals its own float16 arithmetic exactly —
+///    `f16(f16(q * d) + f16(-16 * d))` — the same model the Q4_0 / Q8_0
+///    imports follow (symmetric_bias_parity.rs). It is NOT ggml's float32
+///    `(q - 16) * d` rounded once: a uint32 code times float16 scales runs in
+///    float16 (`promote_types(uint32, float16) == float16`), so the product
+///    and the sum each round. That is the affine control of
+///    kquant_realdata_llamacpp_parity.rs, stated as a formula;
+/// 3. the decode stays within the three half-ulps that model can lose
+///    (the product `q * d`, the bias `-16 * d` and the sum each round once
+///    in float16) of ggml's value everywhere, and is bit-identical to
+///    ggml-rounded-to-f16 on most values (reported).
+#[test]
+fn q5_0_repack_is_lossless_and_decodes_in_f16_affine() {
+    pin_cpu_stream();
+    const ROWS: usize = 8;
+    const K: usize = 1024;
+    const NB: usize = ROWS * K / 32;
+    let mut rng = Lcg(0x5EED_0500);
+    let mut buf = BlockBuf::zeroed(NB * 22);
+    for b in 0..NB {
+        let blk = &mut buf.bytes_mut()[b * 22..(b + 1) * 22];
+        // d: realistic, subnormal, tiny, max, negative, zero, in rotation.
+        let d = match b % 6 {
+            0 | 1 => random_finite_half(&mut rng, 7, 13),
+            2 => (1 + rng.below(1023)) as u16,
+            3 => 0x0400,
+            4 => random_finite_half(&mut rng, 7, 13) | 0x8000,
+            // 2048: the largest power of two with 31 * d still finite in f16.
+            // (ggml's (q - 16) * d stays finite for d up to 4094, but MLX's
+            // float16 affine forms q * d first; a larger d overflows there and
+            // is a real, known divergence of the affine import, not of Q5_0.)
+            _ => {
+                if b % 12 == 5 {
+                    0
+                } else {
+                    0x6800
+                }
+            }
+        };
+        blk[0..2].copy_from_slice(&d.to_le_bytes());
+        for byte in &mut blk[2..22] {
+            *byte = rng.next() as u8;
+        }
+    }
+
+    let mut weight = vec![0u32; ROWS * K * 5 / 32];
+    let mut scales = vec![0u16; NB];
+    let mut codes_seen = BTreeMap::<u32, u64>::new();
+    for b in 0..NB {
+        let blk = &buf.bytes()[b * 22..(b + 1) * 22];
+        let mut words = [0u32; 5];
+        scales[b] = q5_0_repack_block(blk, &mut words);
+        weight[b * 5..(b + 1) * 5].copy_from_slice(&words);
+        assert_eq!(
+            scales[b],
+            u16::from_le_bytes([blk[0], blk[1]]),
+            "block {b}: .scales lost d"
+        );
+        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+        let row_words = &weight[(b / (K / 32)) * (K * 5 / 32)..];
+        for j in 0..16 {
+            // dequantize_row_q5_0's xh_0 / xh_1
+            let xh_0 = ((qh >> j) << 4) & 0x10;
+            let xh_1 = (qh >> (j + 12)) & 0x10;
+            let want0 = u32::from(blk[6 + j] & 0x0F) | xh_0;
+            let want1 = u32::from(blk[6 + j] >> 4) | xh_1;
+            let v0 = (b % (K / 32)) * 32 + j;
+            assert_eq!(extract_code(row_words, v0, 5), want0, "block {b} value {j}");
+            assert_eq!(
+                extract_code(row_words, v0 + 16, 5),
+                want1,
+                "block {b} value {}",
+                j + 16
+            );
+            *codes_seen.entry(want0).or_default() += 1;
+            *codes_seen.entry(want1).or_default() += 1;
+        }
+    }
+    assert_eq!(codes_seen.len(), 32, "every 5-bit code must appear");
+
+    let mut reference = vec![0f32; ROWS * K];
+    for row in 0..ROWS {
+        // SAFETY: `BlockBuf` is 8-byte aligned and holds K/32 whole blocks per row.
+        unsafe {
+            dequantize_row_q5_0(
+                buf.bytes()[row * (K / 32) * 22..].as_ptr(),
+                reference[row * K..].as_mut_ptr(),
+                K as i64,
+            )
+        };
+    }
+    let biases: Vec<u16> = scales
+        .iter()
+        .map(|&d| derived_symmetric_bias_bits(d, 16))
+        .collect();
+    let ours = mlx_affine_decode_f16(&weight, &scales, &biases, ROWS, K, 5);
+
+    let mut f16_exact = 0u64;
+    let mut hard = Vec::new();
+    for (i, (&mine, &theirs)) in ours.iter().zip(&reference).enumerate() {
+        let b = i / 32;
+        let d = half::f16::from_bits(scales[b]).to_f32();
+        let q = extract_code(&weight[(i / K) * (K * 5 / 32)..], i % K, 5) as f32;
+        // 2. MLX's float16 affine arithmetic, exactly.
+        let model = f16(f16(q * d) + half::f16::from_bits(biases[b]).to_f32());
+        assert_eq!(
+            mine.to_bits(),
+            model.to_bits(),
+            "value {i}: MLX affine decode {mine:?} is not f16(f16(q*d) + f16(-16d)) = {model:?} \
+             (q={q}, d={d:?})"
+        );
+        // 3. against ggml's float32: bit-identical after rounding, else 1 ulp.
+        if mine.to_bits() == f16(theirs).to_bits() || (mine == 0.0 && theirs == 0.0) {
+            f16_exact += 1;
+            continue;
+        }
+        // The error budget of the float16 model: half an ulp at each of the
+        // three roundings (the product's ulp is the largest, q * d being up
+        // to 31 * |d| while the result is at most 16 * |d|).
+        let f16_ulp = |x: f32| -> f32 {
+            let t = half::f16::from_f32(x.abs());
+            let up = half::f16::from_bits(t.to_bits() + 1).to_f32();
+            up - t.to_f32()
+        };
+        let bound = 0.5 * (f16_ulp(q * d) + f16_ulp(16.0 * d) + f16_ulp(theirs));
+        if !mine.is_finite() || !theirs.is_finite() || (mine - theirs).abs() > bound {
+            hard.push(format!(
+                "value {i}: ggml {theirs:?} (0x{:08x}) vs mlx {mine:?} (0x{:08x}), q={q}, d={d:?}",
+                theirs.to_bits(),
+                mine.to_bits()
+            ));
+        }
+    }
+    println!(
+        "q5_0: {} values, {} equal ggml rounded to f16, {} within the f16 double-rounding budget",
+        ours.len(),
+        f16_exact,
+        ours.len() as u64 - f16_exact
+    );
+    assert!(
+        hard.is_empty(),
+        "q5_0 decode off ggml by more than the f16 double-rounding budget:\n{}",
+        hard.join("\n")
+    );
+    // Most values round the same way under both forms (75% on this fixture);
+    // the remainder is the documented double rounding, bounded above.
+    assert!(
+        f16_exact * 2 > ours.len() as u64,
+        "q5_0: the f16 affine model should agree with ggml rounded to f16 on a majority of values"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 — MLX's native `mxfp4` mode
+// ---------------------------------------------------------------------------
+
+/// MXFP4 blocks: `e` an E8M0 shared exponent, `qs[j]` the E2M1 codes of value
+/// `j` (low nibble) and `j + 16` (high nibble). The repack un-interleaves
+/// the nibbles into MLX's LSB-first 4-bit stream and copies `e` into the uint8
+/// `.scales`; MLX decodes `FP4_LUT[q] * 2^(e - 127)` and ggml
+/// `kvalues_mxfp4[q] * ggml_e8m0_to_fp32_half(e)` with the doubled table and
+/// the halved exponent, so the two are the same product for every `e >= 2`
+/// and compared bitwise there.
+///
+/// Two documented exemptions, both asserted in their exact shape:
+///
+/// * `e < 2`: ggml's `ggml_e8m0_to_fp32_half` decodes e = 0 and 1 to the
+///   subnormals 2^-128 and 2^-127 (half of the E8M0 value, paired with the
+///   doubled `kvalues_mxfp4`), while MLX's `fp8_e8m0` (fp8.h,
+///   `dequantize_scale`) decodes them to 2^-127 and 2^-126 against the plain
+///   E2M1 table. The doubling cancels the halving, so the products agree
+///   there too on the current MLX (the run reports how many e < 2 values
+///   were bit-identical), but the two decoders define the corner
+///   independently: MLX treats e = 0 as the smallest normal exponent rather
+///   than as half of e = 1, and a change on either side would show up only
+///   here. Real weights never use e < 2 (a block whose largest magnitude is
+///   ~2^-127), so the gate does not require bit-identity below e = 2; it
+///   accepts identity or exactly MLX = 2 x ggml and reports the split.
+/// * code 8 is `-0.0` in MLX's table and `0` (an int8) in ggml's, so a zero
+///   element reads `-0.0` from MLX and `+0.0` from ggml; both sides are
+///   asserted zero.
+#[test]
+fn mxfp4_repack_is_lossless_and_decodes_bitwise_above_e8m0_two() {
+    pin_cpu_stream();
+    const ROWS: usize = 8;
+    const K: usize = 1024;
+    const NB: usize = ROWS * K / 32;
+    let mut rng = Lcg(0x5EED_0039);
+    let mut buf = BlockBuf::zeroed(NB * 17);
+    for b in 0..NB {
+        let blk = &mut buf.bytes_mut()[b * 17..(b + 1) * 17];
+        // Every E8M0 code but NaN (0xFF): 0..=254 in rotation, so the two
+        // exempt codes and the extremes are all exercised.
+        blk[0] = (b % 255) as u8;
+        for byte in &mut blk[1..17] {
+            *byte = rng.next() as u8;
+        }
+    }
+
+    let mut weight = vec![0u32; ROWS * K * 4 / 32];
+    let mut scales = vec![0u8; NB];
+    let mut codes_seen = BTreeMap::<u32, u64>::new();
+    for b in 0..NB {
+        let blk = &buf.bytes()[b * 17..(b + 1) * 17];
+        let mut words = [0u32; 4];
+        scales[b] = mxfp4_repack_block(blk, &mut words);
+        weight[b * 4..(b + 1) * 4].copy_from_slice(&words);
+        assert_eq!(scales[b], blk[0], "block {b}: .scales lost e");
+        let row_words = &weight[(b / (K / 32)) * (K * 4 / 32)..];
+        for j in 0..16 {
+            let v0 = (b % (K / 32)) * 32 + j;
+            let want0 = u32::from(blk[1 + j] & 0x0F);
+            let want1 = u32::from(blk[1 + j] >> 4);
+            assert_eq!(extract_code(row_words, v0, 4), want0, "block {b} value {j}");
+            assert_eq!(
+                extract_code(row_words, v0 + 16, 4),
+                want1,
+                "block {b} value {}",
+                j + 16
+            );
+            *codes_seen.entry(want0).or_default() += 1;
+            *codes_seen.entry(want1).or_default() += 1;
+        }
+    }
+    assert_eq!(codes_seen.len(), 16, "every E2M1 code must appear");
+
+    let mut reference = vec![0f32; ROWS * K];
+    for row in 0..ROWS {
+        // SAFETY: `BlockBuf` is 8-byte aligned and holds K/32 whole blocks per row.
+        unsafe {
+            dequantize_row_mxfp4(
+                buf.bytes()[row * (K / 32) * 17..].as_ptr(),
+                reference[row * K..].as_mut_ptr(),
+                K as i64,
+            )
+        };
+    }
+
+    let rows_i = ROWS as i64;
+    let w = MxArray::from_uint32(&weight, &[rows_i, (K / 8) as i64]).expect("w");
+    let s = MxArray::from_uint8(&scales, &[rows_i, (K / 32) as i64]).expect("scales");
+    let mode = CString::new("mxfp4").expect("mode");
+    // SAFETY: both handles outlive the call; mxfp4 takes no biases; out float32.
+    let handle = unsafe {
+        mlx_sys::mlx_dequantize(
+            w.as_raw_ptr(),
+            s.as_raw_ptr(),
+            std::ptr::null_mut(),
+            32,
+            4,
+            0,
+            mode.as_ptr(),
+        )
+    };
+    assert!(!handle.is_null(), "mlx_dequantize rejected the mxfp4 group");
+    // SAFETY: non-null handle from mlx_dequantize.
+    let len = unsafe { mlx_sys::mlx_array_size(handle) };
+    assert_eq!(len, ROWS * K);
+    let ours = read_f32_exact(handle, len);
+    // SAFETY: the handle is owned here and not referenced afterwards.
+    unsafe { mlx_sys::mlx_array_delete(handle) };
+
+    // The exemption's premise, pinned on the vendored ggml decoder itself.
+    // SAFETY: pure function.
+    unsafe {
+        assert_eq!(
+            ggml_ref_e8m0_to_fp32_half(0).to_bits(),
+            0x0020_0000,
+            "ggml e=0 is 2^-128"
+        );
+        assert_eq!(
+            ggml_ref_e8m0_to_fp32_half(1).to_bits(),
+            0x0040_0000,
+            "ggml e=1 is 2^-127"
+        );
+        assert_eq!(
+            ggml_ref_e8m0_to_fp32_half(2).to_bits(),
+            0x0080_0000,
+            "ggml e=2 is 2^-126"
+        );
+    }
+
+    let mut exact = 0u64;
+    let mut low_e_exact = 0u64;
+    let mut low_e_doubled = 0u64;
+    let mut zero_sign = 0u64;
+    let mut hard = Vec::new();
+    for (i, (&mine, &theirs)) in ours.iter().zip(&reference).enumerate() {
+        let e = scales[i / 32];
+        if mine.to_bits() == theirs.to_bits() {
+            exact += 1;
+            if e < 2 {
+                low_e_exact += 1;
+            }
+            continue;
+        }
+        if mine == 0.0 && theirs == 0.0 {
+            zero_sign += 1;
+            continue;
+        }
+        if e < 2 && mine.to_bits() == (theirs * 2.0).to_bits() {
+            low_e_doubled += 1;
+            continue;
+        }
+        if hard.len() < 16 {
+            hard.push(format!(
+                "value {i}: e={e} ggml {theirs:?} (0x{:08x}) vs mlx {mine:?} (0x{:08x})",
+                theirs.to_bits(),
+                mine.to_bits()
+            ));
+        }
+    }
+    println!(
+        "mxfp4: {} values, {exact} bit-identical, {zero_sign} signed-zero (code 8); e < 2: \
+         {low_e_exact} bit-identical, {low_e_doubled} MLX = 2x ggml",
+        ours.len()
+    );
+    assert!(
+        hard.is_empty(),
+        "mxfp4 decode disagrees with ggml:\n{}",
+        hard.join("\n")
+    );
+    assert!(
+        low_e_exact + low_e_doubled > 0,
+        "the e < 2 corner was never exercised"
+    );
+    assert!(
+        zero_sign > 0,
+        "the code-8 signed-zero exemption was never exercised"
+    );
+    assert!(
+        exact * 10 > ours.len() as u64 * 9,
+        "fewer than 90% of mxfp4 values bit-identical"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The grid formats — IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ1_S /
+// IQ1_M
+// ---------------------------------------------------------------------------
+//
+// `.weight` keeps the native grid-index words, `.scales` the unit's other
+// native bytes and `.biases` the f16 d (gguf_kquant.rs), so the repack is a
+// byte permutation: the lossless check reads every ggml field back out of
+// the three arrays (IQ3_S's scale nibble is read back out of its own byte).
+// The decode (kquant_grid.h, shared by the CPU reference and the Metal
+// kernels) computes `d * (1 + 2 sc) * 2^shift` where ggml computes
+// `d * (0.5 + sc) * 0.25` (IQ2), `* 0.5` (IQ3_XXS), `d * (1 + 2 sc)` as
+// written (IQ3_S) or `d * (2 sc + 1) * (g +- 1/8)` (IQ1): the same products
+// up to an exact power-of-two scaling, so every value is compared strictly
+// bitwise.
+//
+// Every byte of a block but d is random (every index, sign and scale field
+// is valid), and d walks the finite halves plus the degenerate corners
+// (zero, subnormal, smallest normal, largest, negative); IQ1_M's d is
+// written into the nibbles of its scale words as ggml stores it.
+
+/// d for block `b` of a grid run: the corners first, then random finite halves.
+fn grid_super_scale(rng: &mut Lcg, b: usize) -> u16 {
+    match b % 64 {
+        0 => 0x0000, // +0
+        1 => 0x8000, // -0
+        2 => 0x0001, // smallest subnormal
+        3 => 0x03FF, // largest subnormal
+        4 => 0x0400, // smallest normal, 2^-14
+        5 => 0x7BFF, // largest finite, 65504
+        6 => 0xFBFF, // -65504
+        7 => 0xBC00, // -1
+        _ => random_finite_half(rng, 1, 30),
+    }
+}
+
+fn ggml_grid_decode(format: KQuantFormat, rows: &[u8], k: usize, nrows: usize) -> Vec<f32> {
+    let mut out = vec![0f32; nrows * k];
+    let row_bytes = format.row_bytes(k);
+    for r in 0..nrows {
+        // SAFETY: `rows` is a BlockBuf (8-byte aligned) of whole rows; `out`
+        // holds k floats per row.
+        unsafe {
+            let x = rows[r * row_bytes..].as_ptr();
+            let y = out[r * k..].as_mut_ptr();
+            match format {
+                KQuantFormat::IQ2XXS => dequantize_row_iq2_xxs(x, y, k as i64),
+                KQuantFormat::IQ2XS => dequantize_row_iq2_xs(x, y, k as i64),
+                KQuantFormat::IQ2S => dequantize_row_iq2_s(x, y, k as i64),
+                KQuantFormat::IQ3XXS => dequantize_row_iq3_xxs(x, y, k as i64),
+                KQuantFormat::IQ3S => dequantize_row_iq3_s(x, y, k as i64),
+                KQuantFormat::IQ1S => dequantize_row_iq1_s(x, y, k as i64),
+                KQuantFormat::IQ1M => dequantize_row_iq1_m(x, y, k as i64),
+                other => panic!("{other:?} is not a grid format"),
+            }
+        }
+    }
+    out
+}
+
+/// What the lossless check expects per unit `ib` of a block: the `.weight`
+/// words and the `.scales` bytes, straight from the ggml fields.
+fn grid_unit_fields(format: KQuantFormat, blk: &[u8], ib: usize) -> (Vec<u32>, Vec<u8>) {
+    let w32 = |at: usize| u32::from_le_bytes([blk[at], blk[at + 1], blk[at + 2], blk[at + 3]]);
+    match format {
+        KQuantFormat::IQ2XXS => (vec![w32(2 + 8 * ib)], blk[6 + 8 * ib..10 + 8 * ib].to_vec()),
+        KQuantFormat::IQ2XS => (vec![w32(2 + 8 * ib), w32(6 + 8 * ib)], vec![blk[66 + ib]]),
+        KQuantFormat::IQ2S => (
+            vec![w32(2 + 4 * ib), w32(34 + 4 * ib)],
+            vec![blk[66 + ib], blk[74 + ib]],
+        ),
+        KQuantFormat::IQ3XXS => (
+            vec![w32(2 + 8 * ib), w32(6 + 8 * ib)],
+            blk[66 + 4 * ib..70 + 4 * ib].to_vec(),
+        ),
+        // qs (8 bytes), signs (4 bytes); qh byte, scale nibble (ib & 1) of
+        // scales[ib / 2] in its own byte.
+        KQuantFormat::IQ3S => (
+            vec![w32(2 + 8 * ib), w32(6 + 8 * ib), w32(74 + 4 * ib)],
+            vec![blk[66 + ib], (blk[106 + ib / 2] >> (4 * (ib % 2))) & 0xF],
+        ),
+        KQuantFormat::IQ1S => (
+            vec![w32(2 + 4 * ib)],
+            blk[34 + 2 * ib..36 + 2 * ib].to_vec(),
+        ),
+        KQuantFormat::IQ1M => {
+            let sc = |i: usize| u16::from_le_bytes([blk[48 + 2 * i], blk[49 + 2 * i]]);
+            let unit = ((sc(ib / 2) >> (6 * (ib % 2))) & 0x3f) as u8;
+            (
+                vec![w32(4 * ib)],
+                vec![blk[32 + 2 * ib], blk[33 + 2 * ib], unit],
+            )
+        }
+        other => panic!("{other:?} is not a grid format"),
+    }
+}
+
+struct GridRun {
+    values: usize,
+    mismatches: Vec<String>,
+    /// Per 8-value chunk: the 8-bit sign pattern and the scale field seen.
+    signs_seen: BTreeMap<u8, u64>,
+    scales_seen: BTreeMap<u8, u64>,
+    /// IQ1: both delta signs.
+    deltas_seen: [u64; 2],
+    nonzero: u64,
+}
+
+fn grid_run(format: KQuantFormat) -> GridRun {
+    pin_cpu_stream();
+    const ROWS: usize = 6;
+    const K: usize = 2048;
+    let nb = ROWS * K / QK_K;
+    let bb = format.block_bytes();
+    let mut rng = Lcg(0x9A1D_0000 ^ u64::from(format.gguf_type()));
+    let mut buf = BlockBuf::zeroed(nb * bb);
+    for b in 0..nb {
+        let blk = &mut buf.bytes_mut()[b * bb..(b + 1) * bb];
+        for byte in blk.iter_mut() {
+            *byte = rng.next() as u8;
+        }
+        let d = grid_super_scale(&mut rng, b);
+        if format == KQuantFormat::IQ1M {
+            // d lives in the top nibble of each of the four scale halfwords.
+            for i in 0..4 {
+                let at = 48 + 2 * i;
+                let sc = u16::from_le_bytes([blk[at], blk[at + 1]]) & 0x0FFF;
+                let sc = sc | (((d >> (4 * i)) & 0xF) << 12);
+                blk[at..at + 2].copy_from_slice(&sc.to_le_bytes());
+            }
+        } else {
+            blk[0..2].copy_from_slice(&d.to_le_bytes());
+        }
+    }
+
+    // Repack with the production repacker and read every field back.
+    let arrays = repack_kquant(format, buf.bytes(), ROWS, K).expect("repack");
+    let KQuantScales::Unsigned(scales) = &arrays.scales else {
+        panic!("{format:?}: grid companions must be unsigned bytes");
+    };
+    let wcols = format.weight_cols(K);
+    let scols = format.scales_cols(K);
+    let bcols = format.biases_cols(K);
+    assert_eq!(arrays.weight.len(), ROWS * wcols);
+    assert_eq!(scales.len(), ROWS * scols);
+    assert_eq!(arrays.biases.len(), ROWS * bcols);
+    let sbpg = format.scale_bytes_per_group();
+    let per_sb = K / QK_K;
+    let mut signs_seen = BTreeMap::new();
+    let mut scales_seen = BTreeMap::new();
+    let mut deltas_seen = [0u64; 2];
+    for b in 0..nb {
+        let (row, sb) = (b / per_sb, b % per_sb);
+        let blk = &buf.bytes()[b * bb..(b + 1) * bb];
+        let want_d = if format == KQuantFormat::IQ1M {
+            iq1m_d_bits(blk)
+        } else {
+            u16::from_le_bytes([blk[0], blk[1]])
+        };
+        assert_eq!(
+            arrays.biases[row * bcols + sb],
+            want_d,
+            "block {b}: .biases lost d"
+        );
+        for ib in 0..8 {
+            let (ww, ss) = grid_unit_fields(format, blk, ib);
+            let g = sb * 8 + ib;
+            let w_at = row * wcols + g * format.bits();
+            assert_eq!(
+                &arrays.weight[w_at..w_at + format.bits()],
+                &ww[..],
+                "{format:?} block {b} unit {ib}: .weight words"
+            );
+            let s_at = row * scols + g * sbpg;
+            assert_eq!(
+                &scales[s_at..s_at + sbpg],
+                &ss[..],
+                "{format:?} block {b} unit {ib}: .scales bytes"
+            );
+            if format == KQuantFormat::IQ1M {
+                assert_eq!(iq1m_unit_scales(blk, ib), ss[2]);
+            }
+            if format == KQuantFormat::IQ3S {
+                assert_eq!(iq3s_unit_scale(blk, ib), ss[1]);
+            }
+            // Coverage: the sign byte / 7-bit index and the scale field of
+            // every chunk, as ggml reads them.
+            for c in 0..4 {
+                let (sign, scale, delta) = match format {
+                    KQuantFormat::IQ2XXS | KQuantFormat::IQ3XXS => {
+                        let sw = u32::from_le_bytes([ss[0], ss[1], ss[2], ss[3]]);
+                        (((sw >> (7 * c)) & 127) as u8, (sw >> 28) as u8, None)
+                    }
+                    KQuantFormat::IQ2XS => {
+                        let e = (ww[c / 2] >> (16 * (c % 2))) & 0xFFFF;
+                        ((e >> 9) as u8, (ss[0] >> (4 * (c / 2))) & 0xF, None)
+                    }
+                    KQuantFormat::IQ2S => (
+                        ((ww[1] >> (8 * c)) & 0xFF) as u8,
+                        (ss[1] >> (4 * (c / 2))) & 0xF,
+                        None,
+                    ),
+                    KQuantFormat::IQ3S => (((ww[2] >> (8 * c)) & 0xFF) as u8, ss[1], None),
+                    KQuantFormat::IQ1S => {
+                        let qh = u16::from_le_bytes([ss[0], ss[1]]);
+                        (0, ((qh >> 12) & 7) as u8, Some((qh >> 15) & 1))
+                    }
+                    _ => {
+                        let qh = u16::from_le_bytes([ss[0], ss[1]]);
+                        (
+                            0,
+                            (ss[2] >> (3 * (c / 2))) & 7,
+                            Some((qh >> (4 * c + 3)) & 1),
+                        )
+                    }
+                };
+                *signs_seen.entry(sign).or_default() += 1;
+                *scales_seen.entry(scale).or_default() += 1;
+                if let Some(dl) = delta {
+                    deltas_seen[dl as usize] += 1;
+                }
+            }
+        }
+    }
+
+    let reference = ggml_grid_decode(format, buf.bytes(), K, ROWS);
+    let ours = mlx_decode(format, &arrays, ROWS, K);
+    assert_eq!(ours.len(), reference.len());
+    let mut mismatches = Vec::new();
+    let mut nonzero = 0u64;
+    for (i, (&mine, &theirs)) in ours.iter().zip(&reference).enumerate() {
+        if theirs != 0.0 {
+            nonzero += 1;
+        }
+        if mine.to_bits() != theirs.to_bits() && mismatches.len() < 16 {
+            mismatches.push(format!(
+                "value {i} (row {}, k {}): ggml {theirs:?} (0x{:08x}) vs mlx {mine:?} (0x{:08x})",
+                i / K,
+                i % K,
+                theirs.to_bits(),
+                mine.to_bits()
+            ));
+        }
+    }
+    GridRun {
+        values: ours.len(),
+        mismatches,
+        signs_seen,
+        scales_seen,
+        deltas_seen,
+        nonzero,
+    }
+}
+
+fn assert_grid(format: KQuantFormat, sign_space: usize, scale_space: usize, deltas: bool) {
+    let run = grid_run(format);
+    println!(
+        "{}: {} values, {} nonzero, {} sign patterns, {} scale values, deltas {:?}",
+        format.mlx_mode(),
+        run.values,
+        run.nonzero,
+        run.signs_seen.len(),
+        run.scales_seen.len(),
+        run.deltas_seen
+    );
+    assert!(
+        run.mismatches.is_empty(),
+        "{} decode disagrees with ggml:\n{}",
+        format.mlx_mode(),
+        run.mismatches.join("\n")
+    );
+    assert!(
+        run.nonzero * 10 > run.values as u64 * 8,
+        "{format:?}: mostly zero"
+    );
+    assert_eq!(
+        run.signs_seen.len(),
+        sign_space,
+        "{format:?}: every sign pattern must appear"
+    );
+    assert_eq!(
+        run.scales_seen.len(),
+        scale_space,
+        "{format:?}: every scale field value must appear"
+    );
+    if deltas {
+        assert!(
+            run.deltas_seen.iter().all(|&n| n > 0),
+            "{format:?}: both delta signs must appear"
+        );
+    }
+}
+
+#[test]
+fn iq2xxs_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ2XXS, 128, 16, false);
+}
+
+#[test]
+fn iq2xs_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ2XS, 128, 16, false);
+}
+
+#[test]
+fn iq2s_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ2S, 256, 16, false);
+}
+
+#[test]
+fn iq3xxs_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ3XXS, 128, 16, false);
+}
+
+/// IQ3_S: one sign bit per element (all 256 chunk patterns), 16 scale values
+/// and both 9th index bits (every byte of qh is random), decoded through the
+/// packed `iq3s` contract — three words and two companion bytes per unit.
+#[test]
+fn iq3s_repack_is_lossless_and_decodes_bitwise() {
+    assert_eq!(KQuantFormat::IQ3S.bits(), 3);
+    assert_eq!(KQuantFormat::IQ3S.scale_bytes_per_group(), 2);
+    assert!(KQuantFormat::IQ3S.is_grid());
+    assert_grid(KQuantFormat::IQ3S, 256, 16, false);
+}
+
+#[test]
+fn iq1s_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ1S, 1, 8, true);
+}
+
+#[test]
+fn iq1m_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ1M, 1, 8, true);
+}
+
+// ---------------------------------------------------------------------------
 // Provenance guard — the in-tree port of the scratchpad's check_verbatim.py
 // ---------------------------------------------------------------------------
 
-/// The four ggml spans the vendored reference must reproduce verbatim.
-const SPANS: [(&str, usize, usize); 4] = [
+/// The fourteen ggml spans the vendored reference must reproduce verbatim.
+const SPANS: [(&str, usize, usize); 14] = [
     ("get_scale_min_k4", 880, 887),
     ("dequantize_row_q4_K", 1529, 1551),
     ("dequantize_row_q5_K", 1731, 1756),
     ("dequantize_row_q6_K", 1939, 1968),
+    ("dequantize_row_q5_0", 500, 524),
+    ("dequantize_row_mxfp4", 569, 587),
+    ("dequantize_row_q2_K", 961, 991),
+    ("dequantize_row_iq2_xxs", 2488, 2512),
+    ("dequantize_row_iq2_xs", 2516, 2539),
+    ("dequantize_row_iq2_s", 2543, 2571),
+    ("dequantize_row_iq3_xxs", 2575, 2603),
+    ("dequantize_row_iq3_s", 2607, 2646),
+    ("dequantize_row_iq1_s", 2650, 2673),
+    ("dequantize_row_iq1_m", 2675, 2723),
 ];
 
 /// The three sanctioned edits, applied to both sides so only real drift shows.

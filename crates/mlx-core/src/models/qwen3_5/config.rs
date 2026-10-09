@@ -229,6 +229,16 @@ pub struct Qwen3_5Config {
     #[serde(default)]
     #[napi(ts_type = "string | undefined")]
     pub qwen35_gguf_gdn_layout: Option<String>,
+
+    /// Element format of the flat full-attention K/V cache: `"int8"`
+    /// (per-(token, head) symmetric int8 rows with one fp32 scale each —
+    /// half the K/V memory and read bandwidth; see `crate::array::kv_int8`)
+    /// or `"bf16"`. Unset: int8 where the int8 kernels serve the geometry
+    /// (Metal, head 256), else BF16 — see `kv_format()`. Set from the
+    /// `kvFormat` load option; the paged cache ignores it.
+    #[serde(default)]
+    #[napi(ts_type = "string | undefined")]
+    pub kv_format: Option<String>,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -257,8 +267,9 @@ fn default_rope_theta() -> f64 {
 }
 
 impl Qwen3_5Config {
-    /// BF16 bytes for one request's complete GDN conv + recurrent state.
-    /// Full-attention K/V is accounted separately by the paged allocator.
+    /// Bytes for one request's complete GDN state: bf16 conv history plus the
+    /// f32-carried recurrent state. Full-attention K/V is accounted separately
+    /// by the paged allocator.
     pub(crate) fn recurrent_state_bytes(&self) -> u64 {
         let linear_layers = (0..self.num_layers.max(0) as usize)
             .filter(|&layer| self.is_linear_layer(layer))
@@ -270,9 +281,11 @@ impl Qwen3_5Config {
             .unwrap_or(0)
             .saturating_mul(u64::try_from(self.linear_value_head_dim.max(0)).unwrap_or(0))
             .saturating_mul(u64::try_from(self.linear_key_head_dim.max(0)).unwrap_or(0));
-        linear_layers
-            .saturating_mul(conv_elements.saturating_add(recurrent_elements))
-            .saturating_mul(2)
+        linear_layers.saturating_mul(
+            conv_elements
+                .saturating_mul(2)
+                .saturating_add(recurrent_elements.saturating_mul(4)),
+        )
     }
 
     /// Returns whether a given layer index uses linear attention (GatedDeltaNet)
@@ -285,6 +298,21 @@ impl Qwen3_5Config {
             return true;
         }
         !(layer_idx + 1).is_multiple_of(self.full_attention_interval as usize)
+    }
+
+    /// Element format of the flat full-attention K/V cache. An explicit
+    /// `kv_format` wins (an unparseable value is BF16 — persistence rejects
+    /// it at load); otherwise int8, Splash's default, wherever the int8
+    /// segmented kernels serve the geometry (Metal, `head_dim` 256), and
+    /// BF16 elsewhere so no geometry falls onto the dequantizing fallback.
+    pub fn kv_format(&self) -> crate::transformer::KvFormat {
+        use crate::transformer::KvFormat;
+        match self.kv_format.as_deref() {
+            Some(value) if !value.trim().is_empty() => {
+                KvFormat::parse(Some(value)).unwrap_or_default()
+            }
+            _ => KvFormat::default_for_geometry(i64::from(self.head_dim)),
+        }
     }
 
     /// Number of full-attention layers (i.e. layers that use
@@ -367,6 +395,7 @@ mod tests {
     fn gdn_state_bytes_follow_the_real_conv_and_recurrent_shapes() {
         let config = Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: 16,
             num_layers: 4,
@@ -396,8 +425,11 @@ mod tests {
             persist_paged_cache: None,
             n_mtp_layers: 0,
         };
-        // Two linear layers. conv=[3, (1*4)*2 + (2*3)=14], recurrent=[2,3,4].
-        assert_eq!(config.recurrent_state_bytes(), 2 * (3 * 14 + 2 * 3 * 4) * 2);
+        // Two linear layers. conv=[3, (1*4)*2 + (2*3)=14] bf16, recurrent=[2,3,4] f32.
+        assert_eq!(
+            config.recurrent_state_bytes(),
+            2 * (3 * 14 * 2 + 2 * 3 * 4 * 4)
+        );
     }
 
     #[test]

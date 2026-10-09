@@ -352,6 +352,9 @@ unsafe extern "C-unwind" {
     ) -> bool;
     pub fn mlx_array_delete(arr: *mut mlx_array);
 
+    /// `std::chrono::steady_clock` seconds — the clock of the
+    /// `MLX_METAL_COMMAND_TRACE` `encodeStartCpu`/`submitCpu` stamps.
+    pub fn mlx_steady_clock_now_s() -> f64;
     pub fn mlx_synchronize();
     pub fn mlx_clear_cache();
     pub fn mlx_compile_clear_cache() -> bool;
@@ -742,7 +745,88 @@ unsafe extern "C-unwind" {
         causal: bool,
     ) -> *mut mlx_array;
 
-    // Strict test entry: null on unsupported segmented dispatch; no concat fallback.
+    /// Segmented attention over INT8 K/V rows with one fp32 scale per
+    /// (token, head): `*_k` / `*_v` int8 `[B, Hkv, n, 256]`, `*_ks` / `*_vs`
+    /// float32 `[B, Hkv, n]` (token stride 1). Never falls back to the
+    /// dequantizing concat (a compiled trace over it would bake the prefix
+    /// length): null (message on stderr) when no segmented launch serves
+    /// the block.
+    pub fn mlx_segmented_sdpa_int8_forward(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        prefix_ks: *mut mlx_array,
+        prefix_vs: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        new_ks: *mut mlx_array,
+        new_vs: *mut mlx_array,
+        scale: f32,
+        causal: bool,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY int8 entry with a forced route: `mode` -1 automatic, 0
+    /// vector, 1 tile, 2 nax. Null (message on stderr) when that route
+    /// cannot serve the block.
+    pub fn mlx_segmented_sdpa_int8_test_forward(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        prefix_ks: *mut mlx_array,
+        prefix_vs: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        new_ks: *mut mlx_array,
+        new_vs: *mut mlx_array,
+        scale: f32,
+        causal: bool,
+        mode: i32,
+    ) -> *mut mlx_array;
+
+    /// Per-row symmetric int8 KV quantization: BF16 `[B, H, N, 256]` ->
+    /// int8 rows (`out_q`) + fp32 scales `[B, H, N]` (`out_s`), scale =
+    /// max|x| / 127, q = clamp(rint(x * 127 / max), -127, 127). 0 on
+    /// success, -1 (message on stderr) on error.
+    pub fn mlx_kv_int8_quantize_rows(
+        x: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_s: *mut *mut mlx_array,
+    ) -> i32;
+
+    /// TEST-ONLY: the quantizer built from MLX ops (same arithmetic).
+    pub fn mlx_kv_int8_quantize_rows_reference(
+        x: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_s: *mut *mut mlx_array,
+    ) -> i32;
+
+    /// int8 rows `[B, H, N, 256]` x fp32 scales `[B, H, N]` -> BF16 rows.
+    /// Null (message on stderr) on error.
+    pub fn mlx_kv_int8_dequantize_rows(q: *mut mlx_array, s: *mut mlx_array) -> *mut mlx_array;
+
+    /// Fused Q/K RMSNorm + partial RoPE in one dispatch, bit-identical to
+    /// `fast::rms_norm` then `fast::rope(traditional = false)` on the
+    /// `[B, H, T, D]` transpose. `q` `[B, T, HQ, D]`, `k` `[B, T, HK, D]`
+    /// (any strides, contiguous last axis), `wq` / `wk` `[D]`, `offsets`
+    /// int32 `[B]`. Outputs `[B, HQ, T, D]` and `[B, HK, T, D]`. Returns
+    /// false (message on stderr) without Metal or on a contract violation.
+    pub fn mlx_qk_norm_rope(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        wq: *mut mlx_array,
+        wk: *mut mlx_array,
+        offsets: *mut mlx_array,
+        eps: f32,
+        base: f32,
+        scale: f32,
+        rope_dims: i32,
+        out_q: *mut *mut mlx_array,
+        out_k: *mut *mut mlx_array,
+    ) -> bool;
+
+    // Strict test entry: null on unsupported segmented dispatch; no concat
+    // fallback. Always the vector routes (bit-identical to MLX's vector
+    // SDPA), whatever the calibrated crossover says.
     pub fn mlx_segmented_sdpa_test_forward(
         q: *mut mlx_array,
         prefix_k: *mut mlx_array,
@@ -752,6 +836,93 @@ unsafe extern "C-unwind" {
         scale: f32,
         causal: bool,
     ) -> *mut mlx_array;
+
+    // Strict test entry for the simdgroup-matrix tile route of a causal
+    // verify block: null (message on stderr) when this device or block
+    // cannot take it.
+    pub fn mlx_segmented_sdpa_test_forward_tile(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        scale: f32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY: the tile dispatch this device plans for a causal block:
+    /// `out[0..5]` = tile keys, stage-1 threads, threadgroup bytes,
+    /// partitions, the tile pipeline's maxTotalThreadsPerThreadgroup.
+    /// 1 supported, 0 unsupported, -1 without Metal / on error.
+    pub fn mlx_segmented_sdpa_test_tile_plan(
+        q_heads: i32,
+        kv_heads: i32,
+        rows: i32,
+        total_length: i32,
+        out: *mut u32,
+    ) -> i32;
+
+    // Strict test entry for the tensor-op (NAX) route of a causal verify
+    // block: null (message on stderr) when this device, block or Q layout
+    // cannot take it.
+    pub fn mlx_segmented_sdpa_test_forward_nax(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        scale: f32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY: the tensor-op dispatch this device plans for a causal
+    /// block: `out[0..6]` = M, tile keys, stage-1 threads, threadgroup
+    /// bytes, partitions, the pipeline's maxTotalThreadsPerThreadgroup.
+    /// 1 supported, 0 unsupported (no NAX included), -1 without Metal / on
+    /// error.
+    pub fn mlx_segmented_sdpa_test_nax_plan(
+        q_heads: i32,
+        kv_heads: i32,
+        rows: i32,
+        total_length: i32,
+        out: *mut u32,
+    ) -> i32;
+
+    /// TEST-ONLY, platform independent: the tensor-op planner over
+    /// synthetic pipeline limits; `out[0..5]` = M, tile keys, stage-1
+    /// threads, threadgroup bytes, partitions for `total_length` keys under
+    /// `blocks_override` (MLX_SDPA_BLOCKS, 0 = policy).
+    pub fn mlx_segmented_sdpa_test_verify_nax_plan(
+        rows: i32,
+        gqa_factor: i32,
+        total_length: i32,
+        blocks_override: i32,
+        stage1_width: usize,
+        stage1_max_threads: usize,
+        stage1_static_memory: usize,
+        device_max_memory: usize,
+        stage2_width: usize,
+        stage2_max_threads: usize,
+        stage2_static_memory: usize,
+        out: *mut u32,
+    ) -> i32;
+
+    /// TEST-ONLY, platform independent: the tile planner over synthetic
+    /// pipeline limits; `out` as `mlx_segmented_sdpa_test_tile_plan`, with
+    /// the partition count for `total_length` keys under `blocks_override`
+    /// (MLX_SDPA_BLOCKS, 0 = policy).
+    pub fn mlx_segmented_sdpa_test_verify_tile_plan(
+        rows: i32,
+        gqa_factor: i32,
+        total_length: i32,
+        blocks_override: i32,
+        stage1_width: usize,
+        stage1_max_threads: usize,
+        stage1_static_memory: usize,
+        device_max_memory: usize,
+        stage2_width: usize,
+        stage2_max_threads: usize,
+        stage2_static_memory: usize,
+        out: *mut u32,
+    ) -> i32;
 
     // Widest query chunk both segmented launches support for `gqa_factor`:
     // 0 when segmented SDPA is not supported here (the caller takes
@@ -819,6 +990,37 @@ unsafe extern "C-unwind" {
         rows: i32,
         partitions: i32,
         out: *mut u64,
+    ) -> i32;
+
+    /// TEST-ONLY: the key count (prefix + new rows) from which the production
+    /// segmented entry takes a block kernel: the crossover this process
+    /// calibrated (measured now if not yet). -1 without Metal or on error.
+    pub fn mlx_segmented_sdpa_test_block_min_keys() -> i32;
+
+    /// TEST-ONLY: the crossover calibration record (measured now if not
+    /// yet): per point `keys`, `vector_seconds`, `block_seconds` (up to
+    /// `capacity`), the calibration's wall time, the block kernel timed
+    /// (0 none, 1 tile, 2 tensor-op) and the selected crossover. Returns the
+    /// point count (0 when the measurement failed), -1 without Metal or on
+    /// error.
+    pub fn mlx_segmented_sdpa_test_block_calibration(
+        keys: *mut i32,
+        vector_seconds: *mut f64,
+        block_seconds: *mut f64,
+        capacity: usize,
+        out_elapsed_ms: *mut f64,
+        out_block_kernel: *mut i32,
+        out_result: *mut i32,
+    ) -> i32;
+
+    /// TEST-ONLY, platform independent: the crossover selection over
+    /// per-point seconds (`select_segmented_block_min_keys`); -1 on null
+    /// input.
+    pub fn mlx_segmented_sdpa_test_select_block_min_keys(
+        keys: *const i32,
+        vector_seconds: *const f64,
+        block_seconds: *const f64,
+        count: usize,
     ) -> i32;
 
     /// TEST-ONLY, platform independent: FNV-1a 64 digests of the segmented
@@ -1580,16 +1782,16 @@ unsafe extern "C-unwind" {
     /// Maximum legal D128 partitions under live pipeline, storage and context limits.
     pub fn mlx_paged_grouped_d128_max_stripes(context: u32, attention_layers: u32) -> u32;
 
-    /// Context-table D128 stripe count clamped by `mlx_paged_grouped_d128_max_stripes`.
-    /// Returns 0 when the grouped route is unavailable (dispatch then keeps generic V2).
-    pub fn mlx_paged_grouped_d128_default_stripes(context: u32, attention_layers: u32) -> u32;
-
     /// Return 1 when the canonical direct-read D512 Metal pipeline, reducer,
     /// and threadgroup limits
     /// support this shipped Q/KV-head geometry, 0 when unsupported, and -1
     /// when Metal capability probing fails. The caller must separately
     /// enforce BF16, D512, BS16, q_len=1, and one sequence.
     pub fn mlx_paged_grouped_d512_capability(num_q_heads: i32, num_kv_heads: i32) -> i32;
+
+    /// GPU cores of the default Metal device (IORegistry `gpu-core-count`,
+    /// 8 when unpublished); 0 without Metal.
+    pub fn mlx_gpu_core_count() -> i32;
 
     /// Pure selector guard for the supported BF16 D512/BS16 GQA layouts.
     /// selector_mode: 0=disabled, 1=auto, 2=force.
@@ -1600,15 +1802,6 @@ unsafe extern "C-unwind" {
         query_rows: i32,
         max_context_len: i32,
     ) -> i32;
-
-    /// Pure graph-dispatch stripe policy seam. A nonzero override mirrors the
-    /// validated environment override after parsing.
-    pub fn mlx_paged_grouped_d512_stripe_count_for_test(
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        max_context_len: i32,
-        override_stripes: u32,
-    ) -> u32;
 
     /// Compatibility selector for the original 16Q/1KV Gemma 4 route.
     /// selector_mode: 0=disabled, 1=auto, 2=force.
@@ -1625,11 +1818,12 @@ unsafe extern "C-unwind" {
         num_q_heads: i32,
         num_kv_heads: i32,
         context_len: i32,
+        grouped_stripes: u32,
     ) -> i32;
 
     /// Compatibility graph-parity probe for Gemma 4's 16Q/1KV layout.
     /// Returns 1 on success and -3 without Metal.
-    pub fn mlx_paged_grouped_gemma4_graph_parity(context_len: i32) -> i32;
+    pub fn mlx_paged_grouped_gemma4_graph_parity(context_len: i32, grouped_stripes: u32) -> i32;
 }
 
 // ================================================================================
@@ -1818,11 +2012,23 @@ unsafe extern "C-unwind" {
     /// TEST-ONLY: per-thread K-quant kernel-family counters. Enabling or
     /// disabling resets this thread's counts.
     pub fn mlx_test_kquant_counting(enable: bool);
+    pub fn mlx_test_kquant_gather_rhs_fallback(force: bool);
     /// TEST-ONLY: this thread's dispatch count for a kernel family
     /// (e.g. `qmv_fast`, `qmv_wide_nv8`, `qmm_t_nax`, `gather_qmm_rhs_nt`).
     pub fn mlx_test_kquant_family_count(family: *const std::os::raw::c_char) -> u64;
     /// TEST-ONLY: the GPU generation the Metal dispatcher sees, -1 without Metal.
     pub fn mlx_test_kquant_gpu_gen() -> i32;
+    /// TEST-ONLY: whether the Tiled64 bfloat16 route of `x[M, K] @ w[N, K].T`
+    /// at `bits` per weight takes a tensor-op row tier
+    /// (`qmm_m8/m16/m32_nax_t64`) on this device.
+    /// `affine` selects the affine contracts' rule (the 8..32-row tiers
+    /// behind the grid rule); the K-quant modes take the 8-row tier at
+    /// M = 8 only.
+    pub fn mlx_test_kquant_tensor_op_tier(m: i32, n: i32, k: i32, bits: i32, affine: bool) -> bool;
+    /// TEST-ONLY: the M from which the Tiled64 route of `x[M, K] @ w[N, K].T`
+    /// takes the GEMM instead of the matvec kernels on this device (MLX's
+    /// qmv batch limit, or `MLX_QMM_SPLITK_MIN_M`); 0 without Metal.
+    pub fn mlx_test_kquant_qmv_vector_limit(k: i32, n: i32) -> i32;
     /// TEST-ONLY: checks `paged_attn.metallib` against every K-quant kernel
     /// name the Metal dispatcher can build. `counts` (4 slots) receives base
     /// names, NAX names, K-quant functions in the library and pipelines built;
@@ -1965,6 +2171,97 @@ unsafe extern "C-unwind" {
         window_stride: i32,
         out_state: *mut *mut mlx_array,
     ) -> bool;
+
+    // Fused DFlash2 GDN commit over every linear layer: replays `keep`
+    // recorded tokens of each layer's tape into the packed recurrent blob
+    // `[L, Hv, Dv, Dk]` and conv blob `[L, K-1, W]` (bit-identical to the
+    // per-layer `mlx_gated_delta_replay` + conv rebuild) in a few dispatches.
+    // The result is written in place into the spare `rec_next` / `conv_next`
+    // blobs (ping-pong); `k`/`v`/`g`/`beta`/`qkv` point at `layers` per-layer
+    // tape arrays.
+    pub fn mlx_gdn_commit_all(
+        rec_in: *mut mlx_array,
+        conv_in: *mut mlx_array,
+        rec_next: *mut mlx_array,
+        conv_next: *mut mlx_array,
+        layers: i32,
+        k: *const *mut mlx_array,
+        v: *const *mut mlx_array,
+        g: *const *mut mlx_array,
+        beta: *const *mut mlx_array,
+        qkv: *const *mut mlx_array,
+        keep: i32,
+        out_rec: *mut *mut mlx_array,
+        out_conv: *mut *mut mlx_array,
+    ) -> bool;
+
+    // True when both arrays are evaluated and are the same bytes of the same
+    // buffer (offset, size and shape equal).
+    pub fn mlx_array_aliases(a: *const mlx_array, b: *const mlx_array) -> bool;
+
+    // Fused GDN step for one window: the per-step recurrence over every
+    // value column of a head in one threadgroup, then the gated RMSNorm and
+    // `sigmoid(z) * z * norm(y)` on the window rows — bit-identical to the
+    // per-step kernel -> fast::rms_norm -> compiled swiglu chain. `z` is
+    // `[B, T, Hv * Dv]` read through its strides; `state_dst` (nullable)
+    // is a `[B, Hv, Dv, Dk]` f32 view the new state is written into (its
+    // buffer becomes `out_state`). Returns false when off-contract.
+    pub fn mlx_gdn_fused_step(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: f32,
+        state_dst: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    // The complete fused GDN layer core: `qwen4_gdn_prepare` (conv + SiLU +
+    // q/k norm + gates) + recurrence + gated RMSNorm + z gate in one
+    // dispatch (B = 1, Dk = Dv = 128, T <= 16, value head hv on key head
+    // hv % Hk). `outputs[8]`: out, state, q, k, v, decay, beta,
+    // next_history — bit-identical to `mlx_qwen4_gdn_prepare` followed by
+    // `mlx_gdn_fused_step`. `history_dst` (nullable) is a `[3, W]` bf16 view
+    // next_history is written into. Returns false when off-contract.
+    pub fn mlx_gdn_fused_complete(
+        qkv: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        conv: *mut mlx_array,
+        history: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: f32,
+        state_dst: *mut mlx_array,
+        history_dst: *mut mlx_array,
+        outputs: *mut *mut mlx_array,
+    ) -> bool;
+
+    // In-place KV row store: one dispatch writes `tensors` row blocks
+    // (`src[i]`, `[B, H, T(, D)]`) into the matching flat cache buffers
+    // (`dst[i]`) at row `offsets[i]`; `out[i]` are the cache handles to
+    // adopt (same buffers). A bit copy, equal to one slice_update per
+    // tensor. More than one layer's tensors need residency sets (quiet
+    // `false` otherwise).
+    pub fn mlx_kv_store_rows(
+        tensors: i32,
+        dst: *const *mut mlx_array,
+        src: *const *mut mlx_array,
+        offsets: *const i32,
+        out: *mut *mut mlx_array,
+    ) -> bool;
+
+    // Whether `mlx_kv_store_rows` can store several layers in one dispatch
+    // (Metal device with residency sets).
+    pub fn mlx_kv_store_batched_available() -> bool;
 
     // Fused DFlash2 grouped dynamic causal conv: one elementwise dispatch
     // reproducing the pad/slice/add/mul/add chain bit-exactly (per-op dtype

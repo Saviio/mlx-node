@@ -65,15 +65,28 @@ impl Tensor {
                 GgufTensorType::F32 => (4, 1),
                 GgufTensorType::F16 | GgufTensorType::BF16 => (2, 1),
                 GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => (20, 32),
-                GgufTensorType::Q5_1 => (24, 32),
+                GgufTensorType::Q5_0 | GgufTensorType::Q5_1 => (24, 32),
                 GgufTensorType::Q8_0 => (36, 32),
+                // E8M0 scale byte + 16 nibble bytes, no biases.
+                GgufTensorType::MXFP4 => (17, 32),
+                // 64 code bytes + 32 unpacked (sc, m) bytes + (d, dmin).
+                GgufTensorType::Q2K => (100, 256),
                 GgufTensorType::Q3K => (114, 256),
                 GgufTensorType::Q4K => (148, 256),
                 GgufTensorType::Q5K => (180, 256),
                 GgufTensorType::Q6K => (210, 256),
                 GgufTensorType::IQ4NL => (19, 32),
-                GgufTensorType::IQ3S => (266, 256),
                 GgufTensorType::IQ4XS => (138, 256),
+                // The grid formats keep ggml's bytes (gguf_kquant.rs); IQ1_M
+                // adds the 2-byte f16 d the contract makes explicit, IQ3_S
+                // the 4 bytes of its scale nibbles stored one per byte.
+                GgufTensorType::IQ3S => (114, 256),
+                GgufTensorType::IQ2XXS => (66, 256),
+                GgufTensorType::IQ2XS => (74, 256),
+                GgufTensorType::IQ2S => (82, 256),
+                GgufTensorType::IQ3XXS => (98, 256),
+                GgufTensorType::IQ1S => (50, 256),
+                GgufTensorType::IQ1M => (58, 256),
                 GgufTensorType::PQ2_0 => {
                     return Err(err("Qwen4 does not support PQ2_0 tensor residency"));
                 }

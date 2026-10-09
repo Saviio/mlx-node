@@ -338,9 +338,25 @@ fn compile_paged_attn_metallib(
     };
     jobs.extend(kquant_jobs("kquant"));
     jobs.extend(kquant_jobs("kquant_nax"));
-    // Self-contained sources (no MLX headers), with the same flags.
+    // bfloat16-only M = 8 tensor-op kernels: one compile, no KQUANT_DTYPE.
+    jobs.push(AirJob {
+        src: bridge_dir.join("kquant").join("kquant_m8_nax.metal"),
+        air: out_dir.join("kquant_m8_nax.air"),
+        args: vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-fno-fast-math".to_string(),
+            "-I".to_string(),
+            mlx_dir.display().to_string(),
+            min_os.clone(),
+        ],
+    });
+    // Self-contained sources (no MLX headers), with the same flags. The
+    // tensor-op verify kernel includes MetalPerformancePrimitives from the
+    // SDK; `assert_nax_buildable` has already checked the deployment target.
     for file in [
         "segmented_sdpa/sdpa_segmented.metal",
+        "segmented_sdpa/sdpa_segmented_nax.metal",
         "affine_mixed/affine_qmv_wide_mixed.metal",
     ] {
         let args = vec![
@@ -758,6 +774,8 @@ fn main() -> io::Result<()> {
         if build_metal {
             println!("cargo:rustc-link-lib=framework=Metal");
             println!("cargo:rustc-link-lib=framework=QuartzCore");
+            // GPU core count for the K-quant split rule (mlx_kquant_metal.cpp).
+            println!("cargo:rustc-link-lib=framework=IOKit");
         }
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=Accelerate");
@@ -859,18 +877,44 @@ fn main() -> io::Result<()> {
         }
         // The K-quant headers as source text, for the custom kernels that
         // reuse their decoders (the K-quant ops themselves run from the
-        // prebuilt paged_attn.metallib). They include no project headers, so
-        // the preamble is the file itself, in the generator's format.
+        // prebuilt paged_attn.metallib). Their one project include, the
+        // per-mode traits in kquant_mode.h, is inlined in place so each
+        // preamble stays self-contained, in the generator's format.
+        // kquant_mode.h, the grid tables and kquant_grid.h (in that order:
+        // the grid decode needs the mode traits and the tables before it).
+        let inlined_body = |name: &str| -> io::Result<String> {
+            let header = src_dir.join(format!("metal/kquant/{name}.h"));
+            Ok(read_build_source(&header)?
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("#pragma once")
+                        && !(trimmed.starts_with("#include \"") && trimmed.ends_with(".h\""))
+                })
+                .map(|line| format!("{line}\n"))
+                .collect())
+        };
+        let mode_body = format!(
+            "{}{}{}",
+            inlined_body("kquant_mode")?,
+            inlined_body("kquant_grid_tables")?,
+            inlined_body("kquant_grid")?
+        );
         for name in ["kquant", "kquant_nax"] {
             let header = src_dir.join(format!("metal/kquant/{name}.h"));
             let body: String = read_build_source(&header)?
                 .lines()
-                .filter(|line| {
-                    let line = line.trim_start();
-                    !(line.starts_with("#pragma once")
-                        || (line.starts_with("#include \"") && line.ends_with(".h\"")))
+                .filter(|line| !line.trim_start().starts_with("#pragma once"))
+                .map(|line| {
+                    let trimmed = line.trim_start();
+                    if trimmed == "#include \"kquant_mode.h\"" {
+                        mode_body.clone()
+                    } else if trimmed.starts_with("#include \"") && trimmed.ends_with(".h\"") {
+                        String::new()
+                    } else {
+                        format!("{line}\n")
+                    }
                 })
-                .map(|line| format!("{line}\n"))
                 .collect();
             if body.contains(")preamble\"") {
                 return Err(io::Error::other(format!(

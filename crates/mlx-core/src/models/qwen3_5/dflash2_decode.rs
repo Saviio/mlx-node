@@ -16,12 +16,15 @@ use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::{generated_capacity_hint, kv_capacity_round_up};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::stream::{Stream, StreamContext, WiredLimitContext};
+use crate::transformer::KvFormat;
 use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
 use crate::transformer::paged_policy::live_prefill_headroom;
 
 use super::dflash2::DFlash2ContextCache;
+use super::gdn_blob::GdnStateBlobs;
 use super::layer_cache::{
-    Qwen3_5LayerCache, Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, snapshot_all_mtp,
+    Qwen3_5LayerCache, Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, rewind_full_attention_to,
+    snapshot_all_mtp,
 };
 use super::model::{PREFILL_STEP_SIZE, Qwen35Inner};
 
@@ -43,6 +46,17 @@ pub(crate) struct Qwen35DFlash2Stepper<'a> {
     /// — the token provenance [`Self::commit`] materializes once the verify
     /// graph has been forced (post-acceptance read = plain copy, no sync).
     verified_ids_device: Option<MxArray>,
+    /// Packed GDN state of every linear layer (the per-layer cache slots are
+    /// views of it) — the pre-verify state the fused commit replays from.
+    /// `None` keeps the per-layer replay path.
+    gdn_blobs: Option<GdnStateBlobs>,
+}
+
+/// Packed GDN state is on unless `MLX_DFLASH2_GDN_BLOB=0` (A/B switch).
+fn dflash2_gdn_blob_enabled() -> bool {
+    std::env::var("MLX_DFLASH2_GDN_BLOB")
+        .ok()
+        .is_none_or(|value| value.trim() != "0")
 }
 
 fn reusable_dflash2_prefix(
@@ -141,12 +155,20 @@ fn dflash2_kv_budget_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> 
         .map(|headroom| headroom.saturating_sub(DFLASH2_KV_HEADROOM_RESERVE_BYTES) / 10 * 9)
 }
 
-fn kv_row_bytes(full_attention_layers: usize, kv_heads: i32, head_dim: i32, dtype: DType) -> u64 {
+/// Bytes one token row costs across every full-attention K and V tensor:
+/// `head_dim x activation bytes` per (layer, head, tensor) for BF16 rows,
+/// `head_dim + 4` (int8 row plus its fp32 scale) for the int8 format.
+fn kv_row_bytes(
+    full_attention_layers: usize,
+    kv_heads: i32,
+    head_dim: i32,
+    dtype: DType,
+    format: KvFormat,
+) -> u64 {
     (full_attention_layers as u64)
         .saturating_mul(2)
         .saturating_mul(kv_heads.max(0) as u64)
-        .saturating_mul(head_dim.max(0) as u64)
-        .saturating_mul(dtype.byte_size() as u64)
+        .saturating_mul(format.row_bytes(i64::from(head_dim), dtype.byte_size() as u64))
 }
 
 /// Target rows to reserve for one DFlash2 turn: the whole turn
@@ -184,6 +206,134 @@ fn dflash2_kv_reserve_rows(
     let ahead = ahead_cap.min(max_new_tokens.max(0) as u64) as i32;
     Ok(Some(kv_capacity_round_up(prompt, ahead)? as i64))
 }
+
+/// Per-cycle short-lived allocations of one DFlash2 verify cycle. Feeds
+/// `cache_limit::decode_cache_limit` with [`Self::total`].
+pub(crate) struct DFlash2CycleTransient {
+    /// Logits, GDN tapes and one layer's scratch set: geometry-only.
+    pub core_bytes: u64,
+    /// Two-pass attention partials: grows with context length; one set per
+    /// full-attention layer can be in flight at once. Zero below the
+    /// two-pass threshold.
+    pub partials_bytes: u64,
+}
+
+impl DFlash2CycleTransient {
+    pub fn total(&self) -> u64 {
+        self.core_bytes.saturating_add(self.partials_bytes)
+    }
+}
+
+/// First-order estimate of the short-lived bytes one DFlash2 verify cycle
+/// allocates and frees, used to size the decode-time allocator cache
+/// ceiling. `context_rows` is the turn's upper bound on attended keys
+/// (prompt + `max_new_tokens`).
+///
+/// A cycle runs the target over `rows = block_size + 1` tokens — the anchor
+/// plus the draft's `block_size` proposals (the loaded `block_size` is the
+/// checkpoint's minus one, see `DFlash2Model::load`) — and keeps these
+/// transient outputs alive until commit:
+///
+/// ```text
+/// logits   = rows × vocab × 4 B × 2        f32 full-span logits + the
+///                                           penalty/argmax copy
+/// tapes    = layers × rows × (hidden        bf16 residual tap and the GDN
+///            + conv_dim + 2·k_heads·k_dim    (q, k, v, qkv-window) tape kept
+///            + v_heads·v_dim) × 2 B          per layer for the rollback replay
+/// scratch  = rows × 3 × (hidden             one layer's attention/MLP
+///            + intermediate) × 2 B           intermediates; identical sizes
+///                                           are reused layer to layer, so
+///                                           only one set is ever cached
+/// partials = fa_layers × heads × rows        two-pass SDPA stage-1 output
+///            × partitions × head_dim × 2 B   (`segmented_sdpa` / MLX vector
+///                                           SDPA); only when the context is
+///                                           long enough for two-pass (≥ 4096
+///                                           keys), with partitions ≈ one per
+///                                           64 keys clamped to [32, 1024]
+///                                           (the tile kernel's count; the
+///                                           vector kernel's 128/256/512 steps
+///                                           sit at or below it)
+/// ```
+///
+/// Weights and KV caches are resident (never freed per cycle) and are
+/// deliberately excluded; the per-layer GDN recurrent state is re-allocated
+/// each cycle but layer `i`'s freed state is reused by layer `i + 1`, so it
+/// behaves like scratch and is not counted separately. Qwen3.8-27B (8 rows)
+/// at a 1 K prompt: ≈ 15 + 25 + 1 MiB, no partials → `decode_cache_limit`'s
+/// 128 MiB floor wins; at a 6 K prompt (6347 keys): + 16 × 24 × 8 × 128 ×
+/// 256 × 2 B = 192 MiB of partials → 466 MiB cap (logged in production),
+/// above the 340 MiB the unbounded pool holds there (see
+/// `decode_cache_limit` for why that is intended).
+fn dflash2_cycle_transient(
+    config: &super::config::Qwen3_5Config,
+    block_size: usize,
+    context_rows: u64,
+) -> DFlash2CycleTransient {
+    let dim = |v: i32| v.max(0) as u64;
+    let rows = block_size.saturating_add(1) as u64;
+    let logits = rows
+        .saturating_mul(dim(config.vocab_size))
+        .saturating_mul(4)
+        .saturating_mul(2);
+    let key_width = dim(config.linear_num_key_heads)
+        .saturating_mul(dim(config.linear_key_head_dim))
+        .saturating_mul(2);
+    let value_width =
+        dim(config.linear_num_value_heads).saturating_mul(dim(config.linear_value_head_dim));
+    let conv_dim = key_width.saturating_add(value_width);
+    let tape_width = dim(config.hidden_size)
+        .saturating_add(conv_dim)
+        .saturating_add(key_width)
+        .saturating_add(value_width);
+    let tapes = dim(config.num_layers)
+        .saturating_mul(rows)
+        .saturating_mul(tape_width)
+        .saturating_mul(2);
+    let scratch = rows
+        .saturating_mul(3)
+        .saturating_mul(dim(config.hidden_size).saturating_add(dim(config.intermediate_size)))
+        .saturating_mul(2);
+    let partials = if context_rows >= SDPA_TWO_PASS_MIN_KEYS {
+        let partitions = context_rows
+            .div_ceil(SDPA_KEYS_PER_PARTITION)
+            .next_multiple_of(32)
+            .clamp(32, 1024);
+        let fa_layers = (0..dim(config.num_layers) as usize)
+            .filter(|&index| !config.is_linear_layer(index))
+            .count() as u64;
+        fa_layers
+            .saturating_mul(dim(config.num_heads))
+            .saturating_mul(rows)
+            .saturating_mul(partitions)
+            .saturating_mul(dim(config.head_dim))
+            .saturating_mul(2)
+    } else {
+        0
+    };
+    DFlash2CycleTransient {
+        core_bytes: logits.saturating_add(tapes).saturating_add(scratch),
+        partials_bytes: partials,
+    }
+}
+
+/// Decode-phase allocator free-pool ceiling for one DFlash2 turn: the
+/// transient estimate above through `cache_limit::decode_cache_limit`.
+fn dflash2_decode_cache_limit(
+    config: &super::config::Qwen3_5Config,
+    block_size: usize,
+    context_rows: u64,
+) -> u64 {
+    crate::cache_limit::decode_cache_limit(
+        dflash2_cycle_transient(config, block_size, context_rows).total(),
+    )
+}
+
+/// Below this many keys the attention kernels run one-pass and allocate no
+/// partials (`sdpa_vector_uses_two_pass` in `mlx_segmented_sdpa_plan.h`).
+const SDPA_TWO_PASS_MIN_KEYS: u64 = 4096;
+/// Keys per stage-1 partition of the segmented verify tile kernel
+/// (`segmented_verify_tile_partitions`: `8 × max(tile_n, 8)`).
+const SDPA_KEYS_PER_PARTITION: u64 = 64;
 
 /// Smallest full-attention buffer capacity, `None` without full-attention
 /// caches.
@@ -241,6 +391,7 @@ impl Qwen35DFlash2Stepper<'_> {
             &self.tap_layers,
             true,
             super::model::DFlash2LogitsSpan::All,
+            self.gdn_blobs.as_ref().map(GdnStateBlobs::destinations),
         )
     }
 
@@ -296,7 +447,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         let (path, draft_sparse_dists) = draft.propose(
             &self.inner.embedding,
             self.inner.lm_head.as_ref(),
-            &self.context,
+            &mut self.context,
             anchor_id,
             max_len,
             temperature,
@@ -369,6 +520,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             &self.tap_layers,
             true,
             super::model::DFlash2LogitsSpan::All,
+            self.gdn_blobs.as_ref().map(GdnStateBlobs::destinations),
         )?;
         if phase_time {
             eprintln!("[dflash2-phase] verify-build: {:?}", t0.elapsed());
@@ -425,24 +577,60 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 verified_ids.len()
             )));
         }
-        // Replay is required even on full accept: the windowed verify kernel
-        // carries the recurrent state in f32 across the whole window and rounds
-        // to bf16 once at the end, while replay re-rounds per token to restore
-        // the AR-exact state serial decode would leave. Skipping it would let a
-        // sub-ULP divergence compound across cycles.
         let caches = self
             .inner
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
-        replay_mtp_snapshot_to(
-            caches,
-            &snapshot,
-            &tape,
-            keep,
-            false,
-            "Qwen3.8 DFlash2 commit",
-        )?;
+        // Packed path. Full accept (every verified row kept; the bonus token
+        // is not in the state yet): the verify already wrote each layer's
+        // window-final state into the spare blob rows, and with the f32
+        // carry that equals replaying the whole window
+        // (`gated_delta::tests::ar_chain_matches_windowed_kernel_f32`), so
+        // adopting is a parity swap. Otherwise every linear layer's replay
+        // (plus its conv rebuild) runs in one fused primitive from the
+        // pre-verify blobs. The full-attention offsets rewind as before. A
+        // declined kernel drops back to the per-layer replay for the rest of
+        // the turn.
+        let next_blobs = match &self.gdn_blobs {
+            Some(blobs) => {
+                let adopted = if keep == total_written {
+                    blobs.adopt(&tape)?
+                } else {
+                    None
+                };
+                match adopted {
+                    Some(next) => Some(next),
+                    None => blobs.commit(&tape, keep)?,
+                }
+            }
+            None => None,
+        };
+        match next_blobs {
+            Some(next) => {
+                // Rewind first: a failure here leaves the linear slots on the
+                // pre-commit blobs, consistent with `self.gdn_blobs`.
+                rewind_full_attention_to(caches, &snapshot, keep, "Qwen3.8 DFlash2 commit")?;
+                next.apply_views(caches)?;
+                self.gdn_blobs = Some(next);
+            }
+            None => {
+                if self.gdn_blobs.take().is_some() {
+                    tracing::debug!(
+                        keep,
+                        "Qwen3.8 DFlash2 fused GDN commit declined; per-layer replay for the rest of the turn"
+                    );
+                }
+                replay_mtp_snapshot_to(
+                    caches,
+                    &snapshot,
+                    &tape,
+                    keep,
+                    false,
+                    "Qwen3.8 DFlash2 commit",
+                )?;
+            }
+        }
         self.append_tapped(&tapped, &verified_ids[..keep])
     }
 
@@ -531,6 +719,23 @@ impl DsparkBackend for Qwen35Inner {
             .config
             .target_layers
             .clone();
+        // Pack the prefill's per-layer GDN states once per turn (two concats);
+        // every cycle's commit then rewrites the blobs in one fused primitive
+        // and re-points the per-layer slots at them. The DFlash2 stepper
+        // always runs on the flat caches (see the `paged = false` snapshots).
+        let gdn_blobs = match &mut self.caches {
+            Some(caches) if dflash2_gdn_blob_enabled() => {
+                let blobs = GdnStateBlobs::pack(caches)?;
+                match &blobs {
+                    Some(blobs) => blobs.apply_views(caches)?,
+                    None => tracing::debug!(
+                        "Qwen3.8 DFlash2: GDN state not packable; per-layer commit path"
+                    ),
+                }
+                blobs
+            }
+            _ => None,
+        };
         Ok(Qwen35DFlash2Stepper {
             inner: self,
             context: state.context,
@@ -541,6 +746,7 @@ impl DsparkBackend for Qwen35Inner {
             tapped: None,
             verified_ids: None,
             verified_ids_device: None,
+            gdn_blobs,
         })
     }
 }
@@ -613,6 +819,7 @@ impl Qwen35Inner {
                     &tap_layers,
                     false,
                     super::model::DFlash2LogitsSpan::LastRow,
+                    None,
                 )?
             };
             let draft = self
@@ -666,12 +873,13 @@ impl Qwen35Inner {
         ))
     }
 
-    /// K/V element type the target's full-attention caches hold or will be
-    /// allocated with: activations follow the embedding output dtype.
+    /// Activation element type the target's full-attention caches hold (BF16
+    /// format) or quantize from (int8 format): the embedding output dtype,
+    /// or the allocated BF16 buffer's own.
     fn dflash2_target_kv_dtype(&self) -> Result<DType> {
         let allocated = self.caches.iter().flatten().find_map(|cache| match cache {
-            Qwen3_5LayerCache::FullAttention(kv) => kv.keys_ref(),
-            Qwen3_5LayerCache::Linear(_) => None,
+            Qwen3_5LayerCache::FullAttention(kv) if kv.format() == KvFormat::Bf16 => kv.keys_ref(),
+            _ => None,
         });
         match allocated {
             Some(keys) => keys.dtype(),
@@ -680,6 +888,19 @@ impl Qwen35Inner {
                 .forward(&MxArray::from_int32(&[0], &[1, 1])?)?
                 .dtype(),
         }
+    }
+
+    /// Row format of the target's full-attention caches (every FA slot
+    /// shares the config's format).
+    fn dflash2_target_kv_format(&self) -> KvFormat {
+        self.caches
+            .iter()
+            .flatten()
+            .find_map(|cache| match cache {
+                Qwen3_5LayerCache::FullAttention(kv) => Some(kv.format()),
+                Qwen3_5LayerCache::Linear(_) => None,
+            })
+            .unwrap_or_else(|| self.config.kv_format())
     }
 
     /// Size every flat full-attention cache for this turn so decode never
@@ -700,6 +921,7 @@ impl Qwen35Inner {
             self.config.num_kv_heads,
             self.config.head_dim,
             self.dflash2_target_kv_dtype()?,
+            self.dflash2_target_kv_format(),
         );
         let budget_bytes = dflash2_kv_budget_bytes(dflash2_memory_snapshot());
         let rows = dflash2_kv_reserve_rows(
@@ -747,6 +969,7 @@ impl Qwen35Inner {
             &tap_layers,
             false,
             super::model::DFlash2LogitsSpan::LastRow,
+            None,
         )?;
         let fused = self
             .dflash2
@@ -882,6 +1105,16 @@ impl Qwen35Inner {
             .block_size;
         let mut rng = rand::rng();
         let outcome = {
+            // Decode-phase allocator ceiling: prefill (2048-row chunks) has
+            // already run under the load-time cap; the verify/propose loop
+            // only needs room to recycle one cycle's transients, so the
+            // free-pool is capped for exactly this scope and lifted on drop.
+            let _decode_cache_cap =
+                crate::cache_limit::coordinator().push_decode_limit(dflash2_decode_cache_limit(
+                    &self.config,
+                    block_size,
+                    tokens.len() as u64 + params.max_new_tokens.max(0) as u64,
+                ));
             let streaming = turn_streaming
                 .as_mut()
                 .and_then(|ts| ts.ctx(args.sink, args.cancelled));
@@ -1075,17 +1308,7 @@ mod tests {
     }
 
     fn reset_flat_fixture(inner: &mut Qwen35Inner) {
-        inner.caches = Some(
-            (0..inner.config.num_layers as usize)
-                .map(|index| {
-                    if inner.config.is_linear_layer(index) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect(),
-        );
+        inner.caches = Some(Qwen3_5LayerCache::fresh_layer_caches(&inner.config));
         inner.dflash2_context = None;
         inner.dflash2_turn_state = None;
     }
@@ -1095,10 +1318,15 @@ mod tests {
     }
 
     fn tiny_dflash_inner_with_attention_head_dim(seed: u64, head_dim: i32) -> Qwen35Inner {
+        tiny_dflash_inner_with_config(seed, |config| config.head_dim = head_dim)
+    }
+
+    fn tiny_dflash_inner_with_config(
+        seed: u64,
+        adjust: impl FnOnce(&mut super::super::config::Qwen3_5Config),
+    ) -> Qwen35Inner {
         unsafe { mlx_sys::mlx_seed(seed) };
-        let mut inner = super::super::model::scheduled_mtp::seeded_inner_with_attention_head_dim(
-            seed, head_dim,
-        );
+        let mut inner = super::super::model::scheduled_mtp::seeded_inner_with_config(seed, adjust);
         inner.paged_adapter = None;
 
         // The shared scheduled fixture deliberately installs a constant head;
@@ -1242,6 +1470,7 @@ mod tests {
                 &tap_layers,
                 true,
                 super::super::model::DFlash2LogitsSpan::All,
+                None,
             )?;
             let mut arrays = vec![&logits];
             arrays.extend(taps.iter());
@@ -1343,17 +1572,318 @@ mod tests {
         Ok(())
     }
 
+    /// The fixture at the production head dim (256) with its full-attention
+    /// caches in the int8 format: the only geometry the int8 segmented
+    /// kernels serve, so both the compiled and the eager verify read int8
+    /// rows.
+    fn tiny_int8_dflash_inner(seed: u64) -> Qwen35Inner {
+        // The DFlash2 fixture needs hidden % head_dim == 0 (its conv groups);
+        // the format lives in the caches (`reset_flat_fixture` rebuilds them
+        // from the config).
+        tiny_dflash_inner_with_config(seed, |config| {
+            config.head_dim = 256;
+            config.hidden_size = 256;
+            config.kv_format = Some("int8".to_string());
+        })
+    }
+
+    /// Int8 K/V: the compiled verify (int8 prefix + scales as graph inputs,
+    /// the block quantized inside the graph) equals the eager verify (the
+    /// cache quantizes on write) bit for bit — logits, taps and GDN tape —
+    /// and the caches hold identical int8 rows and scales afterwards.
+    #[test]
+    fn compiled_int8_verify_matches_eager_int8_verify_bitwise() -> Result<()> {
+        if !crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { mlx_sys::mlx_default_device() } != 1
+        {
+            eprintln!("SKIP compiled_int8_verify: Metal must be the default device");
+            return Ok(());
+        }
+        assert!(std::env::var_os("MLX_DISABLE_COMPILE").is_none());
+        let mut inner = tiny_int8_dflash_inner(0xDFA5_1E78);
+        let tap_layers: Vec<usize> = (0..inner.layers.len()).collect();
+        let run = |inner: &mut Qwen35Inner, ids: &[i32]| -> Result<Vec<(Vec<i64>, Vec<u32>)>> {
+            reset_flat_fixture(inner);
+            for cache in inner.caches.as_ref().expect("caches") {
+                if let Qwen3_5LayerCache::FullAttention(kv) = cache {
+                    assert_eq!(
+                        kv.format(),
+                        KvFormat::Int8,
+                        "fixture caches follow the config"
+                    );
+                }
+            }
+            let stream = Stream::generation();
+            let _ctx = StreamContext::new(stream);
+            let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4, 5, 6], 0, stream)?;
+            prefill_logits.eval();
+            inner.dflash2_turn_state = Some(state);
+            let input = MxArray::from_int32(ids, &[1, ids.len() as i64])?;
+            let (logits, taps, tape) = super::super::model::forward_dflash2_with_taps(
+                inner,
+                &input,
+                &tap_layers,
+                true,
+                super::super::model::DFlash2LogitsSpan::All,
+                None,
+            )?;
+            let mut arrays = vec![&logits];
+            arrays.extend(taps.iter());
+            for layer in tape.iter().flatten() {
+                let k = &layer.kernel;
+                arrays.extend([&k.q, &k.k, &k.v, &k.g, &k.beta, &layer.qkv]);
+            }
+            let mut cache_arrays = Vec::new();
+            for cache in inner.caches.as_ref().expect("caches") {
+                if let Qwen3_5LayerCache::FullAttention(kv) = cache {
+                    let view = kv.int8_view().expect("int8 cache allocated");
+                    assert_eq!(view.len()?, 6 + ids.len() as i64);
+                    cache_arrays.push(view);
+                }
+            }
+            assert!(
+                !cache_arrays.is_empty(),
+                "the fixture has full-attention layers"
+            );
+            for view in &cache_arrays {
+                arrays.extend(view.arrays());
+            }
+            array_fingerprints(arrays)
+        };
+        for ids in [vec![5, 6, 7, 8, 9, 10, 11, 12], vec![9, 3, 14, 2, 6, 11]] {
+            Qwen35Inner::take_dflash2_compiled_test_counts();
+            inner.dflash2_compiled_verify_disabled = false;
+            let compiled = run(&mut inner, &ids)?;
+            assert_eq!(
+                Qwen35Inner::take_dflash2_compiled_test_counts().0,
+                1,
+                "the compiled int8 verify must run (rows {})",
+                ids.len()
+            );
+            assert!(
+                !inner.dflash2_compiled_verify_disabled,
+                "the int8 compiled verify must not fall back"
+            );
+            inner.dflash2_compiled_verify_disabled = true;
+            let eager = run(&mut inner, &ids)?;
+            assert_eq!(Qwen35Inner::take_dflash2_compiled_test_counts(), (0, 0));
+            assert_eq!(compiled.len(), eager.len());
+            for (index, (a, b)) in compiled.iter().zip(eager.iter()).enumerate() {
+                assert_eq!(a.0, b.0, "output {index} shape (rows {})", ids.len());
+                assert_eq!(
+                    a.1,
+                    b.1,
+                    "verify output {index} differs (rows {})",
+                    ids.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Int8 K/V through the whole retained-prefix DFlash2 trace (eight-row
+    /// verifies with every keep width, rewinds, draft-window wraps and a
+    /// one-row continuation): the compiled shapeless tape is built once per
+    /// sequence length and replays bit-identically as the int8 prefix grows.
+    #[test]
+    fn compiled_int8_verifier_state_and_continuation_repeat_for_every_keep() -> Result<()> {
+        if !crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { mlx_sys::mlx_default_device() } != 1
+        {
+            eprintln!(
+                "SKIP int8 retained-prefix verifier regression: Metal must be the default device"
+            );
+            return Ok(());
+        }
+        assert!(std::env::var_os("MLX_DISABLE_COMPILE").is_none());
+        let mut inner = tiny_int8_dflash_inner(0xDFA5_1E79);
+        for layer in &inner.layers {
+            if let super::super::decoder_layer::AttentionType::Full(attention) = &layer.attn {
+                for seq_len in [1, 8] {
+                    assert!(attention.verify_can_be_shapeless(seq_len)?);
+                }
+            }
+        }
+        Qwen35Inner::take_dflash2_compiled_test_counts();
+        for keep in 1..=8 {
+            let expected = run_retained_prefix_trace(&mut inner, keep)?;
+            assert_eq!(
+                Qwen35Inner::take_dflash2_compiled_test_counts(),
+                (5, 2 * usize::from(keep == 1)),
+                "int8 compiled verifier route: keep={keep}"
+            );
+            assert!(!inner.dflash2_compiled_verify_disabled);
+            let actual = run_retained_prefix_trace(&mut inner, keep)?;
+            assert_eq!(
+                Qwen35Inner::take_dflash2_compiled_test_counts(),
+                (5, 0),
+                "int8 compiled replay must survive a cache reset: keep={keep}"
+            );
+            assert_trace_eq(
+                &actual,
+                &expected,
+                &format!("repeated int8 retained prefix keep={keep}"),
+            );
+            // The trace's target-cache fingerprint covers int8 rows AND
+            // scales (collect_arrays includes the scale buffers).
+            let fa_layers = inner.config.full_attention_layer_count();
+            assert!(
+                expected.target_cache.len() >= 4 * fa_layers,
+                "int8 caches contribute rows and scales to the fingerprint"
+            );
+        }
+        Ok(())
+    }
+
     const GIB: u64 = 1024 * 1024 * 1024;
     const QWEN38_ROW_BYTES: u64 = 64 * 1024;
 
+    /// Qwen3.8-27B text geometry (the DFlash2 production target):
+    /// 64 layers (16 full-attention), 24 heads × 256, GDN 16 key heads /
+    /// 48 value heads × 128, vocab 248 320.
+    fn qwen38_27b_cfg() -> super::super::config::Qwen3_5Config {
+        super::super::config::Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
+            kv_format: None,
+            vocab_size: 248_320,
+            hidden_size: 5120,
+            num_layers: 64,
+            num_heads: 24,
+            num_kv_heads: 4,
+            intermediate_size: 17_408,
+            rms_norm_eps: 1e-6,
+            head_dim: 256,
+            tie_word_embeddings: false,
+            attention_bias: false,
+            max_position_embeddings: 262_144,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 48,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000_000.0,
+            paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    /// Loaded draft `block_size` for the Qwen3.8-27B DFlash2 checkpoint
+    /// (checkpoint block 8 → 7 proposals + the anchor = 8 verify rows).
+    const QWEN38_DRAFT_BLOCK: usize = 7;
+
+    #[test]
+    fn cycle_transient_estimate_matches_the_documented_terms() {
+        let cfg = qwen38_27b_cfg();
+        let rows = 8u64;
+        let logits = rows * 248_320 * 4 * 2;
+        let conv_dim = 16 * 128 * 2 + 48 * 128;
+        let tape_width = 5120 + conv_dim + 16 * 128 * 2 + 48 * 128;
+        let tapes = 64 * rows * tape_width * 2;
+        let scratch = rows * 3 * (5120 + 17_408) * 2;
+        let core = logits + tapes + scratch;
+
+        // 1 K prompt + 1 K generation: one-pass attention, no partials.
+        let short = dflash2_cycle_transient(&cfg, QWEN38_DRAFT_BLOCK, 2048);
+        assert_eq!(short.core_bytes, core);
+        assert_eq!(short.partials_bytes, 0);
+        assert_eq!(short.total(), core);
+        // Tens of MiB — same order as the measured per-cycle churn and under
+        // half the 128 MiB floor, so the floor is the short-prompt cap.
+        assert!((40 << 20) < core && core < (64 << 20), "{core}");
+        assert_eq!(
+            dflash2_decode_cache_limit(&cfg, QWEN38_DRAFT_BLOCK, 2048),
+            crate::cache_limit::DECODE_CACHE_LIMIT_FLOOR
+        );
+
+        // 6 K prompt (6219) + 128 new → 6347 keys: two-pass → 16
+        // full-attention layers × 24 heads × 8 rows × 128 partitions
+        // (ceil(6347 / 64) = 100 → next multiple of 32) × 256 × 2 B.
+        let six_k = dflash2_cycle_transient(&cfg, QWEN38_DRAFT_BLOCK, 6347);
+        assert_eq!(six_k.core_bytes, core);
+        assert_eq!(six_k.partials_bytes, 16 * 24 * rows * 128 * 256 * 2);
+        let cap = dflash2_decode_cache_limit(&cfg, QWEN38_DRAFT_BLOCK, 6347);
+        assert_eq!(cap, 2 * (core + six_k.partials_bytes));
+        // 466 MiB — the value the coordinator logged for this turn in
+        // production; above the 340 MiB the unbounded pool holds at 6 K, so
+        // the ceiling does not bind there (see `decode_cache_limit`).
+        assert_eq!(cap >> 20, 466, "{cap}");
+        // 32 K prompt (32 488) + 1024 new → 33 512 keys → 544 partitions:
+        // 1714 MiB, likewise logged in production.
+        assert_eq!(
+            dflash2_decode_cache_limit(&cfg, QWEN38_DRAFT_BLOCK, 33_512) >> 20,
+            1714
+        );
+
+        // Partition count is clamped: 1024 at huge contexts, 64 at the knee.
+        assert_eq!(
+            dflash2_cycle_transient(&cfg, QWEN38_DRAFT_BLOCK, 1 << 20).partials_bytes,
+            16 * 24 * rows * 1024 * 256 * 2
+        );
+        assert_eq!(
+            dflash2_cycle_transient(&cfg, QWEN38_DRAFT_BLOCK, 4096).partials_bytes,
+            16 * 24 * rows * 64 * 256 * 2
+        );
+        assert_eq!(
+            dflash2_cycle_transient(&cfg, QWEN38_DRAFT_BLOCK, 4095).partials_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn cycle_transient_estimate_scales_with_rows_and_layers() {
+        let cfg = qwen38_27b_cfg();
+        let one = dflash2_cycle_transient(&cfg, QWEN38_DRAFT_BLOCK, 2048).core_bytes;
+        // Twice the layers → tapes double, logits/scratch unchanged.
+        let deeper = super::super::config::Qwen3_5Config {
+            num_layers: 128,
+            ..cfg.clone()
+        };
+        let two = dflash2_cycle_transient(&deeper, QWEN38_DRAFT_BLOCK, 2048).core_bytes;
+        assert!(two > one && two < 2 * one, "{one} → {two}");
+        // Bigger block → every term grows linearly in rows.
+        let wide = dflash2_cycle_transient(&cfg, 15, 2048).core_bytes;
+        assert_eq!(wide, one * 2);
+        // Negative / zero dims are clamped, never wrap.
+        let degenerate = super::super::config::Qwen3_5Config {
+            vocab_size: -1,
+            num_layers: 0,
+            ..cfg
+        };
+        let scratch_only = dflash2_cycle_transient(&degenerate, QWEN38_DRAFT_BLOCK, 1 << 20);
+        assert_eq!(scratch_only.core_bytes, 8 * 3 * (5120 + 17_408) * 2);
+        assert_eq!(scratch_only.partials_bytes, 0, "no layers → no partials");
+    }
+
     #[test]
     fn kv_row_bytes_counts_every_full_attention_layer_and_dtype() {
-        assert_eq!(kv_row_bytes(16, 4, 256, DType::BFloat16), QWEN38_ROW_BYTES);
         assert_eq!(
-            kv_row_bytes(16, 4, 256, DType::Float32),
+            kv_row_bytes(16, 4, 256, DType::BFloat16, KvFormat::Bf16),
+            QWEN38_ROW_BYTES
+        );
+        assert_eq!(
+            kv_row_bytes(16, 4, 256, DType::Float32, KvFormat::Bf16),
             2 * QWEN38_ROW_BYTES
         );
-        assert_eq!(kv_row_bytes(0, 4, 256, DType::BFloat16), 0);
+        assert_eq!(kv_row_bytes(0, 4, 256, DType::BFloat16, KvFormat::Bf16), 0);
+        // int8: one byte per element plus one fp32 scale per row, whatever
+        // the activation dtype.
+        assert_eq!(
+            kv_row_bytes(16, 4, 256, DType::BFloat16, KvFormat::Int8),
+            16 * 2 * 4 * (256 + 4)
+        );
+        assert_eq!(
+            kv_row_bytes(16, 4, 256, DType::Float32, KvFormat::Int8),
+            kv_row_bytes(16, 4, 256, DType::BFloat16, KvFormat::Int8)
+        );
     }
 
     #[test]
@@ -1974,7 +2504,7 @@ mod tests {
                     let (path, _) = draft.propose(
                         &step.inner.embedding,
                         step.inner.lm_head.as_ref(),
-                        &step.context,
+                        &mut step.context,
                         anchor,
                         DRAFT_LEN,
                         0.0,

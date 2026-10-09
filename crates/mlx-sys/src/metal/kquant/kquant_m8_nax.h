@@ -1,0 +1,904 @@
+// M <= 32 bfloat16 K-quant matmul on the Metal 4 tensor op (NAX).
+//
+// Ported from Splash (incoai/splash, Apache-2.0; see THIRD_PARTY_NOTICES):
+// runtime/metal/kernels/common/gguf_staged.h, gguf_staged_tile.h,
+// split_reduce.h and kernels/shared/gguf_linear.metal's decode tile, with the
+// per-format decode rewritten for mlx-node's LSB-first code stream and
+// (.scales, .biases) companions (crates/mlx-core/src/utils/gguf_kquant.rs).
+//
+// One threadgroup = 2 simdgroups x 32 output columns = a 64-column tile;
+// grid (N / 64, K splits). Per 32-input step every lane dequantizes its
+// column's 32 codes to half into a double-buffered threadgroup stage (fp32
+// scale * code + bias, one rounding), then the simdgroup runs matmul2d
+// (rows x 32 x 32, A = bfloat x in device memory, B = the half stage, fp32
+// accumulate) on it while the next step's codes are already in flight. The
+// tile holds 8, 16 or 32 rows (Splash's decode tiers): the weights are
+// dequantized once whatever the row count, so M = 9..32 costs the 8-row
+// tile's weight stream plus the larger matmul. Each step's rows x 32 block
+// of x is staged next to the weights, zero past row M (ARows).
+// Splits > 1 publish fp32 partials; the last-arriving partition of a tile
+// adds them in split order and writes the bfloat16 output, so the result does
+// not depend on scheduling.
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#include <metal_stdlib>
+
+#include "kquant_mode.h"
+#include "kquant_grid.h"
+
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+namespace kq_m8 {
+
+constant constexpr ushort kCols = 32;
+constant constexpr ushort kStep = 32;
+constant constexpr ushort kTileCols = 64;
+constant constexpr ushort kThreads = 64;
+constant constexpr uint kStage = kCols * kStep;
+constant constexpr uint kTableEntries = 256;
+
+enum Format : int {
+  Q4K,
+  Q5K,
+  Q6K,
+  Q3K,
+  IQ4NL,
+  IQ4XS,
+  // The legacy expanded IQ3_S import (8-bit signed codes, KQ_INT8).
+  IQ3S8,
+  Q2K,
+  IQ2XXS,
+  IQ2XS,
+  IQ2S,
+  IQ3XXS,
+  IQ1S,
+  IQ1M,
+  IQ3S,
+  // MLX affine companions (KQ_AFFINE): 4-bit codes as Q4K's, 8-bit as
+  // IQ3S8's; the group size is the kernel's, not the format's.
+  A4,
+  A8,
+  Unsupported
+};
+
+template <Format F>
+constexpr bool is_affine() {
+  return F == A4 || F == A8;
+}
+
+// The kquant_mode.h kind of a grid format, -1 for the others.
+template <Format F>
+constexpr int grid_kind() {
+  return F == IQ2XXS ? KQ_GRID_IQ2XXS
+      : F == IQ2XS   ? KQ_GRID_IQ2XS
+      : F == IQ2S    ? KQ_GRID_IQ2S
+      : F == IQ3XXS  ? KQ_GRID_IQ3XXS
+      : F == IQ1S    ? KQ_GRID_IQ1S
+      : F == IQ1M    ? KQ_GRID_IQ1M
+      : F == IQ3S    ? KQ_GRID_IQ3S
+                     : -1;
+}
+
+template <Format F>
+constexpr bool is_grid() {
+  return grid_kind<F>() >= 0;
+}
+
+template <int group_size, int bits, int super_ratio, bool has_min, int kind>
+constexpr Format format() {
+  if (kind == KQ_AFFINE && !has_min && group_size * super_ratio == 256 &&
+      group_size % 32 == 0) {
+    return bits == 4 ? A4 : bits == 8 ? A8 : Unsupported;
+  }
+  if (group_size == 32 && super_ratio == 8 && !has_min) {
+    if (kind == KQ_GRID_IQ2XXS && bits == 1) {
+      return IQ2XXS;
+    }
+    if (kind == KQ_GRID_IQ2XS && bits == 2) {
+      return IQ2XS;
+    }
+    if (kind == KQ_GRID_IQ2S && bits == 2) {
+      return IQ2S;
+    }
+    if (kind == KQ_GRID_IQ3XXS && bits == 2) {
+      return IQ3XXS;
+    }
+    if (kind == KQ_GRID_IQ1S && bits == 1) {
+      return IQ1S;
+    }
+    if (kind == KQ_GRID_IQ1M && bits == 1) {
+      return IQ1M;
+    }
+    if (kind == KQ_GRID_IQ3S && bits == 3) {
+      return IQ3S;
+    }
+  }
+  if (group_size == 32 && super_ratio == 8 && bits == 4) {
+    if (has_min && kind == KQ_LINEAR) {
+      return Q4K;
+    }
+    if (!has_min && kind == KQ_CODEBOOK) {
+      return IQ4XS;
+    }
+  }
+  if (kind == KQ_LINEAR) {
+    if (group_size == 32 && super_ratio == 8 && bits == 5 && has_min) {
+      return Q5K;
+    }
+    if (group_size == 16 && super_ratio == 16 && bits == 6 && !has_min) {
+      return Q6K;
+    }
+    if (group_size == 16 && super_ratio == 16 && bits == 3 && !has_min) {
+      return Q3K;
+    }
+    if (group_size == 16 && super_ratio == 16 && bits == 2 && has_min) {
+      return Q2K;
+    }
+  }
+  if (group_size == 32 && super_ratio == 1 && bits == 4 && !has_min &&
+      kind == KQ_CODEBOOK) {
+    return IQ4NL;
+  }
+  if (group_size == 32 && super_ratio == 8 && bits == 8 && !has_min &&
+      kind == KQ_INT8) {
+    return IQ3S8;
+  }
+  return Unsupported;
+}
+
+// Bytes of sub-scale companions one 256-value super-block holds in `.scales`:
+// super_ratio * scale_bytes_per_group (kquant_mode.h). IQ4_NL has none per
+// super-block (one byte per 32-value block instead).
+template <Format F>
+constexpr uint sb_scale_bytes() {
+  if constexpr (is_grid<F>()) {
+    return 8 * kq_scale_bytes_per_group<false, grid_kind<F>()>();
+  }
+  return F == Q2K ? 32 : (F == IQ4XS || F == IQ3S8 || F == IQ4NL ? 8 : 16);
+}
+
+constant constexpr int8_t kIQ4[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// .s / .m of the first 16 codes of a unit (.x) and of the last 16 (.y); equal
+// for the 32-code groups. Same operand order as KQScales (mlx_kquant.cpp).
+struct Coef {
+  float2 s;
+  float2 m;
+};
+
+// A unit is 32 consecutive k of one weight row: `bits` uint32 words. `base`
+// is the row's unit 0 and `stride` the words between its units: `bits`
+// row-major, 64 * bits in the Tiled64 layout (mlx_kquant.h), where the 64
+// rows of a tile interleave per unit.
+template <Format F>
+struct Codes;
+
+template <>
+struct Codes<Q4K> {
+  typedef uint4 W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return *reinterpret_cast<const device uint4*>(base + u * stride);
+  }
+};
+template <>
+struct Codes<IQ4XS> {
+  typedef uint4 W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return Codes<Q4K>::load(base, u, stride);
+  }
+};
+template <>
+struct Codes<IQ4NL> {
+  typedef uint4 W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return Codes<Q4K>::load(base, u, stride);
+  }
+};
+
+template <>
+struct Codes<Q5K> {
+  struct W {
+    uint4 a;
+    uint b;
+  };
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    const device uint32_t* s = base + u * stride;
+    return {uint4(s[0], s[1], s[2], s[3]), s[4]};
+  }
+};
+
+template <>
+struct Codes<Q6K> {
+  struct W {
+    uint4 a;
+    uint2 b;
+  };
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    const device uint2* s =
+        reinterpret_cast<const device uint2*>(base + u * stride);
+    return {uint4(s[0], s[1]), s[2]};
+  }
+};
+
+template <>
+struct Codes<Q3K> {
+  struct W {
+    uint2 a;
+    uint b;
+  };
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    const device uint32_t* s = base + u * stride;
+    return {uint2(s[0], s[1]), s[2]};
+  }
+};
+
+template <>
+struct Codes<IQ3S8> {
+  struct W {
+    uint4 a;
+    uint4 b;
+  };
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    const device uint4* s =
+        reinterpret_cast<const device uint4*>(base + u * stride);
+    return {s[0], s[1]};
+  }
+};
+
+template <>
+struct Codes<A4> {
+  typedef uint4 W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return Codes<Q4K>::load(base, u, stride);
+  }
+};
+template <>
+struct Codes<A8> {
+  typedef Codes<IQ3S8>::W W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return Codes<IQ3S8>::load(base, u, stride);
+  }
+};
+
+template <>
+struct Codes<Q2K> {
+  // 32 codes x 2 bits: one 8-byte unit (Splash FmtQ2K's Payload).
+  typedef uint2 W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return *reinterpret_cast<const device uint2*>(base + u * stride);
+  }
+};
+
+// The grid formats: the unit's one to three `.weight` words; the companion
+// bytes (`.sc`) are filled in by CoefCursor::companion, which knows the
+// `.scales` layout (kquant_grid.h lists the per-format fields).
+#define KQ_M8_GRID_CODES(F)                                              \
+  template <>                                                            \
+  struct Codes<F> {                                                      \
+    typedef KQGridUnit W;                                                \
+    static W load(const device uint32_t* base, uint u, uint stride) {    \
+      const device uint32_t* s = base + u * stride;                      \
+      W w;                                                               \
+      w.w0 = s[0];                                                       \
+      w.w1 = kq_grid_words<grid_kind<F>()>() > 1 ? s[1] : 0u;            \
+      w.w2 = kq_grid_words<grid_kind<F>()>() > 2 ? s[2] : 0u;            \
+      w.sc = 0u;                                                         \
+      return w;                                                          \
+    }                                                                    \
+  };
+KQ_M8_GRID_CODES(IQ2XXS)
+KQ_M8_GRID_CODES(IQ2XS)
+KQ_M8_GRID_CODES(IQ2S)
+KQ_M8_GRID_CODES(IQ3XXS)
+KQ_M8_GRID_CODES(IQ1S)
+KQ_M8_GRID_CODES(IQ1M)
+KQ_M8_GRID_CODES(IQ3S)
+#undef KQ_M8_GRID_CODES
+
+constant constexpr uint kTileRows = 64;
+
+// Row n's unit 0 and unit stride (words) in either layout.
+template <int bits, bool tiled>
+METAL_FUNC const device uint32_t* unit_base(
+    const device uint32_t* w,
+    uint n,
+    uint K) {
+  if (tiled) {
+    return w + (size_t(n / kTileRows) * (K / 32) * kTileRows + n % kTileRows) *
+        bits;
+  }
+  return w + size_t(n) * (K * bits / 32);
+}
+template <int bits, bool tiled>
+constexpr uint unit_stride() {
+  return tiled ? kTileRows * bits : bits;
+}
+
+// Element e of row n's per-unit or per-super-block companion of `per`
+// entries, in either layout: row-major [N][entries][per], tiled
+// [N/64][entries][64][per].
+template <bool tiled>
+METAL_FUNC size_t companion_index(
+    uint n,
+    uint entries_per_row,
+    uint e,
+    uint per) {
+  if (tiled) {
+    return (size_t(n / kTileRows) * entries_per_row * kTileRows + e * kTileRows +
+            n % kTileRows) *
+        per;
+  }
+  return size_t(n) * entries_per_row * per + size_t(e) * per;
+}
+
+// Row n's (scale, bias) coefficients per unit. A super-block's sub-scales
+// are contiguous bytes in both layouts (8 or 16 (sc, m) pairs, 16 int8 or 8
+// int8: sb_scale_bytes) and its float16 super-scales one half2 / half, so
+// both are loaded once per super-block and decoded per unit; IQ4_NL has one
+// group per super-block and loads per unit. The affine formats read the
+// unit's group's bfloat16 scale and bias (one 16-bit load each, `group_size`
+// values per group). Same operations and order as KQScales (mlx_kquant.cpp);
+// `scale_shift` applies to every scale as there.
+template <Format F, bool tiled, int scale_shift = 0, int group_size = 32>
+struct CoefCursor {
+  const device uint8_t* scales;
+  const device half* biases;
+  uint n;
+  uint K;
+  uint sb = ~0u;
+  // The super-block's sub-scale bytes: sc the first 16, sc2 the next 16
+  // (Q2K only).
+  uint4 sc = uint4(0u);
+  uint4 sc2 = uint4(0u);
+  half2 d = half2(0.0h);
+
+  CoefCursor(
+      const device uint8_t* scales_,
+      const device half* biases_,
+      uint n_,
+      uint K_)
+      : scales(scales_), biases(biases_), n(n_), K(K_) {}
+
+  // Grid formats: the unit's companion bytes, packed little-endian (the
+  // super-block's 8 companion runs are contiguous in both layouts).
+  uint companion(uint u) const {
+    static_assert(is_grid<F>(), "grid formats only");
+    constexpr uint per = sb_scale_bytes<F>();
+    return kq_grid_companion<grid_kind<F>()>(
+        scales + companion_index<tiled>(n, K / 256, u >> 3, per) +
+        (u & 7u) * (per / 8));
+  }
+
+  Coef at(uint u) {
+    Coef c;
+    if constexpr (is_affine<F>()) {
+      // The super-block's sr bfloat16 scales and sr bfloat16 biases (sr 4
+      // or 8: one 8- or 16-byte load each), loaded once per super-block;
+      // unit u's group is entry (u * 32 / group_size) % sr of both.
+      constexpr uint sr = 256 / group_size;
+      static_assert(sr == 4 || sr == 8, "an affine super-block is 4 or 8 groups");
+      if ((u >> 3) != sb) {
+        sb = u >> 3;
+        const device uint8_t* s = scales + companion_index<tiled>(n, K / 256, sb, 2 * sr);
+        const device uint8_t* b = reinterpret_cast<const device uint8_t*>(
+            biases + companion_index<tiled>(n, K / 256, sb, sr));
+        if constexpr (sr == 8) {
+          sc = *reinterpret_cast<const device uint4*>(s);
+          sc2 = *reinterpret_cast<const device uint4*>(b);
+        } else {
+          sc = uint4(*reinterpret_cast<const device uint2*>(s), 0u, 0u);
+          sc2 = uint4(*reinterpret_cast<const device uint2*>(b), 0u, 0u);
+        }
+      }
+      const uint e = ((u * 32) / group_size) % sr;
+      c.s = float2(kq_bf16_to_float(uint16_t((sc[e >> 1] >> (16 * (e & 1))) & 0xFFFFu)));
+      c.m = float2(kq_bf16_to_float(uint16_t((sc2[e >> 1] >> (16 * (e & 1))) & 0xFFFFu)));
+      return c;
+    }
+    if constexpr (is_grid<F>()) {
+      // The super-block d alone; the per-unit scale lives in the companion
+      // bytes and kq_grid_decode8 applies it.
+      if ((u >> 3) != sb) {
+        sb = u >> 3;
+        d = half2(biases[companion_index<tiled>(n, K / 256, sb, 1)], 0.0h);
+      }
+      c.s = float2(float(d.x));
+      c.m = float2(0.0f);
+      return c;
+    }
+    if constexpr (F == IQ4NL) {
+      const float dd = float(biases[companion_index<tiled>(n, K / 32, u, 1)]);
+      c.s = float2(kq_shift_scale<scale_shift>(
+          dd * float(as_type<char>(scales[companion_index<tiled>(n, K / 32, u, 1)]))));
+      c.m = float2(0.0f);
+      return c;
+    }
+    if ((u >> 3) != sb) {
+      sb = u >> 3;
+      if constexpr (F == Q4K || F == Q5K) {
+        d = *reinterpret_cast<const device half2*>(
+            biases + companion_index<tiled>(n, K / 256, sb, 2));
+        sc = *reinterpret_cast<const device uint4*>(
+            scales + companion_index<tiled>(n, K / 256, sb, 16));
+      } else if constexpr (F == Q2K) {
+        // (d, dmin) and 16 (sc, m) byte pairs: 32 bytes, two uint4.
+        d = *reinterpret_cast<const device half2*>(
+            biases + companion_index<tiled>(n, K / 256, sb, 2));
+        const device uint4* p = reinterpret_cast<const device uint4*>(
+            scales + companion_index<tiled>(n, K / 256, sb, 32));
+        sc = p[0];
+        sc2 = p[1];
+      } else if constexpr (F == Q6K || F == Q3K) {
+        d = half2(biases[companion_index<tiled>(n, K / 256, sb, 1)], 0.0h);
+        sc = *reinterpret_cast<const device uint4*>(
+            scales + companion_index<tiled>(n, K / 256, sb, 16));
+      } else {
+        d = half2(biases[companion_index<tiled>(n, K / 256, sb, 1)], 0.0h);
+        sc = uint4(
+            *reinterpret_cast<const device uint2*>(
+                scales + companion_index<tiled>(n, K / 256, sb, 8)),
+            0u,
+            0u);
+      }
+    }
+    const uint j = u & 7u;
+    if constexpr (F == Q4K || F == Q5K) {
+      const uint sm = (sc[j >> 1] >> (16 * (j & 1))) & 0xFFFFu;
+      c.s = float2(kq_shift_scale<scale_shift>(float(d.x) * float(sm & 0xFFu)));
+      c.m = float2(-(float(d.y) * float(sm >> 8)));
+    } else if constexpr (F == Q2K) {
+      // Two 16-groups per unit: word j holds (sc, m) of group 2j in its low
+      // half and of group 2j + 1 in its high half (Splash FmtQ2K::coef).
+      const uint pairs = j < 4 ? sc[j] : sc2[j - 4];
+      const float dd = float(d.x);
+      const float mm = float(d.y);
+      c.s = float2(
+          kq_shift_scale<scale_shift>(dd * float(pairs & 0xFFu)),
+          kq_shift_scale<scale_shift>(dd * float((pairs >> 16) & 0xFFu)));
+      c.m = float2(
+          -(mm * float((pairs >> 8) & 0xFFu)), -(mm * float(pairs >> 24)));
+    } else if constexpr (F == Q6K || F == Q3K) {
+      // Two 16-groups per unit: int8 scales 2j, 2j + 1.
+      const uint pair = (sc[j >> 1] >> (16 * (j & 1))) & 0xFFFFu;
+      const float dd = float(d.x);
+      c.s = float2(
+          kq_shift_scale<scale_shift>(dd * float(as_type<char>(uchar(pair & 0xFFu)))),
+          kq_shift_scale<scale_shift>(dd * float(as_type<char>(uchar(pair >> 8)))));
+      c.m = float(-(F == Q6K ? 32 : 4)) * c.s;
+    } else {
+      const uint byte = (sc[j >> 2] >> (8 * (j & 3))) & 0xFFu;
+      const float dd = float(d.x);
+      c.s = float2(kq_shift_scale<scale_shift>(dd * float(as_type<char>(uchar(byte)))));
+      c.m = F == IQ3S8 ? float(-128) * c.s : float2(0.0f);
+    }
+    return c;
+  }
+};
+
+// Codes 8j..8j+7 of a unit as bytes: the even ones in .x, the odd in .y.
+template <Format F>
+METAL_FUNC uint2 bytes8(typename Codes<F>::W w, ushort j);
+
+template <>
+METAL_FUNC uint2 bytes8<Q4K>(uint4 w, ushort j) {
+  const uint v = w[j];
+  return uint2(v & 0x0F0F0F0Fu, (v >> 4) & 0x0F0F0F0Fu);
+}
+
+template <>
+METAL_FUNC uint2 bytes8<Q5K>(Codes<Q5K>::W w, ushort j) {
+  // Codes 8j.. start at bit 40j: word j, shift 8j.
+  const uint lo0 = w.a[j];
+  const uint hi0 = j < 3 ? w.a[(j + 1) & 3] : w.b;
+  const uint sh = 8 * j;
+  const uint lo = sh ? (lo0 >> sh) | (hi0 << (32 - sh)) : lo0;
+  const uint hi = hi0 >> sh;
+  const uint even = (lo & 0x1Fu) | ((lo >> 2) & 0x1F00u) |
+      ((lo >> 4) & 0x1F0000u) | ((lo >> 6) & 0x03000000u) | ((hi & 7u) << 26);
+  const uint odd = ((lo >> 5) & 0x1Fu) | ((lo >> 7) & 0x1F00u) |
+      ((lo >> 9) & 0x1F0000u) | ((hi << 21) & 0x1F000000u);
+  return uint2(even, odd);
+}
+
+template <>
+METAL_FUNC uint2 bytes8<Q6K>(Codes<Q6K>::W w, ushort j) {
+  // Codes 8j.. start at bit 48j: words {0, 1}, {1, 2}, {3, 4}, {4, 5}.
+  uint lo, hi;
+  if (j == 0) {
+    lo = w.a.x;
+    hi = w.a.y;
+  } else if (j == 1) {
+    lo = (w.a.y >> 16) | (w.a.z << 16);
+    hi = w.a.z >> 16;
+  } else if (j == 2) {
+    lo = w.a.w;
+    hi = w.b.x;
+  } else {
+    lo = (w.b.x >> 16) | (w.b.y << 16);
+    hi = w.b.y >> 16;
+  }
+  const uint even = (lo & 0x3Fu) | ((lo >> 4) & 0x3F00u) |
+      ((lo >> 8) & 0x3F0000u) | ((hi << 20) & 0x3F000000u);
+  const uint odd = ((lo >> 6) & 0x3Fu) | ((lo >> 10) & 0x3F00u) |
+      ((lo >> 14) & 0x030000u) | ((hi & 15u) << 18) |
+      ((hi << 14) & 0x3F000000u);
+  return uint2(even, odd);
+}
+
+template <>
+METAL_FUNC uint2 bytes8<Q3K>(Codes<Q3K>::W w, ushort j) {
+  // Codes 8j.. start at bit 24j.
+  uint v;
+  if (j == 0) {
+    v = w.a.x;
+  } else if (j == 1) {
+    v = (w.a.x >> 24) | (w.a.y << 8);
+  } else if (j == 2) {
+    v = (w.a.y >> 16) | (w.b << 16);
+  } else {
+    v = w.b >> 8;
+  }
+  const uint even = (v & 7u) | ((v << 2) & 0x700u) | ((v << 4) & 0x70000u) |
+      ((v << 6) & 0x7000000u);
+  const uint odd = ((v >> 3) & 7u) | ((v >> 1) & 0x700u) |
+      ((v << 1) & 0x70000u) | ((v << 3) & 0x7000000u);
+  return uint2(even, odd);
+}
+
+template <>
+METAL_FUNC uint2 bytes8<Q2K>(uint2 w, ushort j) {
+  // Codes 8j.. are the 16 bits at 16j: code i at bit 2i of v (Splash
+  // quant_spread2, split into the even / odd byte lanes).
+  const uint v = (w[j >> 1] >> (16 * (j & 1))) & 0xFFFFu;
+  const uint even = (v & 3u) | ((v << 4) & 0x300u) | ((v << 8) & 0x30000u) |
+      ((v << 12) & 0x3000000u);
+  const uint odd = ((v >> 2) & 3u) | ((v << 2) & 0x300u) |
+      ((v << 6) & 0x30000u) | ((v << 10) & 0x3000000u);
+  return uint2(even, odd);
+}
+
+template <>
+METAL_FUNC uint2 bytes8<IQ3S8>(Codes<IQ3S8>::W w, ushort j) {
+  const uint4 h = j < 2 ? w.a : w.b;
+  const uint w0 = h[2 * (j & 1)];
+  const uint w1 = h[2 * (j & 1) + 1];
+  const uint even = (w0 & 0xFFu) | ((w0 >> 8) & 0xFF00u) |
+      ((w1 << 16) & 0xFF0000u) | ((w1 << 8) & 0xFF000000u);
+  const uint odd = ((w0 >> 8) & 0xFFu) | ((w0 >> 16) & 0xFF00u) |
+      ((w1 << 8) & 0xFF0000u) | (w1 & 0xFF000000u);
+  return uint2(even, odd);
+}
+
+template <>
+METAL_FUNC uint2 bytes8<A4>(uint4 w, ushort j) {
+  return bytes8<Q4K>(w, j);
+}
+
+template <>
+METAL_FUNC uint2 bytes8<A8>(Codes<A8>::W w, ushort j) {
+  return bytes8<IQ3S8>(w, j);
+}
+
+// One lane's unit as 32 half values at dst, each rounded once from fp32.
+// Threadgroup entries of a grid format's table (1 for the unused width and
+// for the other formats).
+template <Format F>
+constexpr uint grid_tl64() {
+  return is_grid<F>() && kq_grid_entries_are_u64<grid_kind<F>()>()
+      ? kq_grid_entries<grid_kind<F>()>()
+      : 1u;
+}
+template <Format F>
+constexpr uint grid_tl32() {
+  return is_grid<F>() && !kq_grid_entries_are_u64<grid_kind<F>()>()
+      ? kq_grid_entries<grid_kind<F>()>()
+      : 1u;
+}
+
+template <Format F, int scale_shift>
+METAL_FUNC void stage32(
+    typename Codes<F>::W w,
+    Coef c,
+    threadgroup const half2* tl,
+    threadgroup half* dst,
+    KQGridTgTables grid) {
+  if constexpr (is_grid<F>()) {
+    // Splash's QuantGrid arm of dequant32: grid magnitude times the group
+    // scale, then the sign, each value rounded once to half. The grid is
+    // read from the threadgroup copy: against the constant tables it
+    // measured 1.8x (IQ2_XXS, 0.219 -> 0.123 ms), 2.1x (IQ2_S) and 2.7x
+    // (IQ1_M) faster on the tiled Qwen3.8 shapes, the lanes' divergent
+    // indices serializing in the constant cache.
+    float v[kStep];
+    kq_grid_decode32<grid_kind<F>(), scale_shift>(w, c.s.x, v, grid);
+#pragma unroll
+    for (ushort j = 0; j < 4; ++j) {
+      *reinterpret_cast<threadgroup half4*>(dst + 8 * j) =
+          half4(v[8 * j], v[8 * j + 1], v[8 * j + 2], v[8 * j + 3]);
+      *reinterpret_cast<threadgroup half4*>(dst + 8 * j + 4) =
+          half4(v[8 * j + 4], v[8 * j + 5], v[8 * j + 6], v[8 * j + 7]);
+    }
+  } else if constexpr (F == IQ4XS || F == IQ4NL) {
+    const float s = c.s.x;
+#pragma unroll
+    for (ushort j = 0; j < 4; ++j) {
+      const uchar4 b = as_type<uchar4>(w[j]);
+      const half2 v0 = half2(float2(tl[b.x]) * s);
+      const half2 v1 = half2(float2(tl[b.y]) * s);
+      const half2 v2 = half2(float2(tl[b.z]) * s);
+      const half2 v3 = half2(float2(tl[b.w]) * s);
+      *reinterpret_cast<threadgroup half4*>(dst + 8 * j) = half4(v0, v1);
+      *reinterpret_cast<threadgroup half4*>(dst + 8 * j + 4) = half4(v2, v3);
+    }
+  } else {
+#pragma unroll
+    for (ushort j = 0; j < 4; ++j) {
+      const uint2 q = bytes8<F>(w, j);
+      const float s = j < 2 ? c.s.x : c.s.y;
+      const float m = j < 2 ? c.m.x : c.m.y;
+      const half4 e = half4(fma(float4(as_type<uchar4>(q.x)), float4(s), float4(m)));
+      const half4 o = half4(fma(float4(as_type<uchar4>(q.y)), float4(s), float4(m)));
+      *reinterpret_cast<threadgroup half4*>(dst + 8 * j) = half4(e.x, o.x, e.y, o.y);
+      *reinterpret_cast<threadgroup half4*>(dst + 8 * j + 4) = half4(e.z, o.z, e.w, o.w);
+    }
+  }
+}
+
+// --- split-K reduction (Splash split_reduce.h) ---------------------------
+
+// True in every thread of the threadgroup that arrives last at `counter`.
+METAL_FUNC bool split_arrive_last(
+    device atomic_uint* counter,
+    uint splits,
+    uint thread_index,
+    threadgroup uint* arrival) {
+  threadgroup_barrier(mem_flags::mem_device);
+  if (thread_index == 0) {
+    atomic_thread_fence(
+        mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    *arrival = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    atomic_thread_fence(
+        mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+  return *arrival == splits - 1;
+}
+
+METAL_FUNC void split_release(device atomic_uint* counter, uint thread_index) {
+  if (thread_index == 0) {
+    atomic_store_explicit(counter, 0u, memory_order_relaxed);
+  }
+}
+
+// One step of x, the threadgroup's shared A operand: the rows x kStep
+// bfloat16 block at input `k0` as rows * 4 chunks of 8 values (one uint4),
+// chunk c = thread + 64 i being row c / 4, values (c % 4) * 8..; zeros for
+// rows past M. Staged in threadgroup memory so the tensor op reads a whole
+// tile whatever M is (a device tensor whose extent is M < rows measured
+// 1.1-5x slower at some (M, shape) pairs, and reading rows past M from
+// device memory would read past x), and staged once per threadgroup: the
+// two simdgroups share the rows, and the 32-row tier read per simdgroup
+// measured 1.7x the 16-row tier's time on the wide-N shapes (x is
+// L2-resident; its re-reads outran the weight stream).
+template <int rows, typename T>
+struct ARows {
+  static_assert(rows % 8 == 0 && rows <= 32, "8-row blocks, one uint4 per chunk");
+  static constexpr constant ushort kChunks = rows * 4;
+  static constexpr constant ushort kPerThread = (kChunks + kThreads - 1) / kThreads;
+  uint4 v[kPerThread];
+
+  METAL_FUNC static ARows load(
+      const device T* x, uint K, uint M, uint k0, uint tid) {
+    ARows a;
+#pragma unroll
+    for (ushort i = 0; i < kPerThread; ++i) {
+      const uint c = tid + kThreads * i;
+      const uint row = c / 4;
+      a.v[i] = c < kChunks && row < M
+          ? *reinterpret_cast<const device uint4*>(
+                x + size_t(row) * K + k0 + (c % 4) * 8)
+          : uint4(0);
+    }
+    return a;
+  }
+
+  // Row-major [rows][kStep] at dst.
+  METAL_FUNC void store(threadgroup T* dst, uint tid) const {
+#pragma unroll
+    for (ushort i = 0; i < kPerThread; ++i) {
+      const uint c = tid + kThreads * i;
+      if (c < kChunks) {
+        *reinterpret_cast<threadgroup uint4*>(dst + (c / 4) * kStep + (c % 4) * 8) =
+            v[i];
+      }
+    }
+  }
+};
+
+} // namespace kq_m8
+
+// Grid (N / 64, splits) of 64 threads. x is [M][K] bfloat16 with M <= rows,
+// y [M][N]; partials [splits][rows][N] fp32 and counters [N / 64] (zero
+// before and after each dispatch) are read only when splits > 1. `tiled`
+// reads the Tiled64 layout: a threadgroup's 64 columns are one tile, so each
+// step's 64 code units are one contiguous 64 * bits * 4-byte run. The
+// arithmetic and its order are the same, so the two layouts give identical
+// bits.
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int super_ratio,
+    bool has_min,
+    int kind,
+    int scale_shift,
+    bool tiled = false,
+    int rows = 8>
+[[kernel, max_total_threads_per_threadgroup(64)]] void kquant_qmm_m8_nax(
+    const device uint32_t* w [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device half* biases [[buffer(2)]],
+    device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    device coherent(device) float* partials [[buffer(5)]],
+    device atomic_uint* counters [[buffer(6)]],
+    const constant int& in_vec_size [[buffer(7)]],
+    const constant int& out_vec_size [[buffer(8)]],
+    const constant int& num_splits [[buffer(9)]],
+    const constant int& num_rows [[buffer(10)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  using namespace kq_m8;
+  constexpr ushort kRows = rows;
+  static_assert(rows == 8 || rows == 16 || rows == 32, "Splash's decode tiers");
+  constexpr Format F = format<group_size, bits, super_ratio, has_min, kind>();
+  static_assert(F != Unsupported, "no M = 8 NAX decode for this mode");
+  static_assert(
+      is_affine<F>() ||
+          sb_scale_bytes<F>() ==
+              (F == IQ4NL ? 8 : super_ratio * kq_scale_bytes_per_group<has_min, kind>()),
+      "the super-block companion stride must match kquant_mode.h");
+  static_assert(is_same_v<T, bfloat>, "the tensor-op A operand is bfloat16");
+  constexpr bool codebook = F == IQ4XS || F == IQ4NL;
+  typedef typename Codes<F>::W W;
+
+  threadgroup half stage[2 * 2 * kStage];
+  threadgroup T astage[2 * kRows * kStep];
+  threadgroup half2 tl[codebook ? kTableEntries : 1];
+  threadgroup uint64_t grid64[grid_tl64<F>()];
+  threadgroup uint32_t grid32[grid_tl32<F>()];
+  threadgroup uint arrival;
+
+  const uint tid = simd_group * 32 + simd_lane;
+  if constexpr (codebook) {
+    for (uint i = tid; i < kTableEntries; i += kThreads) {
+      tl[i] = half2(float(kIQ4[i & 15]), float(kIQ4[i >> 4]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if constexpr (is_grid<F>()) {
+    kq_grid_stage_table<grid_kind<F>()>(grid64, grid32, tid, kThreads);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const KQGridTgTables grid{grid64, grid32};
+
+  const uint K = in_vec_size;
+  const uint N = out_vec_size;
+  const uint M = num_rows;
+  const uint splits = num_splits;
+  const uint per = (K / kStep) / splits;
+  const uint step_begin = group.y * per;
+  const uint step_end = step_begin + per;
+  const uint column0 = group.x * kTileCols + simd_group * kCols;
+  const uint n = column0 + simd_lane;
+  threadgroup half* my = stage + simd_group * 2 * kStage;
+
+  constexpr auto desc = matmul2d_descriptor(
+      kRows, kCols, kStep, false, true, false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<1>> op;
+  tensor<threadgroup T, dextents<int, 2>, tensor_inline> at0(
+      astage, dextents<int, 2>{kStep, kRows}, array<int, 2>{1, kStep});
+  tensor<threadgroup T, dextents<int, 2>, tensor_inline> at1(
+      astage + kRows * kStep, dextents<int, 2>{kStep, kRows},
+      array<int, 2>{1, kStep});
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(
+      my, dextents<int, 2>{kStep, kCols}, array<int, 2>{1, kStep});
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(
+      my + kStage, dextents<int, 2>{kStep, kCols}, array<int, 2>{1, kStep});
+  auto a0 = at0.template slice<kStep, kRows>(0, 0);
+  auto a1 = at1.template slice<kStep, kRows>(0, 0);
+  auto b0 = bt0.template slice<kStep, kCols>(0, 0);
+  auto b1 = bt1.template slice<kStep, kCols>(0, 0);
+  // Zeroed here, not in a helper: a returned initialized cooperative tensor
+  // loses its values (Splash gguf_staged_tile.h).
+  auto acc = op.template get_destination_cooperative_tensor<
+      decltype(a0), decltype(b0), float>();
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    acc[i] = 0.0f;
+  }
+
+  // The codes and coefficients of a step are loaded during the step before.
+  // (Deeper prefetch was measured: 4 steps in flight cost 5-10% on the tiled
+  // Qwen3.8 shapes, from the extra registers.)
+  const device uint32_t* row = unit_base<bits, tiled>(w, n, K);
+  constexpr uint stride = unit_stride<bits, tiled>();
+  CoefCursor<F, tiled, scale_shift, group_size> coefs(scales, biases, n, K);
+  W cur = Codes<F>::load(row, step_begin, stride);
+  Coef cc = coefs.at(step_begin);
+  if constexpr (is_grid<F>()) {
+    cur.sc = coefs.companion(step_begin);
+  }
+  ARows<rows, T> xa = ARows<rows, T>::load(x, K, M, step_begin * kStep, tid);
+  for (uint step = step_begin; step < step_end; ++step) {
+    threadgroup half* buf = my + (step & 1) * kStage;
+    stage32<F, scale_shift>(cur, cc, tl, buf + simd_lane * kStep, grid);
+    xa.store(astage + (step & 1) * kRows * kStep, tid);
+    // The A stage is the threadgroup's, so the step barrier is too.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (step + 1 < step_end) {
+      cur = Codes<F>::load(row, step + 1, stride);
+      cc = coefs.at(step + 1);
+      if constexpr (is_grid<F>()) {
+        cur.sc = coefs.companion(step + 1);
+      }
+      xa = ARows<rows, T>::load(x, K, M, (step + 1) * kStep, tid);
+    }
+    if (step & 1) {
+      op.run(a1, b1, acc);
+    } else {
+      op.run(a0, b0, acc);
+    }
+  }
+
+  // index[0] is the column, index[1] the row.
+  if (splits == 1) {
+#pragma unroll
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+      if (!acc.is_valid_element(i)) {
+        continue;
+      }
+      const auto idx = acc.get_multidimensional_index(i);
+      if (uint(idx[1]) < M) {
+        y[uint(idx[1]) * N + column0 + uint(idx[0])] = T(float(acc[i]));
+      }
+    }
+    return;
+  }
+  const uint split = group.y;
+  const auto at = [&](uint s, uint row_, uint col) {
+    return (size_t(s) * kRows + row_) * N + column0 + col;
+  };
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i)) {
+      continue;
+    }
+    const auto idx = acc.get_multidimensional_index(i);
+    partials[at(split, uint(idx[1]), uint(idx[0]))] = float(acc[i]);
+  }
+  if (!split_arrive_last(counters + group.x, splits, tid, &arrival)) {
+    return;
+  }
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i)) {
+      continue;
+    }
+    const auto idx = acc.get_multidimensional_index(i);
+    const uint row_ = uint(idx[1]);
+    const uint col = uint(idx[0]);
+    if (row_ >= M) {
+      continue;
+    }
+    float total = 0.0f;
+    for (uint s = 0; s < splits; ++s) {
+      total += s == split ? float(acc[i]) : partials[at(s, row_, col)];
+    }
+    y[row_ * N + column0 + col] = T(total);
+  }
+  split_release(counters + group.x, tid);
+}

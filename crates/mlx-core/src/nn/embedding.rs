@@ -868,7 +868,7 @@ mod tests {
         );
     }
 
-    /// PACKED q4k/q6k embeddings (the GGUF K-quant import path): a repacked
+    /// PACKED q4k/q6k/q2k/iq2xxs/iq1m embeddings (the GGUF K-quant import path): a repacked
     /// `token_embd` group loaded via `load_quantized_packed` must
     /// gather-then-dequant in `forward` and quantized-matmul in `as_linear`,
     /// both returning finite values that match a reference `mlx_dequantize` in
@@ -876,25 +876,38 @@ mod tests {
     /// consumers used to hardcode "affine", which cannot decode a K-quant group
     /// (its integer `.scales` fail affine's floating-scale check), so a K-quant
     /// embedding could not load end-to-end. Q4_K is the exact UD-Q4_K_XL input
-    /// embedding format; Q6_K covers the tied-head-capable symmetric layout.
-    /// Both groups are built through the production repacker from synthetic
-    /// ggml super-block bytes, so the whole import→decode chain is exercised.
+    /// embedding format; Q6_K covers the tied-head-capable symmetric layout;
+    /// IQ2_XXS, IQ1_M and IQ3_S cover the grid formats (the Unsloth UD-IQ*
+    /// mixes' `token_embd`), whose `.weight` is native grid-index words
+    /// (IQ3_S: three words per unit, the third its sign bits).
+    /// Q2_K is the 2-bit mix's `token_embd` candidate (two 16-value groups per
+    /// 32-code unit, (sc, m) nibble pairs). All groups are built through the
+    /// production repacker from synthetic ggml super-block bytes, so the whole
+    /// import→decode chain is exercised.
     #[test]
-    fn packed_q4k_and_q6k_forward_and_as_linear_match_reference_dequant() {
+    fn packed_q4k_q6k_q2k_and_grid_forward_and_as_linear_match_reference_dequant() {
         use crate::utils::gguf_kquant::{KQuantFormat, KQuantScales, QK_K, repack_kquant};
 
         let vocab = 6i64;
         let hidden = 256i64; // one K-quant super-block per row
         let k = hidden as usize;
         let rows = vocab as usize;
-        for (fmt, group_size, bits) in [(KQuantFormat::Q4K, 32, 4), (KQuantFormat::Q6K, 16, 6)] {
+        for (fmt, group_size, bits) in [
+            (KQuantFormat::Q4K, 32, 4),
+            (KQuantFormat::Q6K, 16, 6),
+            (KQuantFormat::Q2K, 16, 2),
+            (KQuantFormat::IQ2XXS, 32, 1),
+            (KQuantFormat::IQ1M, 32, 1),
+            (KQuantFormat::IQ3S, 32, 3),
+        ] {
             let mode = fmt.mlx_mode();
             let block_bytes = fmt.block_bytes();
             let sb_per_row = k / QK_K;
 
             // A fixed-seed LCG fills the code planes and sub-scales. Force
             // each floating super-block scale to a small finite value: Q4_K
-            // stores `(d,dmin)` at bytes 0..4, while Q6_K stores `d` at 208.
+            // stores `(d,dmin)` at bytes 0..4, Q6_K stores `d` at 208 and
+            // Q2_K `(d,dmin)` at 80..84.
             let mut blocks: Vec<u8> = {
                 let mut state = 0xC0FFEEu64 ^ fmt.gguf_type() as u64;
                 (0..rows * sb_per_row * block_bytes)
@@ -918,6 +931,26 @@ mod tests {
                     KQuantFormat::Q6K => {
                         blocks[base + 208] = 0x00;
                         blocks[base + 209] = 0x34; // d = f16 0.25
+                    }
+                    KQuantFormat::Q2K => {
+                        blocks[base + 80] = 0x00;
+                        blocks[base + 81] = 0x34; // d = f16 0.25
+                        blocks[base + 82] = 0x00;
+                        blocks[base + 83] = 0x30; // dmin = f16 0.125
+                    }
+                    KQuantFormat::IQ2XXS | KQuantFormat::IQ3S => {
+                        blocks[base] = 0x00;
+                        blocks[base + 1] = 0x34; // d = f16 0.25
+                    }
+                    KQuantFormat::IQ1M => {
+                        // d = f16 0.25 (0x3400) spread over the top nibbles
+                        // of the four scale halfwords at 48..56.
+                        for i in 0..4 {
+                            let at = base + 48 + 2 * i;
+                            let sc = u16::from_le_bytes([blocks[at], blocks[at + 1]]) & 0x0FFF;
+                            let sc = sc | (((0x3400u16 >> (4 * i)) & 0xF) << 12);
+                            blocks[at..at + 2].copy_from_slice(&sc.to_le_bytes());
+                        }
                     }
                     _ => unreachable!(),
                 }

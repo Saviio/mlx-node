@@ -1,6 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
-// ggml K-quant (Q6_K / Q4_K / Q5_K) kernels on the NAX tensor-op path.
+// ggml K-quant and IQ kernels on the NAX tensor-op path.
 //
 // This is quantized_nax.h with the same substitution kquant.h makes to
 // quantized.h: the per-group scalar load `s = scales[g]; b = biases[g]`
@@ -16,6 +16,9 @@
 // its solution, applied to the K-quant decode.
 #include <metal_simdgroup>
 #include <metal_stdlib>
+
+#include "kquant_mode.h"
+#include "kquant_grid.h"
 
 using namespace metal;
 using namespace mlx::steel;
@@ -48,12 +51,14 @@ MLX_MTL_CONST int8_t kIQ4NLValuesNAX[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10,
     1,    13,    25,  38,  53,  69,  89,  113};
 
-template <typename U, int N, int bits, bool nonlinear, typename W>
-inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
+template <typename U, int N, int bits, bool nonlinear, typename W, typename S>
+inline void dequantize(S w, U scale, U bias, W w_local) {
+  // bits == 1 is the grid formats' one-word unit (kquant_grid.h); their
+  // callers take the KQ_GRID arm and never reach the code paths below.
   static_assert(
-      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
-          bits == 8,
-      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+      bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == 5 ||
+          bits == 6 || bits == 8,
+      "Template undefined for bits not in {1, 2, 3, 4, 5, 6, 8}");
 
   if constexpr (nonlinear) {
     for (int i = 0; i < N; i++) {
@@ -140,9 +145,9 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
 // fp16 super-scale and an integer sub-scale, so it is worth more than T's
 // mantissa; decode in float and round once on the store. That also sidesteps
 // bfloat, which has no implicit conversion from float.
-template <typename T, int N, int bits, bool nonlinear>
+template <typename T, int N, int bits, bool nonlinear, typename S>
 inline void dequantize_to(
-    const device uint8_t* w,
+    S w,
     float scale,
     float bias,
     threadgroup T* w_local) {
@@ -150,6 +155,46 @@ inline void dequantize_to(
   dequantize<float, N, bits, nonlinear>(w, scale, bias, w_thread);
   for (int i = 0; i < N; i++) {
     w_local[i] = static_cast<T>(w_thread[i]);
+  }
+}
+
+// The same grid-unit view as kquant.h's (the two headers are separate JIT
+// preambles, so each carries its own copy).
+struct KQGridMeta {
+  const device uint8_t* sc;
+  float d;
+};
+
+template <int kind>
+METAL_FUNC KQGridUnit kq_grid_unit(const device uint8_t* wunit, KQGridMeta m) {
+  return kq_grid_load<kind>(
+      reinterpret_cast<const device uint32_t*>(wunit), m.sc);
+}
+
+// The same decode as kquant.h's kq_decode_group (the two headers are
+// separate JIT preambles, so each carries its own copy).
+template <typename U, int bits, bool has_min, int kind, int scale_shift>
+inline void kq_decode_group(
+    const device float16_t* d,
+    const device uint8_t* sc,
+    thread U& scale,
+    thread U& bias) {
+  if constexpr (kq_is_affine<kind>()) {
+    scale = static_cast<U>(kq_bf16_to_float(
+        *reinterpret_cast<const device uint16_t*>(sc)));
+    bias = static_cast<U>(kq_bf16_to_float(as_type<uint16_t>(d[0])));
+  } else if constexpr (has_min) {
+    scale = kq_shift_scale<scale_shift>(
+        static_cast<U>(d[0]) * static_cast<U>(sc[0]));
+    bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
+  } else {
+    scale = kq_shift_scale<scale_shift>(
+        static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0])));
+    if constexpr (kq_affine_zero_point<kind>()) {
+      bias = static_cast<U>(-(1 << (bits - 1))) * scale;
+    } else {
+      bias = static_cast<U>(0.0f);
+    }
   }
 }
 
@@ -174,10 +219,14 @@ inline void dequantize_to(
 //
 // Mirrors KQScales in mlx_kquant.cpp (CPU reference): same operand order and the
 // same float32 conversions, so the two decodes agree bitwise.
-template <typename U, int bits, int super_ratio, bool has_min>
+template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
 struct KQScales {
-  // Sub-scale entries per group: (sc, m) for q4k and q5k, sc alone for q6k.
-  MLX_MTL_CONST int per_group = has_min ? 2 : 1;
+  // Sub-scale entries per group: (sc, m) for q4k and q5k, sc alone for q6k,
+  // the companion bytes of a grid unit; super-scale entries per super-block:
+  // (d, dmin) or d.
+  MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
+  MLX_MTL_CONST int per_super =
+      kq_bias_entries_per_super<has_min, kind, super_ratio>();
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -191,26 +240,106 @@ struct KQScales {
 
   void at(size_t g, thread U& scale, thread U& bias) const {
     const size_t gi = group + g;
-    const device float16_t* d = biases + (gi / super_ratio) * per_group;
-    const device uint8_t* sc = scales + gi * per_group;
-    if constexpr (has_min) {
-      scale = static_cast<U>(d[0]) * static_cast<U>(sc[0]);
-      bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
-    } else {
-      // as_type is a bit reinterpretation, so this reads the ggml sub-scale as
-      // signed exactly the way the CPU reference's static_cast<int8_t> does.
-      scale = static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0]));
-      if constexpr (bits == 4) {
-        bias = static_cast<U>(0.0f);
-      } else {
-        bias = static_cast<U>(-(1 << (bits - 1))) * scale;
-      }
-    }
+    kq_decode_group<U, bits, has_min, kind, scale_shift>(
+        biases + (gi / super_ratio) * per_super +
+            kq_bias_sub_index<kind, super_ratio>(gi),
+        scales + gi * per_group,
+        scale,
+        bias);
+  }
+
+  KQGridMeta grid_meta(size_t g) const {
+    const size_t gi = group + g;
+    return KQGridMeta{
+        scales + gi * per_group, static_cast<float>(biases[gi / super_ratio])};
   }
 
   // A view whose group 0 is this view's group n.
   KQScales offset(size_t n) const {
     return KQScales(scales, biases, group + n);
+  }
+
+  void advance(size_t n) {
+    group += n;
+  }
+};
+
+// --- Tiled64 layout (mlx_kquant.h; the same helpers as kquant.h) -----------
+MLX_MTL_CONST int KQ_TILE_ROWS = 64;
+
+template <int bits>
+METAL_FUNC const device uint8_t* kq_tiled_row(
+    const device uint32_t* w,
+    uint n,
+    uint units_per_row) {
+  return reinterpret_cast<const device uint8_t*>(w) +
+      (size_t(n / KQ_TILE_ROWS) * units_per_row * KQ_TILE_ROWS +
+       n % KQ_TILE_ROWS) *
+      (bits * 4);
+}
+
+template <int bits>
+METAL_FUNC constexpr size_t kq_tiled_unit_stride() {
+  return size_t(KQ_TILE_ROWS) * bits * 4;
+}
+
+template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
+struct KQScalesTiled {
+  MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
+  MLX_MTL_CONST int per_super =
+      kq_bias_entries_per_super<has_min, kind, super_ratio>();
+
+  const device uint8_t* scales;
+  const device float16_t* biases;
+  size_t group;
+
+  // Sub-scales sit per super-block: row r's super_ratio groups of
+  // super-block G are the contiguous bytes at ((tile * nsb + G) * 64 + r) *
+  // super_ratio * per_group, so one 16-byte load (32 for q2k) covers a
+  // super-block.
+  KQScalesTiled(
+      const device uint8_t* scales_,
+      const device float16_t* biases_,
+      int groups_per_row,
+      uint row,
+      size_t group_ = 0)
+      : scales(
+            scales_ +
+            (size_t(row / KQ_TILE_ROWS) * (groups_per_row / super_ratio) *
+                 KQ_TILE_ROWS +
+             row % KQ_TILE_ROWS) *
+                (super_ratio * per_group)),
+        biases(
+            biases_ +
+            (size_t(row / KQ_TILE_ROWS) * (groups_per_row / super_ratio) *
+                 KQ_TILE_ROWS +
+             row % KQ_TILE_ROWS) *
+                per_super),
+        group(group_) {}
+
+  void at(size_t g, thread U& scale, thread U& bias) const {
+    const size_t gi = group + g;
+    const device float16_t* d = biases +
+        (gi / super_ratio) * KQ_TILE_ROWS * per_super +
+        kq_bias_sub_index<kind, super_ratio>(gi);
+    const device uint8_t* sc = scales +
+        (gi / super_ratio) * KQ_TILE_ROWS * super_ratio * per_group +
+        (gi % super_ratio) * per_group;
+    kq_decode_group<U, bits, has_min, kind, scale_shift>(d, sc, scale, bias);
+  }
+
+  KQGridMeta grid_meta(size_t g) const {
+    const size_t gi = group + g;
+    return KQGridMeta{
+        scales + (gi / super_ratio) * KQ_TILE_ROWS * super_ratio * per_group +
+            (gi % super_ratio) * per_group,
+        static_cast<float>(biases[(gi / super_ratio) * KQ_TILE_ROWS])};
+  }
+
+  KQScalesTiled offset(size_t n) const {
+    KQScalesTiled c = *this;
+    c.group += n;
+    return c;
   }
 
   void advance(size_t n) {
@@ -228,11 +357,20 @@ template <
     short group_size,
     short bits,
     short super_ratio,
-    bool has_min>
+    bool has_min,
+    int kind,
+    int scale_shift,
+    bool tiled = false>
 struct QuantizedBlockLoader {
+  // bits == 1 is the grid formats' one-word unit (kquant_grid.h); their
+  // callers take the KQ_GRID arm and never reach the code paths below.
   static_assert(
-      bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
-      "Template undefined for bits not in {3, 4, 5, 6, 8}");
+      bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == 5 ||
+          bits == 6 || bits == 8,
+      "Template undefined for bits not in {1, 2, 3, 4, 5, 6, 8}");
+  static_assert(
+      !tiled || (reduction_dim == 1 && BCOLS % 32 == 0),
+      "Tiled64 loads whole 32-code units of a transposed weight.");
 
   MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
@@ -261,8 +399,15 @@ struct QuantizedBlockLoader {
   static_assert(
       (n_reads_per_scale * pack_factor) <= group_size,
       "A per-group run must not reach past its group.");
+  // A Tiled64 thread's reads stay inside one unit, so its source is contiguous.
+  static_assert(
+      !tiled || (n_reads * pack_factor) <= 32,
+      "A Tiled64 thread's reads must stay inside one 32-code unit.");
 
-  using scales_t = KQScales<float, bits, super_ratio, has_min>;
+  using scales_t = typename ConditionalType<
+      tiled,
+      KQScalesTiled<float, bits, super_ratio, has_min, kind, scale_shift>,
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>>::type;
 
   const int src_ld;
   const int tile_stride;
@@ -297,21 +442,135 @@ struct QuantizedBlockLoader {
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_.offset(
-            bi * src_ld / group_size + (bj * pack_factor) / group_size)) {}
+            bi * src_ld / group_size + (bj * pack_factor) / group_size)) {
+    static_assert(!tiled, "the Tiled64 loader takes the whole tensor");
+  }
+
+  // Tiled64: the whole weight, its companions, K, the tile's first row
+  // (n0, a multiple of BROWS) and its first input (k0, a multiple of BCOLS).
+  QuantizedBlockLoader(
+      const device uint32_t* w,
+      const device uint8_t* scales_,
+      const device float16_t* biases_,
+      const int K,
+      const int n0,
+      const int k0,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(K),
+        tile_stride((BCOLS / 32) * kq_tiled_unit_stride<bits>()),
+        group_step_cnt(0),
+        group_stride(0),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads * thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(kq_tiled_row<bits>(w, n0 + bi, K / 32) +
+            size_t((k0 + bj * pack_factor) / 32) *
+                kq_tiled_unit_stride<bits>() +
+            ((bj * pack_factor) % 32) * bits / 8),
+        scales(
+            scales_,
+            biases_,
+            K / group_size,
+            n0 + bi,
+            (k0 + bj * pack_factor) / group_size) {
+    static_assert(tiled, "the row-major loader takes a pre-offset source");
+  }
+
+  // Grid formats: a thread's reads are 8, 16 or 32 values inside one unit
+  // (static_assert above), so decode the unit's chunks they cover.
+  void load_grid() const {
+    constexpr int values = n_reads * pack_factor;
+    static_assert(values % 8 == 0 && values <= 32, "whole chunks of one unit");
+    const int in_unit = (bj * pack_factor) % 32;
+    const KQGridMeta m = scales.grid_meta(0);
+    const KQGridUnit u = kq_grid_unit<kind>(src - in_unit * bits / 8, m);
+    for (int c = 0; c < values / 8; c++) {
+      float v[8];
+      kq_grid_decode8<kind, scale_shift>(u, m.d, uint(in_unit / 8 + c), v);
+      for (int i = 0; i < 8; i++) {
+        dst[c * 8 + i] = static_cast<T>(v[i]);
+      }
+    }
+  }
 
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
 
+    if constexpr (kq_is_grid<kind>()) {
+      load_grid();
+      return;
+    }
     int k = 0;
     for (int i = 0; i < n_steps_per_read; i++) {
       float scale;
       float bias;
       scales.at(i, scale, bias);
       for (int j = 0; j < n_reads_per_scale; j++) {
-        dequantize_to<T, pack_factor, bits, bits == 4 && !has_min>(
+        dequantize_to<T, pack_factor, bits, kq_codebook<kind>()>(
             src + k * bytes_per_pack, scale, bias, dst + k * pack_factor);
+        k++;
+      }
+    }
+  }
+
+  // load_unsafe() in two halves, so a kernel can issue the next tile's device
+  // reads (fetch) before the current tile's matmul and decode them (commit)
+  // after: the thread's codes (whole words when its run is a whole number of
+  // them; it starts 4-byte aligned in every row-major mode) and its groups'
+  // (scale, bias). Grid formats decode on commit; the row-major, aligned tile
+  // only.
+  MLX_MTL_CONST short raw_bytes = n_reads * bytes_per_pack;
+  MLX_MTL_CONST bool raw_aligned = raw_bytes % 4 == 0;
+  uint32_t raw[kq_is_grid<kind>() ? 1 : (raw_bytes + 3) / 4];
+  float raw_scale[n_steps_per_read];
+  float raw_bias[n_steps_per_read];
+
+  void fetch() {
+    if constexpr (kq_is_grid<kind>()) {
+      return;
+    }
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    if constexpr (raw_aligned) {
+      auto words = reinterpret_cast<const device uint32_t*>(src);
+      for (int i = 0; i < raw_bytes / 4; i++) {
+        raw[i] = words[i];
+      }
+    } else {
+      thread uint8_t* bytes = reinterpret_cast<thread uint8_t*>(raw);
+      for (int i = 0; i < raw_bytes; i++) {
+        bytes[i] = src[i];
+      }
+    }
+    for (int i = 0; i < n_steps_per_read; i++) {
+      scales.at(i, raw_scale[i], raw_bias[i]);
+    }
+  }
+
+  void commit() const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    if constexpr (kq_is_grid<kind>()) {
+      load_grid();
+      return;
+    }
+    const thread uint8_t* bytes =
+        reinterpret_cast<const thread uint8_t*>(raw);
+    int k = 0;
+    for (int i = 0; i < n_steps_per_read; i++) {
+      for (int j = 0; j < n_reads_per_scale; j++) {
+        dequantize_to<T, pack_factor, bits, kq_codebook<kind>()>(
+            bytes + k * bytes_per_pack,
+            raw_scale[i],
+            raw_bias[i],
+            dst + k * pack_factor);
         k++;
       }
     }
@@ -322,7 +581,7 @@ struct QuantizedBlockLoader {
       return;
     }
 
-    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+    if (reduction_dim == 1 && bi >= src_tile_dim.y) {
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -336,13 +595,17 @@ struct QuantizedBlockLoader {
       return;
     }
 
+    if constexpr (kq_is_grid<kind>()) {
+      load_grid();
+      return;
+    }
     int k = 0;
     for (int i = 0; i < n_steps_per_read; i++) {
       float scale;
       float bias;
       scales.at(i, scale, bias);
       for (int j = 0; j < n_reads_per_scale; j++) {
-        dequantize_to<T, pack_factor, bits, bits == 4 && !has_min>(
+        dequantize_to<T, pack_factor, bits, kq_codebook<kind>()>(
             (device uint8_t*)(src + k * bytes_per_pack),
             scale,
             bias,
@@ -376,15 +639,18 @@ template <
     const int bits,
     const int super_ratio,
     const bool has_min,
+    int kind,
+    int scale_shift,
     const bool aligned_N,
     const int BM = 64,
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    bool tiled = false>
 METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     const device uint32_t* w,
-    KQScales<float, bits, super_ratio, has_min> scales,
+    KQScales<float, bits, super_ratio, has_min, kind, scale_shift> scales,
     const device T* x,
     device T* y,
     threadgroup T* Ws,
@@ -394,7 +660,10 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    // Tiled64 only: the whole companions (`w` is then the whole weight too).
+    const device uint8_t* scales_tiled = nullptr,
+    const device float16_t* biases_tiled = nullptr) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
   static_assert(BM % WM == 0, "BM should be divisible by WM");
@@ -421,7 +690,10 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
       group_size,
       bits,
       super_ratio,
-      has_min>;
+      has_min,
+      kind,
+      scale_shift,
+      tiled>;
 
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -437,7 +709,14 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
-  loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w = [&]() {
+    if constexpr (tiled) {
+      return loader_w_t(
+          w, scales_tiled, biases_tiled, K, y_col, 0, Ws, simd_gid, simd_lid);
+    } else {
+      return loader_w_t(wl, scales, K, Ws, simd_gid, simd_lid);
+    }
+  }();
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -622,13 +901,16 @@ template <
     const int bits,
     const int super_ratio,
     const bool has_min,
+    int kind,
+    int scale_shift,
     const bool aligned_N,
     const bool batched,
     const int BM = 64,
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    bool tiled = false>
 [[kernel]] void kquant_qmm_t_nax(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -650,6 +932,7 @@ template <
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(!(tiled && batched), "Tiled64 weights are 2-D");
   (void)lid;
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
@@ -680,14 +963,17 @@ template <
       bits,
       super_ratio,
       has_min,
+      kind,
+      scale_shift,
       aligned_N,
       BM,
       BK,
       BN,
       WM,
-      WN>(
+      WN,
+      tiled>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       Ws,
@@ -697,5 +983,150 @@ template <
       tid,
       lid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      scales,
+      biases);
+}
+
+// The sorted-rhs MoE expert matmul (x @ w[e].T, one expert per row run) on
+// the tensor op: quantized_nax.h's affine_gather_qmm_rhs_nax with the KQScales
+// decode. `offsets[e]` is the first row of expert e (gather_mm_offsets);
+// schedule_row_tile gives tile tid.y the rows of one expert only, so an
+// expert's slab is dequantized once per BM rows and never straddles a tile.
+// N % BN == 0 and K % BK == 0 (the dispatcher's gate).
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int super_ratio,
+    bool has_min,
+    int kind,
+    int scale_shift,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN>
+[[kernel]] void kquant_gather_qmm_rhs_nax(
+    const device T* x [[buffer(0)]],
+    const device uint32_t* w [[buffer(1)]],
+    const device uint8_t* scales [[buffer(2)]],
+    const device float16_t* biases [[buffer(3)]],
+    const device int32_t* offsets [[buffer(4)]],
+    device T* y [[buffer(5)]],
+    const constant int& M [[buffer(6)]],
+    const constant int& N [[buffer(7)]],
+    const constant int& K [[buffer(8)]],
+    const constant int& num_groups [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+  static_assert((BM / WM) % 16 == 0 && (BN / WN) % 16 == 0, "16-row tiles");
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      1,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits,
+      super_ratio,
+      has_min,
+      kind,
+      scale_shift>;
+
+  threadgroup T Ws[BN * BK_padded];
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const size_t stride_w = size_t(N) * K_w;
+  const size_t stride_s = size_t(N) * K_g;
+  int y_row;
+  int group;
+  short tgp_bm;
+  if (!schedule_row_tile<BM>(
+          offsets, num_groups, M, tid.y, simd_lane_id, y_row, group, tgp_bm)) {
+    return;
+  }
+  const int y_col = tid.x * BN;
+
+  x += size_t(y_row) * K;
+  y += size_t(y_row) * N + y_col;
+  auto wl = (const device uint8_t*)w + group * stride_w + size_t(y_col) * K_w;
+  KQScales<float, bits, super_ratio, has_min, kind, scale_shift> sb(
+      scales, biases, group * stride_s + size_t(y_col) * K_g);
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+  const short sgp_sm = short(clamp(int(tgp_bm) - tm, 0, int(SM)));
+  const bool rows_in_bounds = y_row + tm + SM <= M;
+  const bool sg_active = sgp_sm > 0;
+
+  NAXTile<float, TM, TN> Dtile;
+  Dtile.clear();
+
+  const device T* xn = x + tm * K;
+  loader_w_t loader_w(wl, sb, K, Ws, simd_group_id, simd_lane_id);
+
+  loader_w.fetch();
+  dispatch_bool(rows_in_bounds, [&](auto kAlignedM) {
+    for (int k = 0; k < K; k += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_w.commit();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_w.next();
+      if (k + BK < K) {
+        loader_w.fetch();
+      }
+
+      STEEL_PRAGMA_NO_UNROLL
+      for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+        if (sg_active) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          if constexpr (kAlignedM.value) {
+            Atile.load(xn + kk1, K);
+          } else {
+            Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+          }
+          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<false>{},
+              Btile,
+              metal::bool_constant<true>{});
+
+          (void)compiler_barrier;
+        }
+      }
+
+      xn += BK;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgp_sm == SM) {
+      Dtile.store(y + tm * N + tn, N);
+    } else if (sg_active) {
+      Dtile.store_slice(y + tm * N + tn, N, short2(0, 0), short2(SN, sgp_sm));
+    }
+  });
 }
