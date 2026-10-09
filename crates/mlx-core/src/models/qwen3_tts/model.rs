@@ -1,6 +1,6 @@
 use super::{
     codec::{CodecDecoder, CodecState},
-    config::{CodecConfig, ModelConfig, read_json},
+    config::{CodecConfig, ModelConfig, TransformerConfig, read_json},
     tokenizer::TextTokenizer,
     transformer::Decoder,
     weights::Weights,
@@ -596,6 +596,19 @@ impl NativeModel {
                 input = cat(&[&self.text_embed(&instruction_ids)?, &input], 1)?;
             }
         }
+        // Pre-size the talker KV to the whole turn (resident prefix + prompt +
+        // frames): growth is a full-buffer copy, so unreserved appends churn
+        // O(bound²/step) bytes per layer. Predictor/codec caches are skipped:
+        // the predictor's growth step already covers its fixed 16-row window
+        // and the codec window keeps its cache bounded.
+        if let Some(first) = talker_state.first() {
+            let bound = i64::from(first.kv.get_offset())
+                .saturating_add(input.shape()?[1])
+                .saturating_add(max_frames as i64);
+            for state in &mut talker_state {
+                state.kv.reserve(bound)?;
+            }
+        }
         let mut rng =
             StdRng::seed_from_u64(options.seed.map(u64::from).unwrap_or_else(rand::random));
         let valid = c.code_predictor_config.vocab_size;
@@ -617,6 +630,24 @@ impl NativeModel {
         let mut first_pcm_ms = None;
         let mut blocked = 0.;
         let mut reason = "length";
+        // Decode-phase allocator ceiling: scoped to the frame loop only
+        // (dflash2_decode.rs:1113 discipline) so prompt prefills above stay
+        // under the load-time safety cap; a decode step only needs room to
+        // recycle its own transients, so the pool is capped for exactly this
+        // scope and lifted on drop. The cadence is once per text segment —
+        // synthesize issues one generate per segment — and while live the
+        // cap composes by minimum with other models' ceilings in the shared
+        // process pool (cache_limit.rs coordinator semantics).
+        // No periodic clear_cache: between-turn draining is the server's
+        // idle sweeper (cache_limit.rs documents why per-request drains are
+        // wrong on a multi-model process).
+        let _decode_cap = crate::cache_limit::coordinator().push_decode_limit(
+            crate::cache_limit::decode_cache_limit(tts_step_transient(
+                &self.config,
+                &self.codec.config,
+                chunk_frames,
+            )),
+        );
         for step in 0..max_frames {
             if cancelled.load(Ordering::Acquire) {
                 reason = "cancelled";
@@ -755,6 +786,48 @@ fn draw(
     sample_dense_distribution_array(&probabilities, rng)?.reshape(&[1, 1])
 }
 
+/// First-order estimate of the short-lived bytes one decode step allocates
+/// and frees, used to size the turn's decode-time allocator ceiling. Weights
+/// and KV caches are resident and excluded; same-size layer intermediates are
+/// reused layer to layer, so only one scratch set is counted per forward.
+///
+/// ```text
+/// talker    = vocab × 4 B × 2 (f32 logits + penalized copy)
+///             + 3 × (hidden + intermediate) × 2 B   one layer's scratch
+/// predictor = (num_code_groups - 1) single-token forwards
+///             × 3 × (hidden + intermediate) × 2 B
+/// codec     = num_quantizers × chunk_frames rows per windowed step
+///             × 3 × (hidden + intermediate) × 2 B
+/// pcm       = 2 × chunk_frames × upsample × 4 B     clip + f32 copy
+/// ```
+fn tts_step_transient(model: &ModelConfig, codec: &CodecConfig, chunk_frames: usize) -> u64 {
+    let dim = |v: i64| v.max(0) as u64;
+    let scratch = |c: &TransformerConfig| {
+        dim(c.hidden_size)
+            .saturating_add(dim(c.intermediate_size))
+            .saturating_mul(3)
+            .saturating_mul(2)
+    };
+    let t = &model.talker_config;
+    let p = &t.code_predictor_config;
+    let logits = dim(t.vocab_size as i64).saturating_mul(4).saturating_mul(2);
+    let predictor =
+        (t.num_code_groups.saturating_sub(1) as u64).saturating_mul(scratch(&p.transformer));
+    let frames = (chunk_frames as u64).max(1);
+    let codec_step = (codec.decoder_config.num_quantizers as u64)
+        .saturating_mul(frames)
+        .saturating_mul(scratch(&codec.decoder_config.transformer));
+    let pcm = 2u64
+        .saturating_mul(frames)
+        .saturating_mul(codec.decode_upsample_rate as u64)
+        .saturating_mul(4);
+    logits
+        .saturating_add(scratch(&t.transformer))
+        .saturating_add(predictor)
+        .saturating_add(codec_step)
+        .saturating_add(pcm)
+}
+
 #[cfg(test)]
 mod instruction_tests {
     use super::super::prefix::{CachePolicy, PrefixCache};
@@ -887,5 +960,30 @@ mod instruction_tests {
         cache
             .prepare(&ids, &model.talker, || model.text_embed(&ids), &cancelled)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod decode_limit_tests {
+    use super::*;
+    use crate::cache_limit::DECODE_CACHE_LIMIT_FLOOR;
+
+    #[test]
+    fn qwen3_tts_step_transient_fits_under_decode_floor() {
+        let model: ModelConfig = serde_json::from_str(include_str!("fixtures/base.json")).unwrap();
+        let codec: CodecConfig = serde_json::from_str(include_str!("fixtures/codec.json")).unwrap();
+        for chunk_frames in [1usize, 2, 8] {
+            let transient = tts_step_transient(&model, &codec, chunk_frames);
+            assert!(
+                transient > 0 && transient < DECODE_CACHE_LIMIT_FLOOR,
+                "chunk_frames={chunk_frames}: {transient}"
+            );
+            assert_eq!(
+                crate::cache_limit::decode_cache_limit(transient),
+                DECODE_CACHE_LIMIT_FLOOR
+            );
+        }
+        // The estimate must track the codec chunk it prices.
+        assert!(tts_step_transient(&model, &codec, 8) > tts_step_transient(&model, &codec, 1));
     }
 }

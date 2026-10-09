@@ -53,6 +53,12 @@ function positive(value: number, name: string): number {
   return value;
 }
 
+// The abort listener must be built outside synthesizeStream: V8 shares a
+// context slot for `stream` across that scope's closures, so a same-scope
+// listener would pin the stream on a live caller signal and defeat the
+// WeakRef busy slot. From here the context chain captures only `ref`.
+const abortStream = (ref: WeakRef<TtsStream>) => () => ref.deref()?.cancel();
+
 export function createTtsModel(backend: TtsBackend): TtsModel {
   const capabilities = Object.freeze({
     ...backend.capabilities,
@@ -242,7 +248,6 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
         segments: 0,
         finishReason: 'eos',
       };
-      const onAbort = () => stream.cancel();
       function finish(error: unknown) {
         if (settled) return;
         settled = true;
@@ -400,9 +405,9 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
           else void iterator.return(undefined).catch(() => {});
         },
       };
-      active = new WeakRef(stream);
-      // A caller-supplied signal keeps the stream alive via this listener, so
-      // GC frees the busy slot only for streams with no external references.
+      const streamRef = new WeakRef(stream);
+      active = streamRef;
+      const onAbort = abortStream(streamRef);
       signal?.addEventListener('abort', onAbort, { once: true });
       if (signal?.aborted) stream.cancel();
       return stream;

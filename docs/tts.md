@@ -71,7 +71,9 @@ fails with a busy error; a concurrent voice release is queued instead and
 applies after the active operation finishes. `cancel()`, `AbortSignal`, early iterator return and
 `dispose()` wake blocked endpoints and release generation state. Cancellation
 rejects `completed` with `AbortError`. A stream has one consumer; the consumer must
-iterate or cancel it. Input errors reject both the iterator and `completed`.
+iterate or cancel it. If every stream reference is dropped first, garbage
+collection frees the model slot even while a caller `AbortSignal` stays alive.
+Input errors reject both the iterator and `completed`.
 An upstream iterator blocked on external I/O is not awaited during cancellation.
 Model disposal also cancels voice preparation at computation-stage boundaries;
 an already running MLX evaluation completes before its resources are released.
@@ -118,6 +120,11 @@ for the loaded TTS model's lifetime. Fractional values are supported; unset or
 `0` uses the normal cache policy. This is a shared process pool, not a TTS-private
 memory quota or a total RAM limit. Multiple live ceilings and a positive global
 `MLX_CACHE_LIMIT_GB` compose by minimum. Invalid values fail before model loading.
+
+During each segment's decode loop the model additionally tightens the pool to
+the decode-time ceiling (`max(2 × step transient, 128 MiB)`), lifted when the
+segment ends. That ceiling is process-wide like any other, so it composes by
+minimum against concurrent models' ceilings while a TTS turn is in flight.
 
 Native decoding advances explicit causal convolution, transpose-convolution
 overlap and transformer cache state. Token ID zero is valid; output length is

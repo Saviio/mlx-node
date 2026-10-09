@@ -1,3 +1,6 @@
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
+
 import { describe, it, expect, vi } from 'vite-plus/test';
 
 import { createTtsModel, type TtsBackend } from '../src/model.js';
@@ -199,6 +202,55 @@ describe('session lifecycle', () => {
     }
     await stream.completed;
     expect(remove).toHaveBeenCalledExactlyOnceWith('abort', expect.any(Function));
+    await model.dispose();
+  });
+  it('cancels the stream when a caller AbortSignal fires', async () => {
+    const { model, cancelled } = fake();
+    const controller = new AbortController();
+    const stream = model.synthesizeStream('Hi.', { voice: 'voice', signal: controller.signal });
+    const iterator = stream[Symbol.asyncIterator]();
+    expect((await iterator.next()).value?.samples.length).toBe(2);
+    controller.abort();
+    // Abort delivers a generator return: the pull resolves done while
+    // completed still rejects with AbortError.
+    expect(await iterator.next()).toMatchObject({ done: true });
+    await expect(stream.completed).rejects.toMatchObject({ name: 'AbortError' });
+    expect(cancelled()).toBe(1);
+    await model.synthesize('Reusable.', { voice: 'voice' });
+    await model.dispose();
+  });
+  // Collection timing and FinalizationRegistry callback delivery are not
+  // deterministic (conservative stack roots, loaded CI machines), so the
+  // retry budget absorbs the occasional run where GC never reclaims in time.
+  it('frees the busy slot on GC for an abandoned stream whose signal stays alive', { retry: 2 }, async () => {
+    const { model, submitted } = fake();
+    // Node exposes gc() only under --expose-gc; setting the flag before a new
+    // vm context is created yields a gc that collects this process's heap.
+    setFlagsFromString('--expose_gc');
+    const gc = runInNewContext('gc') as () => void;
+    const collected = { freed: false };
+    const registry = new FinalizationRegistry(() => {
+      collected.freed = true;
+    });
+    const controller = new AbortController();
+    const abandon = () => {
+      const stream = model.synthesizeStream('Abandoned.', { voice: 'voice', signal: controller.signal });
+      registry.register(stream, 0);
+    };
+    abandon();
+    expect(submitted).toEqual([]);
+    expect(() => model.synthesizeStream('Busy.', { voice: 'voice' })).toThrow('busy');
+    for (let i = 0; !collected.freed && i < 12; i++) {
+      // Churn clears conservative stack roots that may still point at the stream.
+      let acc = 0;
+      for (let n = 0; n < 1e5; n++) acc = (acc + n) % 7;
+      gc();
+      gc();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(collected.freed).toBe(true);
+    // The live signal can no longer pin the stream, so a new request proceeds.
+    expect((await model.synthesize('After.', { voice: 'voice' })).samples.length).toBe(4);
     await model.dispose();
   });
   it('rejects completed with AbortError when cancel races the natural queue close', async () => {
