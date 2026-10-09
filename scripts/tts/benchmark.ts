@@ -46,6 +46,8 @@ const { values } = parseArgs({
     speed: { type: 'string', default: '1' },
     'playback-buffer-seconds': { type: 'string', default: '1' },
     'prebuffer-seconds': { type: 'string', default: '1' },
+    'expect-raw-pcm-sha256': { type: 'string' },
+    'expect-processed-pcm-sha256': { type: 'string' },
     note: { type: 'string' },
   },
 });
@@ -69,6 +71,12 @@ if (
 ) {
   throw new Error('Playback buffer must be within (0, 60] seconds and prebuffer within [0, buffer]');
 }
+for (const [flag, expected] of [
+  ['--expect-raw-pcm-sha256', values['expect-raw-pcm-sha256']],
+  ['--expect-processed-pcm-sha256', values['expect-processed-pcm-sha256']],
+] as const)
+  if (expected !== undefined && !/^[0-9a-f]{64}$/i.test(expected))
+    throw new Error(`${flag} must be a SHA-256 hex digest`);
 const text = values['text-file']
   ? await readFile(values['text-file'], 'utf8')
   : (values.text ??
@@ -182,6 +190,9 @@ try {
   const segmentFirstPcm: number[] = [];
   const rawPcmHash = createHash('sha256');
   const processedPcmHash = createHash('sha256');
+  let processedSamples = 0;
+  let nonFiniteSamples = 0;
+  let processedPcmSquares = 0;
   const segments: {
     segmentIndex: number;
     startSample: number;
@@ -236,6 +247,11 @@ try {
     for await (const chunk of processed) {
       const at = performance.now();
       processedPcmHash.update(Buffer.from(chunk.samples.buffer, chunk.samples.byteOffset, chunk.samples.byteLength));
+      processedSamples += chunk.samples.length;
+      for (const sample of chunk.samples) {
+        if (Number.isFinite(sample)) processedPcmSquares += sample * sample;
+        else nonFiniteSamples++;
+      }
       if (firstPcmMs === undefined) {
         firstPcmMs = at - began;
         firstBeforeInputEnded = !inputEnded;
@@ -297,6 +313,27 @@ try {
         : null;
     const percentile = (data: number[], p: number) =>
       [...data].sort((a, b) => a - b)[Math.min(data.length - 1, Math.floor(data.length * p))] ?? null;
+    const rawPcmSha256 = rawPcmHash.digest('hex');
+    const processedPcmSha256 = processedPcmHash.digest('hex');
+    const expectedPcmSha256 = [
+      ['raw', rawPcmSha256, values['expect-raw-pcm-sha256']],
+      ['processed', processedPcmSha256, values['expect-processed-pcm-sha256']],
+    ] as const;
+    const pcmHashMismatches = expectedPcmSha256.filter(
+      ([, actual, expected]) => expected !== undefined && actual !== expected.toLowerCase(),
+    );
+    for (const [name, actual, expected] of pcmHashMismatches)
+      console.error(`PCM SHA-256 mismatch (${name}): expected ${expected}, got ${actual}`);
+    // Finite, non-silent output only; detecting wrong-but-plausible speech
+    // requires fixed-seed digests or the external ASR oracle. The 1e-4 RMS
+    // floor (~-80 dBFS) is an order of magnitude below the quietest measured
+    // speech stream, so it rejects silence and corrupt output without
+    // penalizing legitimately quiet speech.
+    const processedPcmRms = processedSamples ? Math.sqrt(processedPcmSquares / processedSamples) : 0;
+    const passedAudioContent = generatedSeconds > 0 && nonFiniteSamples === 0 && processedPcmRms > 1e-4;
+    const passedPcmHash = expectedPcmSha256.some(([, , expected]) => expected !== undefined)
+      ? pcmHashMismatches.length === 0
+      : null;
     const report = {
       date: new Date().toISOString(),
       model: values.model,
@@ -351,8 +388,10 @@ try {
       synthesis,
       audioProcessing: {
         ...processed.stats,
-        rawPcmSha256: rawPcmHash.digest('hex'),
-        processedPcmSha256: processedPcmHash.digest('hex'),
+        rawPcmSha256,
+        processedPcmSha256,
+        processedPcmRms,
+        nonFiniteSamples,
         speed: Number(values.speed),
         outputSeconds: generatedSeconds,
       },
@@ -386,6 +425,8 @@ try {
       peakRssBytes: process.resourceUsage().maxRSS * 1024,
       sampledPeakRssBytes: Math.max(...memory.map((x) => x.rss)),
       memory,
+      passedAudioContent,
+      passedPcmHash,
       passedMeasuredServiceBudget:
         !controller.signal.aborted &&
         inputEnded &&
@@ -393,7 +434,8 @@ try {
         measuredServiceTimeRatio !== null &&
         measuredServiceTimeRatio < 1,
       passedPacedPlayback: paced
-        ? playbackComplete &&
+        ? passedAudioContent &&
+          playbackComplete &&
           playbackPolicy.prebufferSeconds <= 1 &&
           playback.underruns === 0 &&
           playbackBeforeSimulatedCompletion === true &&
@@ -403,6 +445,7 @@ try {
           measuredServiceTimeRatio < 1
         : null,
       passedTenMinutePlayback:
+        passedAudioContent &&
         playbackComplete &&
         playbackPolicy.prebufferSeconds <= 1 &&
         playback.playedSeconds >= 600 &&

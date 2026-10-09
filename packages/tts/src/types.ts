@@ -37,7 +37,10 @@ export type TtsInput = string | AsyncIterable<TtsInputEvent>;
 export type TtsVoice = string | PreparedVoice | { type: 'description'; description: string };
 export interface PreparedVoice {
   readonly id: string;
-  /** Release this voice while the model is idle. Repeated disposal is safe. */
+  /**
+   * Release this voice. Repeated disposal is safe. Releases may be requested
+   * while the model is busy; they are queued behind the active operation.
+   */
   dispose(): Promise<void>;
 }
 export interface TtsLoadOptions {
@@ -77,7 +80,7 @@ export interface TtsStats {
   realTimeFactor: number | null;
   firstPcmMs: number | null;
   segments: number;
-  finishReason: 'eos' | 'length' | 'cancelled';
+  finishReason: 'eos' | 'length';
 }
 export interface TtsStream extends AsyncIterable<AudioChunk> {
   readonly completed: Promise<TtsStats>;

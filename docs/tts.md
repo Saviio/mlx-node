@@ -36,9 +36,13 @@ Preparation advances one codec frame at a time and materializes retained state,
 bounding decoder temporary memory independently of reference duration. Each segment
 forks the prepared prefix with isolated writable attention caches and immutable
 convolution histories. Handles belong to one model and may be reused across
-requests. Call `await voice.dispose()` while the model is idle to release a
-reference that is no longer needed; repeated disposal is safe. A released handle
-cannot be used for synthesis. Model disposal releases all remaining references.
+requests. Call `await voice.dispose()` to release a
+reference that is no longer needed; repeated disposal is safe. Releases stay
+valid while the model is busy and run after the active synthesis or
+preparation finishes. A released handle
+cannot be used for synthesis. A model retains at most eight prepared voices;
+preparing beyond that evicts the oldest, and an evicted or released handle
+fails on its next use. Model disposal releases all remaining references.
 Reference length is validated against the encoder's configured context capacity
 before resampling or inference; it is not silently truncated.
 
@@ -62,8 +66,9 @@ PCM buffering is bounded to about one second and text buffering to two segments.
 `chunkDurationMs`, `audioBufferSeconds`, `queuedSegments` and
 `maxSegmentGraphemes` configure these policies. Slow consumers apply backpressure.
 
-One model accepts one active synthesis, voice preparation or voice release. A concurrent request
-fails with a busy error. `cancel()`, `AbortSignal`, early iterator return and
+One model accepts one active synthesis or voice preparation. A concurrent request
+fails with a busy error; a concurrent voice release is queued instead and
+applies after the active operation finishes. `cancel()`, `AbortSignal`, early iterator return and
 `dispose()` wake blocked endpoints and release generation state. Cancellation
 rejects `completed` with `AbortError`. A stream has one consumer; the consumer must
 iterate or cancel it. Input errors reject both the iterator and `completed`.
@@ -121,7 +126,12 @@ based on actual frame count.
 Run SDK/lifecycle tests with `vp test packages/tts/__test__`. Rust numerical
 parity tests are opt-in and require separately supplied checkpoint weights and
 development fixtures. Set `TTS_TEST_MODEL` to the checkpoint directory and
-`TTS_TEST_GOLDENS` to the fixture directory. Fixture generators and generated
+`TTS_TEST_GOLDENS` to the fixture directory, then run
+`TTS_TEST_MODEL=<dir> TTS_TEST_GOLDENS=<dir> cargo test -p mlx-core --lib -- --ignored qwen3_tts`.
+The ignored tests are `qwen3_tts_reference_parity`, `qwen3_tts_encoder_reference_parity`,
+`qwen3_tts_icl_prompt_parity`, `qwen3_tts_teacher_parity`,
+`qwen3_tts_predictor_cache_capacity_parity` and the instruction parity tests in
+`model.rs`. Fixture generators and generated
 numerical fixtures are not included in this repository.
 The speaker frontend uses the periodic Hann window defined by
 the [official speaker frontend](https://github.com/QwenLM/Qwen3-TTS/blob/main/qwen_tts/core/models/modeling_qwen3_tts.py).
@@ -139,8 +149,9 @@ fixtures (`wave`, `encoded`, `long_wave`, `long_encoded`); expected IDs have sha
 `scripts/tts/lifecycle.ts --model <custom-voice>` tests a full native queue,
 cancellation, reuse, disposal during paused input and seeded waveform invariance
 under different PCM chunk sizes. For Base, pass `--reference <wav>` and
-`--transcript-file <txt>` together; this also checks busy/idempotent voice release,
-use-after-release, replacement preparation and cancellation during preparation.
+`--transcript-file <txt>` together; this also checks voice release during an
+active generation, idempotent and use-after-release rejection, replacement
+preparation and cancellation during preparation.
 `scripts/tts/quality.ts --custom <path> --base
 <path> --output <directory>` writes multilingual preset and cloned samples.
 ASR content agreement does not establish timbre similarity or naturalness;
@@ -153,13 +164,23 @@ PCM, block intervals, RTF, resident-memory samples and optional playback underru
 the JS open call, giving lower/upper bounds from text submission. `peakRssBytes`
 uses the process-wide OS high-water mark through Node's `resourceUsage().maxRSS`;
 `memory` contains steady-state samples and MLX active/peak/allocator-cache bytes.
-Use `--seconds 600 --play` for the ten-minute test. The playback prebuffer is one
-second. RTF is synthesis time / audio duration; native queue backpressure is excluded
+Use `--seconds 600 --play` for the ten-minute test. The benchmark's
+`--prebuffer-seconds` default is one second; the SDK and CLI playback default is
+0.32 seconds. RTF is synthesis time / audio duration; native queue backpressure is excluded
 from synthesis time. Report cold and warm runs separately. A passing short smoke
 test does not establish the ten-minute realtime or perceptual-quality acceptance.
 `passedTenMinutePlayback` covers the continuous playback subtest, including EOS;
 review the memory trajectory and quality checks separately for full acceptance.
 Use `--note` to record competing workloads or other measurement conditions.
+`passedAudioContent` requires finite, non-silent processed PCM (RMS above
+`1e-4`, roughly -80 dBFS — a sanity floor far below measured quiet speech, not
+a speech-level threshold); it rejects a silent or corrupt stream but does not
+verify speech content, which needs the external ASR oracle. `passedPcmHash`
+enforces any digests supplied as `--expect-raw-pcm-sha256` or
+`--expect-processed-pcm-sha256` and is `null` when none are given. Only
+`passedAudioContent` is folded into the paced and ten-minute playback verdicts;
+`passedPcmHash` is a standalone report field, so a hash mismatch does not fail
+those verdicts.
 
 For a finite, paced text response, add `--once --text-file story.txt
 --graphemes-per-second 20 --chunk-graphemes 2 --first-chunk-ms 500`. The clock
@@ -302,7 +323,8 @@ different overlap durations, so the before/after numbers are not an isolated
 microbenchmark of the optimization. Initial BF16 fresh-process smoke runs exceeded RTF 1;
 the ten-minute realtime result above applies to the stated 8-bit configuration.
 
-Raw local reports: `.cache/tts/results/base-8bit-10min-final.json` (failed baseline),
+Uncommitted local reports (under the gitignored `.cache/`):
+`.cache/tts/results/base-8bit-10min-final.json` (failed baseline),
 `base-prefix-10min.json` and `custom-final-10min.json`. Model revisions:
 
 - CustomVoice: `85e237c12c027371202489a0ec509ded67b5e4b5`.
@@ -322,8 +344,13 @@ vp exec oxnode scripts/tts/benchmark.ts --model ./Base-8bit \
 
 Verification on the final native build:
 
-- 112 SDK/audio/download tests; 31 selected Rust tests including all three real
-  checkpoint oracle tests; native lifecycle checks; native build; focused type
+- 78 TTS-scoped TS tests — `packages/tts/__test__` (51 across stream, audio,
+  speed and qwen3 adapter suites), `__test__/tts` (14), `download-tts` (9) and
+  `tts-input` (4); 31 selected Rust tests including the three real checkpoint
+  oracle tests run above (fixture-gated `#[ignore]` tests — seven in total
+  covering codec/encoder/ICL/teacher/predictor parity — ran with locally
+  supplied `TTS_TEST_MODEL`/`TTS_TEST_GOLDENS` fixtures and are not runnable
+  from this checkout); native lifecycle checks; native build; focused type
   checks and Clippy passed. Full workspace `build:ts` remains blocked by existing
   `packages/agent` pi-ai dependency/type incompatibilities in unchanged files.
   A real CLI smoke test with split UTF-8 byte sequences and delayed stdin input
@@ -344,6 +371,16 @@ Verification on the final native build:
 - Independent review findings were fixed and a confirm review found no remaining
   static blockers. Naturalness, timbre and audible joins still require human
   listening; no perceptual-quality pass is claimed from ASR or embedding scores.
+
+> PCM/hash staleness: the PCM16 comparisons above and the
+> `rawPcmSha256`/`processedPcmSha256` digests recorded in the `docs/research`
+> benchmark reports predate the sampler parity fixes (64-token repetition
+> window, ICL 1.5 penalty floor, temperature-first filter ordering, EOS
+> filtering, shared predictor sampling). The 64-token window changes generated
+> PCM beyond 64 frames and the ICL floor changes every clone run, so those
+> digests are historical records, not baselines for the current build.
+> Regenerate them with `--expect-raw-pcm-sha256` /
+> `--expect-processed-pcm-sha256` before reusing them as gates.
 
 ### Chinese Fairy voice and a paced 2000-character response
 
@@ -387,7 +424,7 @@ The native speed adapter matches the pure Rust preview output sample-for-sample.
 For that 13.76-second preview, processing took 25 ms and yielded 11.965 seconds.
 ASR exactly matched the original text; pYIN voiced-F0 medians were 198 Hz before
 and 200 Hz after processing. These diagnostics do not establish perceptual
-superiority. Local artifacts include `long-stream-wsola-1.15.{wav,json}`,
+superiority. Uncommitted local artifacts include `long-stream-wsola-1.15.{wav,json}`,
 `wsola-implementation.json` (source hashes and policies), and the retained
 `long-stream-picola-1.15.{wav,json}`, under `.cache/tts/fairy/`.
 
@@ -479,9 +516,11 @@ mlx tts -m ./CustomVoice-1.7B --voice vivian --input-format jsonl --file events.
 ```
 
 Text remains the default input format. JSONL is incremental UTF-8, allows a final
-record without a newline, and has a 64 KiB record limit. Invalid records terminate
-the stream with a line-numbered error. File input is opened lazily and destroyed
-on iterator completion. `--instruct` and `--instruct-file` are mutually exclusive;
+record without a newline, and has a 64 KiB record limit. In `jsonl` mode `--text`
+is parsed as a single JSONL record, so use `{"type":"text","text":"…"}` rather than
+plain text. Invalid records terminate the stream with a line-numbered error. File
+input is opened lazily and destroyed on iterator completion. `--instruct` and
+`--instruct-file` are mutually exclusive;
 preset, reference audio, and voice description are mutually exclusive voice modes.
 
 ### Prefix caching

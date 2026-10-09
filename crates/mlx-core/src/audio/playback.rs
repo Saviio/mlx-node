@@ -14,8 +14,12 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+// A stalled CoreAudio render callback (device unplugged or suspended) makes
+// the ring stop draining; bound every producer wait so callers can error out.
+const STALL: Duration = Duration::from_secs(10);
 
 struct Ring {
     samples: Box<[AtomicU32]>,
@@ -24,6 +28,9 @@ struct Ring {
     enabled: AtomicBool,
     closed: AtomicBool,
     cancelled: AtomicBool,
+    // Set before cancelling on a stall so finish() reports the stall rather
+    // than racing cancel() to a clean partial drain.
+    stalled: AtomicBool,
     underruns: AtomicU64,
     played: AtomicU64,
     first_ns: AtomicU64,
@@ -106,6 +113,10 @@ impl Playback {
             let _ = unit.stop();
         }
     }
+    fn stall(&self) {
+        self.ring.stalled.store(true, Ordering::Release);
+        self.stop();
+    }
 }
 #[napi(object)]
 pub struct PcmPlaybackStats {
@@ -152,6 +163,7 @@ impl PcmPlayer {
             enabled: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            stalled: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             played: AtomicU64::new(0),
             first_ns: AtomicU64::new(0),
@@ -219,17 +231,28 @@ impl PcmPlayer {
         env.spawn_future(async move {
             let _writer = inner.writer.lock().await;
             let mut at = 0;
+            let mut last_progress = Instant::now();
             while at < samples.len() {
+                if inner.ring.stalled.load(Ordering::Acquire) {
+                    return Err(Error::from_reason("PCM playback stalled"));
+                }
                 if inner.ring.cancelled.load(Ordering::Acquire)
                     || inner.ring.closed.load(Ordering::Acquire)
                 {
                     return Err(Error::from_reason("PCM player closed"));
                 }
-                at += inner.ring.push(&samples[at..]);
+                let pushed = inner.ring.push(&samples[at..]);
+                at += pushed;
                 if inner.ring.queued() >= inner.prebuffer {
                     inner.ring.enabled.store(true, Ordering::Release);
                 }
                 if at < samples.len() {
+                    if pushed > 0 {
+                        last_progress = Instant::now();
+                    } else if last_progress.elapsed() >= STALL {
+                        inner.stall();
+                        return Err(Error::from_reason("PCM playback stalled"));
+                    }
                     tokio::time::sleep(Duration::from_millis(4)).await;
                 }
             }
@@ -243,22 +266,38 @@ impl PcmPlayer {
             let _writer = inner.writer.lock().await;
             inner.ring.closed.store(true, Ordering::Release);
             inner.ring.enabled.store(true, Ordering::Release);
+            let mut last_progress = Instant::now();
+            let mut last_queued = inner.ring.queued();
             while inner.ring.queued() > 0 && !inner.ring.cancelled.load(Ordering::Acquire) {
+                let queued = inner.ring.queued();
+                if queued != last_queued {
+                    last_queued = queued;
+                    last_progress = Instant::now();
+                } else if last_progress.elapsed() >= STALL {
+                    inner.stall();
+                    return Err(Error::from_reason("PCM playback stalled"));
+                }
                 tokio::time::sleep(Duration::from_millis(4)).await;
             }
             // An empty software ring only means CoreAudio accepted the last
             // block. Wait until its scheduled presentation ends before stop.
+            let deadline = Instant::now() + STALL;
             while !inner.ring.cancelled.load(Ordering::Acquire) {
                 let remaining = inner
                     .ring
                     .drain_ns
                     .load(Ordering::Acquire)
                     .saturating_sub(inner.ring.now_ns());
-                if remaining == 0 {
+                if remaining == 0 || Instant::now() >= deadline {
                     break;
                 }
                 tokio::time::sleep(Duration::from_nanos(remaining).min(Duration::from_millis(4)))
                     .await;
+            }
+            // A stall on either side sets `stalled`; a concurrent finish must
+            // surface it instead of resolving a partial drain as success.
+            if inner.ring.stalled.load(Ordering::Acquire) {
+                return Err(Error::from_reason("PCM playback stalled"));
             }
             let stats = stats(&inner);
             inner.stop();
@@ -301,6 +340,7 @@ mod tests {
             enabled: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            stalled: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             played: AtomicU64::new(0),
             first_ns: AtomicU64::new(0),

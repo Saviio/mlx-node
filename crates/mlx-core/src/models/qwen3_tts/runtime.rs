@@ -15,6 +15,8 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
+// Registered ceilings feed the shared process-wide MLX free pool, so this
+// limit applies to every loaded model in the process, not just TTS.
 const CACHE_LIMIT_ENV: &str = "TTS_MLX_CACHE_LIMIT";
 
 fn parse_cache_limit(raw: &str) -> Result<Option<usize>> {
@@ -121,10 +123,11 @@ enum Command {
         reply: ResponseTx<String>,
         busy: Arc<AtomicBool>,
     },
+    // Releases stay valid while a generation or preparation runs: the command
+    // channel serializes them behind the active operation.
     Release {
         id: String,
         reply: ResponseTx<()>,
-        busy: Arc<AtomicBool>,
     },
     Dispose(ResponseTx<()>),
 }
@@ -233,15 +236,10 @@ impl TtsNativeModel {
                         drop(_guard);
                         let _ = reply.send(result);
                     }
-                    Command::Release { id, reply, busy } => {
-                        let _guard = RunGuard {
-                            busy,
-                            control: None,
-                        };
+                    Command::Release { id, reply } => {
                         if let Some(model) = state.0.as_mut() {
                             model.release_voice(&id);
                         }
-                        drop(_guard);
                         let _ = reply.send(Ok(()));
                     }
                     Command::Dispose(reply) => {
@@ -291,6 +289,15 @@ impl TtsNativeModel {
             finished: AtomicBool::new(false),
             ended: Notify::new(),
         });
+        match self.active.lock() {
+            Ok(mut active) => {
+                *active = Some(ActiveOperation::Generate(control.clone()));
+            }
+            Err(_) => {
+                self.busy.store(false, Ordering::Release);
+                return Err(Error::from_reason("TTS lifecycle lock poisoned"));
+            }
+        }
         let result = self.thread.send(Command::Generate {
             text,
             options: Box::new(options),
@@ -299,14 +306,12 @@ impl TtsNativeModel {
             busy: self.busy.clone(),
         });
         if let Err(error) = result {
+            if let Ok(mut active) = self.active.lock() {
+                *active = None;
+            }
             self.busy.store(false, Ordering::Release);
             return Err(error);
         }
-        *self
-            .active
-            .lock()
-            .map_err(|_| Error::from_reason("TTS lifecycle lock poisoned"))? =
-            Some(ActiveOperation::Generate(control.clone()));
         Ok(TtsNativeStream { control })
     }
     #[napi]
@@ -340,6 +345,9 @@ impl TtsNativeModel {
             reply,
             busy: self.busy.clone(),
         }) {
+            if let Ok(mut active) = self.active.lock() {
+                *active = None;
+            }
             self.busy.store(false, Ordering::Release);
             return Err(error);
         }
@@ -353,18 +361,8 @@ impl TtsNativeModel {
         if self.disposed.load(Ordering::Acquire) {
             return env.spawn_future(async { Ok(()) });
         }
-        if self.busy.swap(true, Ordering::AcqRel) {
-            return Err(Error::from_reason("TTS model busy"));
-        }
         let (reply, rx) = tokio::sync::oneshot::channel();
-        if let Err(error) = self.thread.send(Command::Release {
-            id,
-            reply,
-            busy: self.busy.clone(),
-        }) {
-            self.busy.store(false, Ordering::Release);
-            return Err(error);
-        }
+        self.thread.send(Command::Release { id, reply })?;
         env.spawn_future(async move {
             rx.await
                 .map_err(|_| Error::from_reason("TTS worker exited during voice release"))?
@@ -373,12 +371,7 @@ impl TtsNativeModel {
     #[napi]
     pub fn dispose<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
         self.disposed.store(true, Ordering::Release);
-        if let Some(control) = self
-            .active
-            .lock()
-            .map_err(|_| Error::from_reason("TTS lifecycle lock poisoned"))?
-            .take()
-        {
+        if let Some(control) = self.active.lock().unwrap_or_else(|e| e.into_inner()).take() {
             control.cancel();
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -391,9 +384,8 @@ impl TtsNativeModel {
 }
 impl Drop for TtsNativeModel {
     fn drop(&mut self) {
-        if let Ok(active) = self.active.lock()
-            && let Some(control) = active.as_ref()
-        {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(control) = active.as_ref() {
             control.cancel();
         }
     }
@@ -412,7 +404,7 @@ impl TtsNativeStream {
             ));
         }
         let control = self.control.clone();
-        env.spawn_future(async move {
+        match env.spawn_future(async move {
             let mut receiver = control.receiver.lock().await;
             let notified = control.notify.notified();
             tokio::pin!(notified);
@@ -433,7 +425,13 @@ impl TtsNativeStream {
                     first_pcm_ms: p.first_pcm_ms,
                 })
             })
-        })
+        }) {
+            Ok(promise) => Ok(promise),
+            Err(error) => {
+                self.control.pulling.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
     }
     #[napi]
     pub fn wait_finished<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {

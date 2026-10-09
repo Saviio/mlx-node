@@ -56,6 +56,10 @@ pub struct SpeechTempo {
     reference_prefix: Vec<f64>,
     window: Vec<f64>,
     closed: bool,
+    /// Grain picks recorded for tests: (desired, excluded verbatim start, low,
+    /// high, chosen). The second field is None when no position was excluded.
+    #[cfg(test)]
+    selections: Vec<(u64, Option<u64>, u64, u64, u64)>,
 }
 impl SpeechTempo {
     pub fn new(sample_rate: u32, channels: u32, speed: f64) -> Result<Self, TempoError> {
@@ -114,6 +118,8 @@ impl SpeechTempo {
             reference_prefix: Vec::new(),
             window: (0..hop).map(|i| fade(i, hop)).collect(),
             closed: false,
+            #[cfg(test)]
+            selections: Vec::new(),
         })
     }
     /// Input frames required for the first nonempty write, including the
@@ -247,7 +253,7 @@ impl SpeechTempo {
         ) as u64;
         let low = desired.saturating_sub(radius).max(self.base);
         let high = (desired + radius).min(self.received - overlap as u64);
-        let start = self.select(desired, low, high);
+        let start = self.select(desired, low, high, false);
         let correction = desired as f64 - start as f64;
         for frame in 0..count {
             let position = if frame < overlap {
@@ -259,8 +265,10 @@ impl SpeechTempo {
             let position = position.clamp(self.base as f64, (self.received - 1) as f64);
             let left = position.floor() as u64;
             let fraction = position - left as f64;
+            // Ramp length is overlap+1 so frame 0 keeps weight 0 even at
+            // overlap==1 (short tails); the frame at `overlap` crosses to 1.
             let weight = if frame < overlap {
-                fade(frame, overlap)
+                fade(frame, overlap + 1)
             } else {
                 1.
             };
@@ -343,11 +351,27 @@ impl SpeechTempo {
             2. * cross / energy
         }
     }
-    fn select(&mut self, desired: u64, low: u64, high: u64) -> u64 {
+    fn select(&mut self, desired: u64, low: u64, high: u64, verbatim_tail: bool) -> u64 {
         self.prepare_search(high + (self.tail.len() / self.channels) as u64);
         let mut best = desired.clamp(low, high);
+        // On the render path the tail is copied verbatim from input at
+        // previous_start + hop, so that position always scores a perfect
+        // self-match and would lock grains into rate-1 playback. Exclude it
+        // unless it is the nominal continuation (natural == desired), where
+        // verbatim is correct. The endpoint tail is synthesized output rather
+        // than verbatim input, so no position is excluded there.
+        let natural = self.previous_start + self.hop as u64;
+        let verbatim = |candidate: u64| verbatim_tail && candidate == natural && natural != desired;
+        // The clamped seed itself can land on the excluded position at the
+        // finishing boundary; reseed to a neighbor so it cannot win by default.
+        if verbatim(best) {
+            best = if best > low { best - 1 } else { high };
+        }
         let mut score = self.similarity(best, self.stride);
         for candidate in (low..=high).step_by(self.stride) {
+            if verbatim(candidate) {
+                continue;
+            }
             let value = self.similarity(candidate, self.stride);
             if preferable(value, candidate, score, best, desired) {
                 best = candidate;
@@ -359,21 +383,18 @@ impl SpeechTempo {
         for candidate in coarse.saturating_sub(self.stride as u64).max(low)
             ..=(coarse + self.stride as u64).min(high)
         {
+            if verbatim(candidate) {
+                continue;
+            }
             let value = self.similarity(candidate, 1);
             if preferable(value, candidate, score, best, desired) {
                 best = candidate;
                 score = value;
             }
         }
-        // A direct continuation can be a narrow correlation peak for unvoiced
-        // consonants/transients; don't miss it on the coarse search grid.
-        let natural = self.previous_start + self.hop as u64;
-        if natural >= low && natural <= high {
-            let value = self.similarity(natural, 1);
-            if preferable(value, natural, score, best, desired) {
-                best = natural;
-            }
-        }
+        #[cfg(test)]
+        self.selections
+            .push((desired, verbatim_tail.then_some(natural), low, high, best));
         best
     }
     fn render(&mut self, finishing: bool, output: &mut Vec<f32>) {
@@ -391,7 +412,7 @@ impl SpeechTempo {
                 .saturating_sub(self.search as u64)
                 .max(self.base)
                 .min(high);
-            self.select(desired, low, high)
+            self.select(desired, low, high, true)
         };
         for frame in 0..self.hop {
             for channel in 0..self.channels {
@@ -654,5 +675,55 @@ mod tests {
         assert!(tempo.write(&[f32::NAN, 0.]).is_err());
         assert_eq!(tempo.received, 0);
         assert!(tempo.finish().unwrap().is_empty());
+    }
+    #[test]
+    fn selection_never_locks_onto_the_verbatim_continuation() {
+        // The tail mirrors input at previous_start + hop, so that candidate
+        // always correlates to exactly 1. Unless it is also the nominal time
+        // map position, choosing it stalls the map and later forces a skip.
+        let mut state = 0x9e37_79b9u32;
+        let input: Vec<f32> = (0..48000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as f32 / u32::MAX as f32 - 0.5
+            })
+            .collect();
+        for speed in [0.7, 0.8, 1.1, 1.25, 1.35] {
+            let mut tempo = SpeechTempo::new(24000, 1, speed).unwrap();
+            for block in input.chunks(1531) {
+                tempo.write(block).unwrap();
+            }
+            tempo.finish().unwrap();
+            assert!(!tempo.selections.is_empty(), "speed {speed}");
+            assert!(
+                tempo.selections.iter().any(|s| s.1.is_some()),
+                "speed {speed}: no render-path selections recorded"
+            );
+            for &(desired, natural, low, high, chosen) in &tempo.selections {
+                if let Some(natural) = natural {
+                    assert!(
+                        chosen != natural || chosen == desired.clamp(low, high),
+                        "speed {speed}: grain at {chosen} locked onto the verbatim \
+                         continuation {natural} (desired {desired} in {low}..={high})"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn endpoint_replacement_crossfades_the_first_frame() {
+        // With a short final tail the overlap resolves to a single frame; the
+        // replaced region must still crossfade instead of hard-overwriting the
+        // boundary sample with a verbatim input frame.
+        let input: Vec<f32> = (0..5)
+            .map(|i| (std::f32::consts::TAU * 800. * i as f32 / 24000.).sin())
+            .collect();
+        let output = run(&input, 1, 0.25, 5);
+        let boundary = output.len() - 5;
+        assert_ne!(output[boundary], input[0]);
+        let step = (output[boundary] - output[boundary - 1]).abs();
+        assert!(step < 0.4, "boundary discontinuity {step}");
     }
 }

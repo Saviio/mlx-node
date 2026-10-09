@@ -15,7 +15,7 @@ use napi::{Error, Result};
 use rand::{SeedableRng, rngs::StdRng};
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
@@ -45,10 +45,6 @@ struct GenerationConfig {
     top_p: f64,
     repetition_penalty: f64,
     max_new_tokens: usize,
-    subtalker_temperature: f64,
-    subtalker_top_k: i32,
-    subtalker_top_p: f64,
-    subtalker_dosample: bool,
 }
 fn sampling_temperature(override_value: Option<f64>, configured: f64, enabled: bool) -> f64 {
     override_value.unwrap_or(if enabled { configured } else { 0. })
@@ -83,11 +79,15 @@ pub struct VoiceCondition {
     text: Vec<i32>,
     codec_prefix: CodecState,
 }
+// Each prepared voice retains a speaker embedding, codec codes and a
+// materialized codec prefix, so retained voices are bounded FIFO.
+const MAX_PREPARED_VOICES: usize = 8;
 
 pub struct NativeModel {
     speaker: Option<super::speaker::SpeakerEncoder>,
     encoder: Option<super::encoder::CodecEncoder>,
     voices: HashMap<String, VoiceCondition>,
+    voice_order: VecDeque<String>,
     pub config: ModelConfig,
     pub codec: CodecDecoder,
     tokenizer: TextTokenizer,
@@ -202,6 +202,7 @@ impl NativeModel {
                 None
             },
             voices: HashMap::new(),
+            voice_order: VecDeque::new(),
             tokenizer: TextTokenizer::load(path)?,
             talker: Decoder::load(&w, "talker.model", &c.transformer, true, false)?,
             predictor: Decoder::load(
@@ -426,10 +427,21 @@ impl NativeModel {
         super::check_cancelled(cancelled)?;
         let id = uuid::Uuid::new_v4().to_string();
         self.voices.insert(id.clone(), condition);
+        self.voice_order.push_back(id.clone());
+        while self.voice_order.len() > MAX_PREPARED_VOICES {
+            if let Some(evicted) = self.voice_order.pop_front() {
+                self.voices.remove(&evicted);
+            } else {
+                break;
+            }
+        }
         Ok(id)
     }
     pub fn release_voice(&mut self, id: &str) {
         self.voices.remove(id);
+        if let Some(index) = self.voice_order.iter().position(|v| v == id) {
+            self.voice_order.remove(index);
+        }
     }
     fn condition(&self, options: &Options) -> Result<&VoiceCondition> {
         let id = options
@@ -534,11 +546,6 @@ impl NativeModel {
             self.defaults.temperature,
             self.defaults.do_sample,
         );
-        let subtalker_temperature = sampling_temperature(
-            options.temperature,
-            self.defaults.subtalker_temperature,
-            self.defaults.subtalker_dosample,
-        );
         let top_k = options.top_k.unwrap_or(self.defaults.top_k);
         let top_p = options.top_p.unwrap_or(self.defaults.top_p);
         let penalty = options
@@ -554,6 +561,13 @@ impl NativeModel {
         {
             return Err(Error::from_reason("Invalid TTS sampling options"));
         }
+        // ICL needs a stronger penalty: the reference floors it at 1.5 to
+        // prevent code degeneration with long reference audio prefills.
+        let penalty = if options.prepared_voice_id.is_some() {
+            penalty.max(1.5)
+        } else {
+            penalty
+        };
         let max_frames = options.max_frames.unwrap_or(self.defaults.max_new_tokens);
         let chunk_frames = options.chunk_frames.unwrap_or(2).min(max_frames);
         if max_frames == 0 || chunk_frames == 0 || chunk_frames > max_frames {
@@ -595,7 +609,10 @@ impl NativeModel {
             })
             .collect();
         let mask = MxArray::from_float32(&mask, &[1, c.vocab_size as i64])?;
-        let mut seen = vec![false; c.vocab_size];
+        // The reference penalizes only the last 64 group-0 tokens; a monotonic
+        // history progressively over-penalizes long utterances.
+        const REPETITION_CONTEXT_SIZE: usize = 64;
+        let mut recent: VecDeque<i32> = VecDeque::with_capacity(REPETITION_CONTEXT_SIZE);
         let mut pending = Vec::new();
         let mut first_pcm_ms = None;
         let mut blocked = 0.;
@@ -612,24 +629,17 @@ impl NativeModel {
                 .reshape(&[1, c.vocab_size as i64])?
                 .astype(DType::Float32)?
                 .add(&mask)?;
-            if penalty != 1. && step > 0 {
-                let multipliers: Vec<f32> = seen
-                    .iter()
-                    .map(|&yes| if yes { penalty as f32 } else { 1. })
-                    .collect();
+            if penalty != 1. && !recent.is_empty() {
+                let mut multipliers = vec![1f32; c.vocab_size];
+                for &token in &recent {
+                    multipliers[token as usize] = penalty as f32;
+                }
                 let mult = MxArray::from_float32(&multipliers, &[1, c.vocab_size as i64])?;
                 logits = logits
                     .less(&MxArray::scalar_float(0.)?)?
                     .where_(&logits.mul(&mult)?, &logits.div(&mult)?)?;
             }
-            let token = draw(
-                &logits,
-                temperature,
-                top_k,
-                top_p,
-                Some(c.codec_eos_token_id),
-                &mut rng,
-            )?;
+            let token = draw(&logits, temperature, top_k, top_p, &mut rng)?;
             let mut tokens = vec![token];
             for state in &mut code_state {
                 state.kv.reset_keep_capacity();
@@ -648,14 +658,7 @@ impl NativeModel {
                 let logits = self.residual_heads[i]
                     .forward(&h)?
                     .reshape(&[1, valid as i64])?;
-                tokens.push(draw(
-                    &logits,
-                    subtalker_temperature,
-                    options.top_k.unwrap_or(self.defaults.subtalker_top_k),
-                    options.top_p.unwrap_or(self.defaults.subtalker_top_p),
-                    None,
-                    &mut rng,
-                )?);
+                tokens.push(draw(&logits, temperature, top_k, top_p, &mut rng)?);
             }
             let all = cat(&tokens.iter().collect::<Vec<_>>(), 1)?.reshape(&[
                 1,
@@ -681,7 +684,10 @@ impl NativeModel {
             if first < 0 || first as usize >= valid {
                 return Err(Error::from_reason("Invalid generated codec ID"));
             }
-            seen[first as usize] = true;
+            if recent.len() == REPETITION_CONTEXT_SIZE {
+                recent.pop_front();
+            }
+            recent.push_back(first);
             pending.push(all);
             if pending.len() >= chunk_frames {
                 let audio = self
@@ -730,34 +736,22 @@ fn draw(
     temperature: f64,
     top_k: i32,
     top_p: f64,
-    eos: Option<i32>,
     rng: &mut StdRng,
 ) -> Result<MxArray> {
     let mut x = logits.astype(DType::Float32)?;
     if temperature <= 1e-6 {
         return x.argmax(-1, Some(true))?.astype(DType::Int32);
     }
-    let saved = eos
-        .map(|id| x.slice_axis(1, id as i64, id as i64 + 1))
-        .transpose()?;
-    if top_k > 0 {
+    // Reference order: temperature first, then filters on tempered logits;
+    // EOS receives no protection from top_k/top_p.
+    x = x.div_scalar(temperature)?;
+    if top_k > 0 && i64::from(top_k) < x.shape()?[1] {
         x = apply_top_k(&x, top_k)?;
     }
     if top_p > 0. && top_p < 1. {
         x = apply_top_p(&x, top_p)?;
     }
-    if let (Some(id), Some(saved)) = (eos, saved) {
-        x = cat(
-            &[
-                &x.slice_axis(1, 0, id as i64)?,
-                &saved,
-                &x.slice_axis(1, id as i64 + 1, x.shape()?[1])?,
-            ],
-            1,
-        )?;
-    }
-    let probabilities =
-        Activations::softmax(&x.div_scalar(temperature)?, Some(-1))?.reshape(&[-1])?;
+    let probabilities = Activations::softmax(&x, Some(-1))?.reshape(&[-1])?;
     sample_dense_distribution_array(&probabilities, rng)?.reshape(&[1, 1])
 }
 

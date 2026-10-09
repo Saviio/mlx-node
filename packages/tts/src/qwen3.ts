@@ -30,6 +30,9 @@ export async function loadQwen3Backend(path: string, options: TtsLoadOptions = {
     start(text, options) {
       const frameMs = (samplesPerFrame * 1000) / capabilities.sampleRate;
       const chunkFrames = Math.ceil(options.chunkDurationMs / frameMs);
+      const bufferChunks = Math.max(1, Math.floor((options.audioBufferSeconds * 1000) / (chunkFrames * frameMs)));
+      if (bufferChunks > 4096)
+        throw new RangeError('audioBufferSeconds/chunkDurationMs exceeds the native buffer capacity (4096 chunks)');
       return native.start(
         text,
         JSON.stringify({
@@ -44,7 +47,7 @@ export async function loadQwen3Backend(path: string, options: TtsLoadOptions = {
           repetition_penalty: options.repetitionPenalty,
           seed: options.seed,
           chunk_frames: chunkFrames,
-          buffer_chunks: Math.max(1, Math.floor((options.audioBufferSeconds * 1000) / (chunkFrames * frameMs))),
+          buffer_chunks: bufferChunks,
           max_frames:
             options.maxDurationSeconds === undefined
               ? undefined

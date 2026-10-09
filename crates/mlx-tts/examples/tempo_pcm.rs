@@ -20,6 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if chunk == 0 {
         return Err("chunk must be positive".into());
     }
+    let chunk_samples = chunk
+        .checked_mul(channels as usize)
+        .ok_or("chunk-frames too large")?;
     let bytes = fs::read(&a[4])?;
     if bytes.len() % 4 != 0 {
         return Err("partial float32 sample".into());
@@ -35,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frames = 0usize;
     let mut nanos = 0u128;
     let mut peak = 0;
-    for block in input.chunks(chunk * channels as usize) {
+    for block in input.chunks(chunk_samples) {
         let start = Instant::now();
         let output = tempo.write(block)?;
         nanos += start.elapsed().as_nanos();

@@ -69,6 +69,10 @@ export function changeAudioSpeed(source: AsyncIterable<AudioChunk>, speed: numbe
         )
           throw new Error('PCM format or segment order changed');
         if (input.samples.some((value) => !Number.isFinite(value))) throw new Error('Non-finite PCM sample');
+        // Fail before constructing the native processor: SpeechTempo accepts
+        // 1000..=500_000 Hz and 1..=32 channels and would throw a generic error.
+        if (Native && (input.sampleRate < 1000 || input.sampleRate > 500_000 || input.channels > 32))
+          throw new RangeError('Invalid PCM stream');
         if (previous && previous.segmentIndex !== input.segmentIndex && processor) {
           const tail = timed(() => processor!.finish());
           processor.close();

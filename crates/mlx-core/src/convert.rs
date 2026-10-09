@@ -3080,22 +3080,28 @@ fn reject_dense_only_family_quantization(
     )))
 }
 
-/// Qwen3-ASR's loader accepts one uniform packed format for the text tower.
-/// Mixed recipes emit per-layer metadata that the runtime intentionally
-/// rejects, and the remaining quantization modes have no ASR dispatch.
-fn validate_qwen3_asr_quantization(
+/// Qwen3-ASR's and Qwen3-TTS's loaders accept one uniform packed format for
+/// the text tower. Mixed recipes emit per-layer metadata that the runtimes
+/// intentionally reject, and the remaining quantization modes have no
+/// dispatch in either family.
+fn validate_qwen3_packed_quantization(
     model_type: Option<&str>,
     do_quantize: bool,
     quant_mode: &str,
     quant_recipe: Option<&str>,
 ) -> Result<()> {
-    if !matches!(model_type, Some("qwen3_asr" | "qwen3_tts")) || !do_quantize {
+    let family = match model_type {
+        Some("qwen3_asr") => "Qwen3-ASR",
+        Some("qwen3_tts") => "Qwen3-TTS",
+        _ => return Ok(()),
+    };
+    if !do_quantize {
         return Ok(());
     }
     if !matches!(quant_mode, "affine" | "mxfp4" | "mxfp8") || quant_recipe.is_some() {
-        return Err(Error::from_reason(
-            "Qwen3-ASR packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit quant_recipe",
-        ));
+        return Err(Error::from_reason(format!(
+            "{family} packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit quant_recipe",
+        )));
     }
     Ok(())
 }
@@ -3351,7 +3357,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // dense. Fail before mode-specific validation, input I/O, the conversion
     // mutex, or any MLX operation.
     reject_dense_only_family_quantization(model_type.as_deref(), do_quantize, &quant_mode)?;
-    validate_qwen3_asr_quantization(
+    validate_qwen3_packed_quantization(
         model_type.as_deref(),
         do_quantize,
         &quant_mode,
@@ -12327,28 +12333,40 @@ mod tests {
     #[test]
     fn qwen3_asr_rejects_mixed_or_unsupported_native_quantization() {
         for mode in ["affine", "mxfp4", "mxfp8"] {
-            validate_qwen3_asr_quantization(Some("qwen3_asr"), true, mode, None)
+            validate_qwen3_packed_quantization(Some("qwen3_asr"), true, mode, None)
                 .expect("uniform ASR packed mode must remain supported");
         }
 
         for mode in ["nvfp4", "sym8"] {
-            let error = validate_qwen3_asr_quantization(Some("qwen3_asr"), true, mode, None)
+            let error = validate_qwen3_packed_quantization(Some("qwen3_asr"), true, mode, None)
                 .expect_err("unsupported ASR mode must fail before conversion I/O");
             assert!(error.reason.contains("uniform"), "{}", error.reason);
         }
 
-        let error =
-            validate_qwen3_asr_quantization(Some("qwen3_asr"), true, "affine", Some("mixed_4_6"))
-                .expect_err("ASR mixed recipe must fail before conversion I/O");
+        let error = validate_qwen3_packed_quantization(
+            Some("qwen3_asr"),
+            true,
+            "affine",
+            Some("mixed_4_6"),
+        )
+        .expect_err("ASR mixed recipe must fail before conversion I/O");
         assert!(
             error.reason.contains("omit quant_recipe"),
             "{}",
             error.reason
         );
 
-        validate_qwen3_asr_quantization(Some("qwen3_asr"), false, "affine", Some("mixed_4_6"))
+        let error = validate_qwen3_packed_quantization(Some("qwen3_tts"), true, "nvfp4", None)
+            .expect_err("unsupported TTS mode must fail before conversion I/O");
+        assert!(
+            error.reason.contains("Qwen3-TTS"),
+            "the rejection names the TTS family, not ASR: {}",
+            error.reason
+        );
+
+        validate_qwen3_packed_quantization(Some("qwen3_asr"), false, "affine", Some("mixed_4_6"))
             .expect("the existing generic recipe-without-quantize validation owns this case");
-        validate_qwen3_asr_quantization(Some("qwen3_5"), true, "affine", Some("mixed_4_6"))
+        validate_qwen3_packed_quantization(Some("qwen3_5"), true, "affine", Some("mixed_4_6"))
             .expect("other model families keep their recipe support");
     }
 

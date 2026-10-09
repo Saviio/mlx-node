@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from 'vite-plus/test';
 import { createTtsModel, type TtsBackend } from '../src/model.js';
 import { BoundedQueue } from '../src/queue.js';
 import { TextSegmenter } from '../src/segmenter.js';
+import type { TtsStream } from '../src/types.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -200,6 +201,30 @@ describe('session lifecycle', () => {
     expect(remove).toHaveBeenCalledExactlyOnceWith('abort', expect.any(Function));
     await model.dispose();
   });
+  it('rejects completed with AbortError when cancel races the natural queue close', async () => {
+    const { model, backend } = fake();
+    let stream: TtsStream | undefined;
+    vi.spyOn(backend, 'start').mockImplementationOnce(() => ({
+      next: async () => ({
+        samples: new Float32Array([1, 2]),
+        finished: true,
+        finishReason: 'eos',
+        synthesisMs: 10,
+      }),
+      cancel: () => {},
+      // Awaits queue.shift() resume after the terminal packet: abort before
+      // waitFinished resolves so the close is not a natural end.
+      waitFinished: async () => stream?.cancel(),
+    }));
+    stream = model.synthesizeStream('Hi.', { voice: 'voice' });
+    const iterator = stream[Symbol.asyncIterator]();
+    // The only chunk carries the terminal flag; the second pull enters the
+    // waitFinished/queue-close window where the cancel lands.
+    expect((await iterator.next()).value?.samples.length).toBe(2);
+    await expect(iterator.next()).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(stream.completed).rejects.toMatchObject({ name: 'AbortError' });
+    await model.dispose();
+  });
   it('return before the first pull settles completion and releases the model', async () => {
     const { model, submitted } = fake();
     const stream = model.synthesizeStream('Never.', { voice: 'voice' });
@@ -245,18 +270,18 @@ describe('session lifecycle', () => {
     await a.model.dispose();
     await b.model.dispose();
   });
-  it('rejects disposal of a busy voice without losing the handle, then releases it once', async () => {
+  it('releases a busy voice once the native queue drains, then releases it once', async () => {
     const { model, backend } = fake();
     const voice = await model.prepareVoice({
       audio: { samples: new Float32Array([0, 1]), sampleRate: 10 },
       transcript: 'Hello',
     });
     const stream = model.synthesizeStream('Hello.', { voice });
-    await expect(voice.dispose()).rejects.toThrow('busy');
-    expect(backend.releaseVoice).not.toHaveBeenCalled();
+    await voice.dispose();
+    expect(backend.releaseVoice).toHaveBeenCalledExactlyOnceWith(voice.id);
     stream.cancel();
     await expect(stream.completed).rejects.toMatchObject({ name: 'AbortError' });
-    await model.synthesize('Reusable.', { voice });
+    expect(() => model.synthesizeStream('Released.', { voice })).toThrow('does not belong');
     await Promise.all([voice.dispose(), voice.dispose()]);
     expect(backend.releaseVoice).toHaveBeenCalledExactlyOnceWith(voice.id);
     expect(() => model.synthesizeStream('Released.', { voice })).toThrow('does not belong');
@@ -275,26 +300,28 @@ describe('session lifecycle', () => {
     const release = first.dispose();
     expect(() => model.synthesizeStream('Busy.', { voice: 'voice' })).toThrow('busy');
     expect(() => model.prepareVoice(reference)).toThrow('busy');
-    await expect(second.dispose()).rejects.toThrow('busy');
+    // A second release joins the in-flight one instead of busy-rejecting.
+    const secondRelease = second.dispose();
     released.resolve();
-    await release;
-    await model.synthesize('Other voice remains usable.', { voice: second });
-    await second.dispose();
+    await Promise.all([release, secondRelease]);
+    expect(backend.releaseVoice).toHaveBeenNthCalledWith(1, 'first');
+    expect(backend.releaseVoice).toHaveBeenNthCalledWith(2, 'second');
+    expect(() => model.synthesizeStream('Released.', { voice: second })).toThrow('does not belong');
+    await model.synthesize('Model is free again.', { voice: 'voice' });
     await model.dispose();
   });
-  it('rejects releasing a voice during preparation and leaves it usable afterward', async () => {
+  it('releases a voice during preparation once the native queue drains', async () => {
     const { model, backend } = fake();
     const reference = { audio: { samples: new Float32Array([0, 1]), sampleRate: 10 }, transcript: 'Hello' };
     const voice = await model.prepareVoice(reference);
     const preparation = deferred<string>();
     vi.spyOn(backend, 'prepareVoice').mockImplementationOnce(() => preparation.promise);
     const pending = model.prepareVoice(reference);
-    await expect(voice.dispose()).rejects.toThrow('busy');
-    expect(backend.releaseVoice).not.toHaveBeenCalled();
+    await voice.dispose();
+    expect(backend.releaseVoice).toHaveBeenCalledExactlyOnceWith(voice.id);
     preparation.resolve('second');
     await pending;
-    await model.synthesize('Still usable.', { voice });
-    await voice.dispose();
+    expect(() => model.synthesizeStream('Released.', { voice })).toThrow('does not belong');
     await model.dispose();
   });
   it('allows retrying failed voice release and does not call a disposed backend', async () => {

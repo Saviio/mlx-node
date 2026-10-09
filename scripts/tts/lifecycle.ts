@@ -35,6 +35,7 @@ if (reference) {
 }
 let nativeReferenceRelease: { activeBytesBefore: number; activeBytesAfter: number } | undefined;
 let sdkReferenceRelease: { activeBytesBefore: number; activeBytesAfter: number } | undefined;
+let releasedDuringGeneration = false;
 let disposedPreparationMs: number | undefined;
 const native = await TtsNativeModel.load(
   values.model,
@@ -56,9 +57,14 @@ try {
   );
   assert.ok((await stream.next())?.samples.length);
   await sleep(400);
-  if (nativeVoiceId) await assert.rejects(async () => native.releaseVoice(nativeVoiceId), /busy/);
+  // Voice release no longer requires an idle model; it serializes behind the
+  // running generation, so cancel before awaiting to keep this bounded.
+  const releaseWhileBusy = nativeVoiceId ? native.releaseVoice(nativeVoiceId) : undefined;
+  releasedDuringGeneration = nativeVoiceId !== undefined;
+  void releaseWhileBusy?.catch(() => {}); // Keep the later await the single failure point.
   stream.cancel();
   await stream.waitFinished();
+  await releaseWhileBusy;
   assert.equal(await stream.next(), null);
   const next = native.start('可以再次使用。', JSON.stringify({ ...condition, seed: 534, max_frames: 1 }));
   while (await next.next()) {
@@ -67,7 +73,7 @@ try {
   await next.waitFinished();
   if (reference && nativeVoiceId) {
     const activeBytesBefore = getMemorySnapshot().activeBytes;
-    await native.releaseVoice(nativeVoiceId);
+    // The voice was already released during the generation above.
     await native.releaseVoice(nativeVoiceId);
     nativeReferenceRelease = { activeBytesBefore, activeBytesAfter: getMemorySnapshot().activeBytes };
     const released = native.start('已经释放的声音。', JSON.stringify({ ...condition, max_frames: 1 }));
@@ -118,11 +124,13 @@ try {
   if (reference && prepared) {
     const live = model.synthesizeStream('请保持声音直到取消。', { ...options, maxDurationSeconds: 0.16 });
     assert.ok((await live[Symbol.asyncIterator]().next()).value?.samples.length);
-    await assert.rejects(prepared.dispose(), /busy/);
+    const activeBytesBefore = getMemorySnapshot().activeBytes;
+    // Release serializes behind the running generation; cancel before awaiting.
+    const released = prepared.dispose();
+    void released.catch(() => {}); // Keep the later await the single failure point.
     live.cancel();
     await assert.rejects(live.completed, { name: 'AbortError' });
-    const activeBytesBefore = getMemorySnapshot().activeBytes;
-    await prepared.dispose();
+    await released;
     await prepared.dispose();
     sdkReferenceRelease = { activeBytesBefore, activeBytesAfter: getMemorySnapshot().activeBytes };
     assert.throws(() => model.synthesizeStream('已经释放的声音。', options), /Prepared voice does not belong/);
@@ -188,7 +196,7 @@ try {
         ? {
             native: nativeReferenceRelease,
             sdk: sdkReferenceRelease,
-            rejectedBusyRelease: true,
+            releasedDuringGeneration,
             rejectedReleasedVoices: true,
             preparedReplacementVoices: true,
             disposedPreparationMs,

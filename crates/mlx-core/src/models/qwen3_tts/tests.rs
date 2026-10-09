@@ -1,3 +1,7 @@
+//! Numerical parity tests against pinned checkpoints and external fixtures.
+//! They are `#[ignore]`d by default. Run them with
+//! `TTS_TEST_MODEL=<checkpoint dir> TTS_TEST_GOLDENS=<fixture dir> cargo test -p mlx-core --lib -- --ignored qwen3_tts`;
+//! fixture contents are described in docs/tts.md.
 use super::{
     codec::CodecDecoder, config::read_json, encoder::CodecEncoder, tokenizer::TextTokenizer,
     weights::Weights,

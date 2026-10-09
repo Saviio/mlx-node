@@ -62,6 +62,19 @@ const PERMANENT_FS_CODES = new Set([
  */
 const PERMANENT_PROTOCOL_MESSAGES = ['Unsupported chunk version', 'Unsupported compression scheme'];
 
+/**
+ * Deterministic composite-model refusals raised by `listModelFilesOnce`, which
+ * runs INSIDE `withRetries`. Each describes repo state a repeat cannot change:
+ * a vanished config, a component that is incomplete at this revision, or a
+ * composite listing with no immutable revision to pin to — so they must not
+ * cost four recursive listings plus 1/2/4s of backoff to fail identically.
+ */
+const PERMANENT_DOWNLOAD_MESSAGES = [
+  'Repository config disappeared',
+  'Composite models require an immutable revision',
+  'Required model component',
+];
+
 /** The human-readable text of a failure, whatever shape it arrived in. */
 function failureText(error: unknown): string {
   if (typeof error === 'string') return error;
@@ -131,8 +144,9 @@ function isRetriableStatus(status: number): boolean {
  * The harm is asymmetric, but NOT as cheaply as "7 s of backoff": because each
  * attempt truncates `<blob>.incomplete` and re-GETs without a Range header, a
  * wrongly-retried failure also re-transfers the shard up to three more times.
- * That is why the two categories which are deterministic AND status-less —
- * {@link PERMANENT_FS_CODES} and {@link PERMANENT_PROTOCOL_MESSAGES} — are
+ * That is why the categories which are deterministic AND status-less —
+ * {@link PERMANENT_FS_CODES}, {@link PERMANENT_PROTOCOL_MESSAGES}, and
+ * {@link PERMANENT_DOWNLOAD_MESSAGES} — are
  * named explicitly instead of being left to the default. Refusing to retry
  * something transient still costs the whole download, so everything else
  * unmodelled keeps defaulting to retry.
@@ -157,6 +171,7 @@ export function isRetriableFetchError(error: unknown): boolean {
   // string through the blob stream, but as an Error when awaited directly.
   const text = failureText(error);
   if (PERMANENT_PROTOCOL_MESSAGES.some((m) => text.includes(m))) return false;
+  if (PERMANENT_DOWNLOAD_MESSAGES.some((m) => text.includes(m))) return false;
 
   if (typeof error === 'string') {
     const status = FLATTENED_STATUS.exec(error);

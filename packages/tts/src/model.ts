@@ -61,14 +61,15 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
     languages: Object.freeze([...backend.capabilities.languages]),
   });
   const voices = new WeakSet<PreparedVoice>();
-  let active: TtsStream | undefined;
+  // Weak so an abandoned, never-iterated stream frees the busy slot via GC.
+  let active: WeakRef<TtsStream> | undefined;
   let preparing: Promise<PreparedVoice> | undefined;
   let releasing: Promise<void> | undefined;
   let disposed = false;
   let disposal: Promise<void> | undefined;
   function available() {
     if (disposed) throw new Error('TTS model disposed');
-    if (active || preparing || releasing) throw new Error('TTS model busy');
+    if (active?.deref() || preparing || releasing) throw new Error('TTS model busy');
   }
   const model: TtsModel = {
     capabilities,
@@ -96,18 +97,17 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
             dispose() {
               if (disposed) return Promise.resolve();
               if (release) return release;
-              try {
-                available();
-              } catch (error) {
-                return Promise.reject(error);
-              }
-              release = Promise.resolve()
+              // The handle is dropped once the release is dispatched so queued
+              // synthesis fails eagerly instead of reaching the native queue.
+              voices.delete(voice);
+              // Releases serialize behind a running operation on the native
+              // side; concurrent releases join in the same order.
+              release = (releasing ?? Promise.resolve())
+                .catch(() => {})
                 .then(() => backend.releaseVoice(id))
-                .then(() => {
-                  voices.delete(voice);
-                })
                 .catch((error) => {
                   release = undefined;
+                  voices.add(voice);
                   throw error;
                 })
                 .finally(() => {
@@ -247,7 +247,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
         if (settled) return;
         settled = true;
         signal?.removeEventListener('abort', onAbort);
-        if (active === stream) active = undefined;
+        if (active?.deref() === stream) active = undefined;
         stats.wallMs = performance.now() - started;
         stats.realTimeFactor = stats.audioSeconds ? stats.synthesisMs / 1000 / stats.audioSeconds : null;
         if (error !== noFailure) reject(error);
@@ -303,37 +303,45 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
             const segment = await queue.shift();
             stats.inputWaitMs += performance.now() - inputWaiting;
             if (segment === undefined) {
-              naturalEnd = true;
+              // A cancel racing the natural queue close still terminates as abort.
+              naturalEnd = !controller.signal.aborted;
               break;
             }
             const submitted = performance.now();
+            // A release dispatched after stream creation can drain before this
+            // segment starts; fail it eagerly rather than on the native worker.
+            if (voiceMode === 'reference' && !voices.has(options.voice as PreparedVoice))
+              throw new Error('Prepared voice does not belong to this model');
             raw = backend.start(segment.text, { ...backendOptions, instruct: segment.instruct });
             rawCancelled = false;
             let terminal = false;
             while (true) {
               const chunk = await abortable(raw.next(), controller.signal);
               if (!chunk) break;
+              // Drain PCM before honoring `finished`: the BackendChunk contract
+              // does not require a terminal chunk to carry empty samples.
+              if (chunk.samples.length) {
+                stats.firstPcmMs ??= performance.now() - submitted;
+                const frames = chunk.samples.length / capabilities.channels;
+                if (!Number.isSafeInteger(frames)) throw new Error('Backend returned an incomplete PCM frame');
+                stats.audioSeconds += frames / capabilities.sampleRate;
+                const consumerWaiting = performance.now();
+                yield {
+                  samples: chunk.samples,
+                  sampleRate: capabilities.sampleRate,
+                  channels: capabilities.channels,
+                  startSample: offset,
+                  segmentIndex: stats.segments,
+                };
+                stats.consumerWaitMs += performance.now() - consumerWaiting;
+                offset += frames;
+              }
               if (chunk.finished) {
                 terminal = true;
                 stats.synthesisMs += chunk.synthesisMs ?? 0;
                 if (chunk.finishReason === 'length') stats.finishReason = 'length';
                 break;
               }
-              if (!chunk.samples.length) continue;
-              stats.firstPcmMs ??= performance.now() - submitted;
-              const frames = chunk.samples.length / capabilities.channels;
-              if (!Number.isSafeInteger(frames)) throw new Error('Backend returned an incomplete PCM frame');
-              stats.audioSeconds += frames / capabilities.sampleRate;
-              const consumerWaiting = performance.now();
-              yield {
-                samples: chunk.samples,
-                sampleRate: capabilities.sampleRate,
-                channels: capabilities.channels,
-                startSample: offset,
-                segmentIndex: stats.segments,
-              };
-              stats.consumerWaitMs += performance.now() - consumerWaiting;
-              offset += frames;
             }
             if (!terminal && !controller.signal.aborted) throw new Error('TTS worker ended without completion');
             await raw.waitFinished();
@@ -344,10 +352,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
           failure = inputFailure !== noFailure ? inputFailure : error;
           throw failure;
         } finally {
-          if (!naturalEnd) {
-            stats.finishReason = 'cancelled';
-            controller.abort();
-          }
+          if (!naturalEnd) controller.abort();
           cancelRaw();
           try {
             await raw?.waitFinished();
@@ -391,13 +396,13 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
           controller.abort();
           cancelRaw();
           queue.close();
-          if (!began) {
-            stats.finishReason = 'cancelled';
-            finish(abortError());
-          } else void iterator.return(undefined).catch(() => {});
+          if (!began) finish(abortError());
+          else void iterator.return(undefined).catch(() => {});
         },
       };
-      active = stream;
+      active = new WeakRef(stream);
+      // A caller-supplied signal keeps the stream alive via this listener, so
+      // GC frees the busy slot only for streams with no external references.
       signal?.addEventListener('abort', onAbort, { once: true });
       if (signal?.aborted) stream.cancel();
       return stream;
@@ -426,7 +431,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
     dispose() {
       disposal ??= (async () => {
         disposed = true;
-        const stream = active;
+        const stream = active?.deref();
         stream?.cancel();
         await Promise.all([
           backend.dispose(),

@@ -866,12 +866,13 @@ export async function run(argv: string[]) {
   }
 
   if (
-    modelType === 'qwen3_asr' &&
+    (modelType === 'qwen3_asr' || modelType === 'qwen3_tts') &&
     args.quantize &&
     ((quantMode !== undefined && !['affine', 'mxfp4', 'mxfp8'].includes(quantMode)) || args['q-recipe'] !== undefined)
   ) {
+    const family = modelType === 'qwen3_tts' ? 'Qwen3-TTS' : 'Qwen3-ASR';
     console.error(
-      'Error: Qwen3-ASR packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit --q-recipe',
+      `Error: ${family} packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit --q-recipe`,
     );
     process.exit(1);
   }

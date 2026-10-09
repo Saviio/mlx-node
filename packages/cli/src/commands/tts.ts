@@ -42,7 +42,8 @@ export async function run(args: string[]): Promise<void> {
   --voice-description <text>  VoiceDesign voice description (1.7B)
   --instruct <text>           Delivery instruction (supported voice modes only)
   --instruct-file <file>      Read the delivery instruction from a UTF-8 file
-  --input-format text|jsonl   Incremental input format (default: text; 64 KiB per JSONL record)
+  --input-format text|jsonl   Incremental input format (default: text; 64 KiB per JSONL record;
+                              with jsonl, --text is parsed as a single JSONL record)
   --language <language>      Default: auto
   --play                     Stream PCM to the default macOS output device
   -o, --output <wav>          Stream to a PCM16 WAV file
@@ -161,6 +162,13 @@ fractional values are supported, and unset/0 uses the normal cache policy.`);
         2,
       ),
     );
+  } catch (error) {
+    if (!controller.signal.aborted) throw error;
+    // Ctrl+C landed: the stream rejects with AbortError, but that is a clean
+    // cancellation, not a failure — report the conventional 130 and let the
+    // finally block still tear down player, writer, and model.
+    process.exitCode = 130;
+    console.error('Cancelled');
   } finally {
     player?.cancel();
     try {
