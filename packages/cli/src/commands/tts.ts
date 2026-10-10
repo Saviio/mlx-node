@@ -50,7 +50,7 @@ export async function run(args: string[]): Promise<void> {
   --chunk-ms <ms>             Target PCM chunk duration (default: 160)
   --prebuffer-seconds <s>     Playback prebuffer (default: 0.32; at most buffer capacity)
   --buffer-seconds <s>        Playback buffer capacity (default: 1)
-  --max-duration <seconds>    Per-segment generation limit; truncation is reported
+  --max-duration <seconds>    Per-segment generation limit (default: 120); truncation is reported
   --seed <integer>            Reproducible sampling
   --speed <factor>            Pitch-preserving speech speed (0.25..4; default: 1)
 

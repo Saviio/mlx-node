@@ -12,7 +12,22 @@ use crate::{
     },
 };
 use napi::{Error, Result};
-use std::sync::atomic::AtomicBool;
+use std::{collections::HashMap, sync::atomic::AtomicBool};
+
+/// The decoder is an F32 architecture: half-precision weights run slower
+/// (bf16 conv/SDPA kernels) and measurably degrade output (~34 dB SNR loss,
+/// PR-204 audit #5). Fail loudly instead of silently degrading.
+fn check_decoder_dtype(tensors: &HashMap<String, MxArray>) -> Result<()> {
+    for (name, tensor) in tensors {
+        if name.starts_with("decoder.") && tensor.dtype()? != DType::Float32 {
+            return Err(Error::from_reason(format!(
+                "Codec decoder tensor {name} must be float32 (got {:?})",
+                tensor.dtype()?
+            )));
+        }
+    }
+    Ok(())
+}
 
 pub fn conv(w: &Weights, prefix: &str, stride: u32, dilation: u32, groups: u32) -> Result<Conv1d> {
     let (weight, bias) = w.conv(prefix, false)?;
@@ -212,9 +227,7 @@ impl CodecState {
         })
     }
 
-    /// Materialize every retained tail, including histories not needed by the
-    /// most recent PCM output, so a prepared prefix retains no growing graph.
-    fn eval(&self) -> Result<()> {
+    fn retained(&self) -> Vec<&MxArray> {
         let mut arrays = Vec::new();
         arrays.extend(self.pre.history.as_ref());
         for state in &self.transformer {
@@ -234,7 +247,20 @@ impl CodecState {
             }
         }
         arrays.extend(self.final_conv.history.as_ref());
-        MxArray::eval_arrays(&arrays)
+        arrays
+    }
+
+    /// Materialize every retained tail, including histories not needed by the
+    /// most recent PCM output, so a prepared prefix retains no growing graph.
+    fn eval(&self) -> Result<()> {
+        MxArray::eval_arrays(&self.retained())
+    }
+
+    /// Submit the same materialization without waiting, so the next chunk's
+    /// graph build overlaps the GPU eval. The final `eval` still performs the
+    /// one synchronous wait.
+    fn eval_async(&self) {
+        MxArray::async_eval_arrays(&self.retained());
     }
 }
 impl CodecDecoder {
@@ -248,6 +274,7 @@ impl CodecDecoder {
                 ));
             }
         }
+        check_decoder_dtype(&w.tensors)?;
         let (initial, _) = w.conv("decoder.decoder.0.conv", false)?;
         if initial.shape()?[0] != c.decoder_dim || initial.shape()?[2] != c.latent_dim {
             return Err(Error::from_reason(
@@ -381,14 +408,110 @@ impl CodecDecoder {
 
     /// Prepare a reusable reference prefix without retaining its PCM or a
     /// reference-length decoder graph. One codec frame bounds temporary memory.
+    /// `step` must stay per-frame: multi-frame shapes change conv/GEMM tiling
+    /// and are not bit-identical to the 1-frame loop (chunked runs verified
+    /// against this loop diverge in sample 0). The history materialization is
+    /// submitted asynchronously so each frame's graph build overlaps the GPU
+    /// eval of the previous one, then the final `eval` performs the one
+    /// synchronous wait that bounds retained state and surfaces eval errors.
     pub fn prepare_prefix(&self, codes: &MxArray, cancelled: &AtomicBool) -> Result<CodecState> {
         let mut state = self.state();
         for frame in 0..codes.shape_at(1)? {
             super::check_cancelled(cancelled)?;
             let _ = self.step(&codes.slice_axis(1, frame, frame + 1)?, &mut state)?;
-            state.eval()?;
+            state.eval_async();
         }
         super::check_cancelled(cancelled)?;
+        state.eval()?;
         Ok(state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_dtype_guard_rejects_half_weights() {
+        let tensors = |decoder_dtype: DType| {
+            HashMap::from([
+                (
+                    "decoder.pre_transformer.input_proj.weight".to_string(),
+                    MxArray::from_float32(&[0.; 4], &[2, 2])
+                        .unwrap()
+                        .astype(decoder_dtype)
+                        .unwrap(),
+                ),
+                (
+                    "decoder.decoder.0.conv.weight".to_string(),
+                    MxArray::from_float32(&[0.; 8], &[2, 2, 2])
+                        .unwrap()
+                        .astype(decoder_dtype)
+                        .unwrap(),
+                ),
+                // The encoder is a separate family with its own checks.
+                (
+                    "encoder.encoder.0.conv.weight".to_string(),
+                    MxArray::from_float32(&[0.; 4], &[2, 2]).unwrap(),
+                ),
+            ])
+        };
+        check_decoder_dtype(&tensors(DType::Float32)).unwrap();
+        let err = check_decoder_dtype(&tensors(DType::BFloat16)).unwrap_err();
+        assert!(err.reason.contains("must be float32"), "{err:?}");
+    }
+
+    /// `prepare_prefix` must retain bit-identical state: async-evaluating the
+    /// histories between frames cannot change the continuation's PCM bits.
+    #[test]
+    #[ignore = "Requires a Qwen3-TTS checkpoint in TTS_TEST_MODEL"]
+    fn prepare_prefix_matches_per_frame() {
+        use super::super::config::{CodecConfig, read_json};
+        use super::super::weights::Weights;
+        use std::path::Path;
+
+        let root = Path::new(&std::env::var("TTS_TEST_MODEL").unwrap()).join("speech_tokenizer");
+        let weights = Weights::load(&root).unwrap();
+        let config: CodecConfig = read_json(&root.join("config.json")).unwrap();
+        let codec = CodecDecoder::load(&weights, config).unwrap();
+        let groups = codec.config.decoder_config.num_quantizers as i64;
+        // 19 prefix frames fill the state; 4 continuation frames decode
+        // through it so history differences surface in the PCM bits.
+        let values: Vec<i32> = (0..23 * groups)
+            .map(|i| ((i * 37 + 11) % 1024) as i32)
+            .collect();
+        let codes = MxArray::from_int32(&values, &[1, 23, groups]).unwrap();
+        let prefix = codes.slice_axis(1, 0, 19).unwrap();
+        let continuation = codes.slice_axis(1, 19, 23).unwrap();
+        let prepared = codec
+            .prepare_prefix(&prefix, &AtomicBool::new(false))
+            .unwrap();
+        let mut legacy = codec.state();
+        for frame in 0..19i64 {
+            let _ = codec
+                .step(
+                    &prefix.slice_axis(1, frame, frame + 1).unwrap(),
+                    &mut legacy,
+                )
+                .unwrap();
+            legacy.eval().unwrap();
+        }
+        let decode = |mut state: CodecState| {
+            codec
+                .step(&continuation, &mut state)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+        };
+        let a = decode(prepared.fork().unwrap());
+        let b = decode(legacy);
+        assert_eq!(a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "sample {i}: prepared prefix changed PCM bits"
+            );
+        }
     }
 }

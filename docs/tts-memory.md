@@ -14,6 +14,15 @@ budgets are inherently unsuitable.
 For the subsequent native allocation changes, smaller-cache sweeps and 1.7B
 measurements, see [the cache-floor follow-up](tts-cache-floor.md).
 
+> **RTF context (2026-10-10):** the 0.5–0.89 native RTF figures below were
+> recorded on the earlier, slower decode path and the older converted 8-bit
+> checkpoint; they are historical comparisons of allocator-cache policy, not
+> current speed. On the current head with dense BF16 official checkpoints, the
+> same CLI measures medians of 3 runs at **RTF 0.24–0.33** (0.6B ≈ 0.24–0.26,
+> 1.7B ≈ 0.29–0.33; ~20 ms/frame vs ~26 ms/frame per 12 Hz frame). The
+> allocator-policy conclusions and memory methodology below remain valid; only
+> the absolute RTF level has moved.
+
 ## What the counters mean
 
 - `physicalFootprintBytes`: macOS's process physical footprint from

@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { createTtsModel } from '../src/model.js';
-import { loadQwen3Backend } from '../src/qwen3.js';
 import type { BackendOptions } from '../src/model.js';
+import { loadQwen3Backend } from '../src/qwen3.js';
 import type { TtsCapabilities } from '../src/types.js';
 
 const mock = vi.hoisted(() => ({
@@ -66,9 +66,9 @@ describe('Qwen3 backend adapter', () => {
   });
   it('rejects malformed instruction-cache options before loading', async () => {
     const before = mock.loadArgs.length;
-    await expect(
-      loadQwen3Backend('/model', { instructionCache: { enabled: true, maxBytes: -1 } }),
-    ).rejects.toThrow(RangeError);
+    await expect(loadQwen3Backend('/model', { instructionCache: { enabled: true, maxBytes: -1 } })).rejects.toThrow(
+      RangeError,
+    );
     await expect(
       loadQwen3Backend('/model', { instructionCache: { enabled: 'yes' as unknown as boolean } }),
     ).rejects.toThrow(TypeError);
@@ -92,7 +92,7 @@ describe('Qwen3 backend adapter', () => {
         seed: 534,
         chunk_frames: 2, // 160 ms / 80 ms frames
         buffer_chunks: 6, // 1 s buffer / 160 ms chunks
-        max_frames: undefined,
+        max_frames: 1500, // default 120 s / 80 ms frames
       },
     ]);
   });
@@ -107,9 +107,7 @@ describe('Qwen3 backend adapter', () => {
     const backend = await loadQwen3Backend('/model');
     const before = mock.startArgs.length;
     expect(() => backend.start('x', options({ audioBufferSeconds: 700 }))).toThrow(RangeError);
-    expect(() => backend.start('x', options({ audioBufferSeconds: 700 }))).toThrow(
-      /buffer capacity \(4096 chunks\)/,
-    );
+    expect(() => backend.start('x', options({ audioBufferSeconds: 700 }))).toThrow(/buffer capacity \(4096 chunks\)/);
     expect(mock.startArgs.length).toBe(before);
   });
   it('wires model defaults through the stream backend', async () => {

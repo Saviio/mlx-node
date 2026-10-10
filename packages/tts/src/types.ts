@@ -62,6 +62,7 @@ export interface TtsOptions {
   topK?: number;
   topP?: number;
   repetitionPenalty?: number;
+  /** Per-segment generation limit in seconds (default 120); truncation reports `finishReason: 'length'`. */
   maxDurationSeconds?: number;
   chunkDurationMs?: number;
   audioBufferSeconds?: number;

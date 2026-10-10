@@ -79,7 +79,10 @@ Model disposal also cancels voice preparation at computation-stage boundaries;
 an already running MLX evaluation completes before its resources are released.
 
 `maxDurationSeconds` is a per-segment limit; reaching it reports `finishReason:
-'length'`. The default limit comes from the checkpoint generation configuration.
+'length'`. The SDK and CLI default it to 120 seconds (1,500 codec frames); that
+ceiling also bounds the talker KV reservation to ~160 MiB per segment instead of
+the checkpoint generation limit (~0.9 GiB at 8,192 frames). Direct native callers
+that omit `max_frames` still use the checkpoint generation configuration.
 Sampling options preserve the checkpoint defaults unless explicitly overridden.
 
 ## CLI and resources

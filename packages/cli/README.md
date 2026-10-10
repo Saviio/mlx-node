@@ -45,9 +45,10 @@ VoiceDesign. Supported 1.7B voice modes also accept `--instruct` or `--instruct-
 a 64 KiB record limit. `--speed` applies pitch-preserving tempo processing to
 playback and WAV output (0.25–4, default 1). `--chunk-ms` defaults to 160 ms;
 playback defaults to a one-second buffer and 0.32-second prebuffer, configurable
-with `--buffer-seconds` and `--prebuffer-seconds`. `--max-duration` limits each text
-segment, and `--seed` controls reproducible sampling. See `mlx tts --help` and the
-[TTS guide](https://github.com/mlx-node/mlx-node/blob/main/docs/tts.md) for SDK usage,
+with `--buffer-seconds` and `--prebuffer-seconds`. `--max-duration` limits each
+text segment (default 120 seconds), and `--seed` controls reproducible sampling.
+See `mlx tts --help` and the [TTS
+guide](https://github.com/mlx-node/mlx-node/blob/main/docs/tts.md) for SDK usage,
 conversion and measured performance.
 
 ### Delegate Work

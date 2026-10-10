@@ -82,6 +82,10 @@ pub struct VoiceCondition {
 // Each prepared voice retains a speaker embedding, codec codes and a
 // materialized codec prefix, so retained voices are bounded FIFO.
 const MAX_PREPARED_VOICES: usize = 8;
+/// Up-front talker KV reservation and growth-slab granularity (~160 s of
+/// audio, ~215 MiB of KV): generation longer than the horizon grows the cache
+/// at this step instead of holding the full bound turn-long.
+const RESERVE_HORIZON_FRAMES: usize = 2048;
 
 pub struct NativeModel {
     speaker: Option<super::speaker::SpeakerEncoder>,
@@ -529,6 +533,11 @@ impl NativeModel {
         let instruction_ids = self.instruction_tokens(&options)?;
         let (mut input, trailing, pad) = self.prepare_body(text, &options)?;
         let mut talker_state = self.talker.state();
+        // The decode reserve below is capped at RESERVE_HORIZON_FRAMES, so any
+        // growth past it amortizes in slabs of the same granularity.
+        for state in &mut talker_state {
+            state.kv = KVCache::with_growth_step(RESERVE_HORIZON_FRAMES)?;
+        }
         let mut code_state = self.predictor.state();
         // Each audio frame writes two initial rows plus one for each remaining
         // residual code: exactly num_code_groups rows before the next reset.
@@ -598,13 +607,17 @@ impl NativeModel {
         }
         // Pre-size the talker KV to the whole turn (resident prefix + prompt +
         // frames): growth is a full-buffer copy, so unreserved appends churn
-        // O(bound²/step) bytes per layer. Predictor/codec caches are skipped:
-        // the predictor's growth step already covers its fixed 16-row window
-        // and the codec window keeps its cache bounded.
+        // O(bound²/step) bytes per layer. The reservation is capped at the
+        // horizon so an unbounded max_frames (generation_config defaults to
+        // 8192, ~0.9 GiB of talker KV) cannot pin that allocation for a short
+        // utterance; generation past the horizon grows in horizon-sized slabs.
+        // Predictor/codec caches are skipped: the predictor's growth step
+        // already covers its fixed 16-row window and the codec window keeps
+        // its cache bounded.
         if let Some(first) = talker_state.first() {
             let bound = i64::from(first.kv.get_offset())
                 .saturating_add(input.shape()?[1])
-                .saturating_add(max_frames as i64);
+                .saturating_add(max_frames.min(RESERVE_HORIZON_FRAMES) as i64);
             for state in &mut talker_state {
                 state.kv.reserve(bound)?;
             }
@@ -627,6 +640,10 @@ impl NativeModel {
         const REPETITION_CONTEXT_SIZE: usize = 64;
         let mut recent: VecDeque<i32> = VecDeque::with_capacity(REPETITION_CONTEXT_SIZE);
         let mut pending = Vec::new();
+        // The previous chunk's codec output is submitted without waiting and
+        // read back only after the next frame's eval_arrays commits, so its
+        // GPU work overlaps that frame's host-side graph build.
+        let mut deferred_pcm: Option<MxArray> = None;
         let mut first_pcm_ms = None;
         let mut blocked = 0.;
         let mut reason = "length";
@@ -707,6 +724,18 @@ impl NativeModel {
             };
             input = embed.add(&t)?;
             MxArray::eval_arrays(&[&all, &input])?;
+            // eval_arrays just waited on the GPU timeline, which already
+            // contains the deferred chunk's commands, so this readback is a
+            // small copy rather than a codec-decode wait.
+            if let Some(pcm) = deferred_pcm.take() {
+                emit_pcm(
+                    pcm.to_float32()?.to_vec(),
+                    &started,
+                    &mut first_pcm_ms,
+                    &mut blocked,
+                    &mut emit,
+                )?;
+            }
             let first = tokens[0].item_at_int32(0)?;
             if first == c.codec_eos_token_id {
                 reason = "eos";
@@ -721,38 +750,45 @@ impl NativeModel {
             recent.push_back(first);
             pending.push(all);
             if pending.len() >= chunk_frames {
-                let audio = self
-                    .codec
-                    .step(
-                        &cat(&pending.iter().collect::<Vec<_>>(), 1)?,
-                        &mut codec_state,
-                    )?
-                    .to_float32()?
-                    .to_vec();
-                if first_pcm_ms.is_none() {
-                    first_pcm_ms = Some(started.elapsed().as_secs_f64() * 1000.);
-                }
-                let wait = Instant::now();
-                emit(audio)?;
-                blocked += wait.elapsed().as_secs_f64() * 1000.;
+                let pcm = self.codec.step(
+                    &cat(&pending.iter().collect::<Vec<_>>(), 1)?,
+                    &mut codec_state,
+                )?;
+                // Submit without waiting: the readback lands after the next
+                // frame's eval_arrays, overlapping codec decode with that
+                // frame's tape build. A cancel/error drops the lazy array
+                // un-evaluated, matching the old blocking site's drop.
+                MxArray::async_eval_arrays(&[&pcm]);
+                deferred_pcm = Some(pcm);
                 pending.clear();
             }
         }
-        if !pending.is_empty() && !cancelled.load(Ordering::Acquire) {
-            let audio = self
-                .codec
-                .step(
-                    &cat(&pending.iter().collect::<Vec<_>>(), 1)?,
-                    &mut codec_state,
-                )?
-                .to_float32()?
-                .to_vec();
-            if first_pcm_ms.is_none() {
-                first_pcm_ms = Some(started.elapsed().as_secs_f64() * 1000.);
+        if !cancelled.load(Ordering::Acquire) {
+            // The deferred chunk (produced first) drains before the tail.
+            if let Some(pcm) = deferred_pcm.take() {
+                emit_pcm(
+                    pcm.to_float32()?.to_vec(),
+                    &started,
+                    &mut first_pcm_ms,
+                    &mut blocked,
+                    &mut emit,
+                )?;
             }
-            let wait = Instant::now();
-            emit(audio)?;
-            blocked += wait.elapsed().as_secs_f64() * 1000.;
+            if !pending.is_empty() {
+                emit_pcm(
+                    self.codec
+                        .step(
+                            &cat(&pending.iter().collect::<Vec<_>>(), 1)?,
+                            &mut codec_state,
+                        )?
+                        .to_float32()?
+                        .to_vec(),
+                    &started,
+                    &mut first_pcm_ms,
+                    &mut blocked,
+                    &mut emit,
+                )?;
+            }
         }
         Ok(GenerationStats {
             synthesis_ms: started.elapsed().as_secs_f64() * 1000. - blocked,
@@ -760,6 +796,26 @@ impl NativeModel {
             reason,
         })
     }
+}
+
+/// Emit one PCM chunk in frame order, stamp first-PCM latency on the first
+/// chunk, and charge only the consumer-send wait to `blocked` so backpressure
+/// stays excluded from `synthesis_ms`. The deferred chunk's fp32 readback
+/// happens here; `codec.step` already produces float32 output.
+fn emit_pcm(
+    audio: Vec<f32>,
+    started: &Instant,
+    first_pcm_ms: &mut Option<f64>,
+    blocked: &mut f64,
+    emit: &mut impl FnMut(Vec<f32>) -> Result<()>,
+) -> Result<()> {
+    if first_pcm_ms.is_none() {
+        *first_pcm_ms = Some(started.elapsed().as_secs_f64() * 1000.);
+    }
+    let wait = Instant::now();
+    emit(audio)?;
+    *blocked += wait.elapsed().as_secs_f64() * 1000.;
+    Ok(())
 }
 
 fn draw(
@@ -796,35 +852,40 @@ fn draw(
 ///             + 3 × (hidden + intermediate) × 2 B   one layer's scratch
 /// predictor = (num_code_groups - 1) single-token forwards
 ///             × 3 × (hidden + intermediate) × 2 B
-/// codec     = num_quantizers × chunk_frames rows per windowed step
-///             × 3 × (hidden + intermediate) × 2 B
+/// codec     = chunk_frames rows (codes are RVQ-summed before the transformer)
+///             × 3 × (hidden + intermediate) × 4 B   f32 decoder scratch
+/// conv      = chunk_frames × upsample × decoder_dim × 4 B
+///             (widest f32 conv-stack feature map, not summed per stage)
 /// pcm       = 2 × chunk_frames × upsample × 4 B     clip + f32 copy
 /// ```
 fn tts_step_transient(model: &ModelConfig, codec: &CodecConfig, chunk_frames: usize) -> u64 {
     let dim = |v: i64| v.max(0) as u64;
-    let scratch = |c: &TransformerConfig| {
+    let scratch = |c: &TransformerConfig, bytes: u64| {
         dim(c.hidden_size)
             .saturating_add(dim(c.intermediate_size))
             .saturating_mul(3)
-            .saturating_mul(2)
+            .saturating_mul(bytes)
     };
     let t = &model.talker_config;
     let p = &t.code_predictor_config;
     let logits = dim(t.vocab_size as i64).saturating_mul(4).saturating_mul(2);
     let predictor =
-        (t.num_code_groups.saturating_sub(1) as u64).saturating_mul(scratch(&p.transformer));
+        (t.num_code_groups.saturating_sub(1) as u64).saturating_mul(scratch(&p.transformer, 2));
     let frames = (chunk_frames as u64).max(1);
-    let codec_step = (codec.decoder_config.num_quantizers as u64)
-        .saturating_mul(frames)
-        .saturating_mul(scratch(&codec.decoder_config.transformer));
+    let codec_step = frames.saturating_mul(scratch(&codec.decoder_config.transformer, 4));
+    let conv_stack = frames
+        .saturating_mul(codec.decode_upsample_rate as u64)
+        .saturating_mul(dim(codec.decoder_config.decoder_dim))
+        .saturating_mul(4);
     let pcm = 2u64
         .saturating_mul(frames)
         .saturating_mul(codec.decode_upsample_rate as u64)
         .saturating_mul(4);
     logits
-        .saturating_add(scratch(&t.transformer))
+        .saturating_add(scratch(&t.transformer, 2))
         .saturating_add(predictor)
         .saturating_add(codec_step)
+        .saturating_add(conv_stack)
         .saturating_add(pcm)
 }
 
@@ -969,10 +1030,12 @@ mod decode_limit_tests {
     use crate::cache_limit::DECODE_CACHE_LIMIT_FLOOR;
 
     #[test]
-    fn qwen3_tts_step_transient_fits_under_decode_floor() {
+    fn qwen3_tts_step_transient_scales_with_chunk_geometry() {
         let model: ModelConfig = serde_json::from_str(include_str!("fixtures/base.json")).unwrap();
         let codec: CodecConfig = serde_json::from_str(include_str!("fixtures/codec.json")).unwrap();
-        for chunk_frames in [1usize, 2, 8] {
+        // Default chunk geometry stays inside the floor: the repriced estimate
+        // (codec f32 scratch + widest conv-stack map) is ~24 MiB at cf=2.
+        for chunk_frames in [1usize, 2, 4] {
             let transient = tts_step_transient(&model, &codec, chunk_frames);
             assert!(
                 transient > 0 && transient < DECODE_CACHE_LIMIT_FLOOR,
@@ -983,7 +1046,12 @@ mod decode_limit_tests {
                 DECODE_CACHE_LIMIT_FLOOR
             );
         }
+        // A large chunk prices the ~11.3 MiB/frame conv-stack map honestly, so
+        // the estimate crosses the 2x binding point instead of never binding.
+        let wide = tts_step_transient(&model, &codec, 8);
+        assert!(wide.saturating_mul(2) > DECODE_CACHE_LIMIT_FLOOR);
+        assert!(crate::cache_limit::decode_cache_limit(wide) > DECODE_CACHE_LIMIT_FLOOR);
         // The estimate must track the codec chunk it prices.
-        assert!(tts_step_transient(&model, &codec, 8) > tts_step_transient(&model, &codec, 1));
+        assert!(wide > tts_step_transient(&model, &codec, 1));
     }
 }
