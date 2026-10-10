@@ -290,6 +290,89 @@ impl DecoderLayer {
     }
 }
 
+pub struct Decoder {
+    layers: Vec<DecoderLayer>,
+    norm: Option<RMSNorm>,
+    pub dtype: DType,
+}
+impl Decoder {
+    pub fn load(
+        w: &Weights,
+        prefix: &str,
+        c: &TransformerConfig,
+        qk: bool,
+        scales: bool,
+    ) -> Result<Self> {
+        let layers = (0..c.num_hidden_layers)
+            .map(|i| DecoderLayer::load(w, &format!("{prefix}.layers.{i}"), c, qk, scales))
+            .collect::<Result<_>>()?;
+        let norm = w.rms(&format!("{prefix}.norm"), c.rms_norm_eps)?;
+        let dtype = norm.get_weight().dtype()?;
+        Ok(Self {
+            layers,
+            norm: Some(norm),
+            dtype,
+        })
+    }
+    pub fn load_encoder(w: &Weights, prefix: &str, c: &TransformerConfig) -> Result<Self> {
+        c.validate()?;
+        if c.hidden_act != "gelu" {
+            return Err(Error::from_reason("Unsupported TTS encoder activation"));
+        }
+        let layers = (0..c.num_hidden_layers)
+            .map(|i| {
+                let p = format!("{prefix}.layers.{i}");
+                let a = format!("{p}.self_attn");
+                Ok(DecoderLayer {
+                    q: w.linear(&format!("{a}.q_proj"))?,
+                    k: w.linear(&format!("{a}.k_proj"))?,
+                    v: w.linear(&format!("{a}.v_proj"))?,
+                    o: w.linear(&format!("{a}.o_proj"))?,
+                    q_norm: None,
+                    k_norm: None,
+                    norm1: Norm::Layer(w.norm(&format!("{p}.input_layernorm"), c.rms_norm_eps)?),
+                    norm2: Norm::Layer(
+                        w.norm(&format!("{p}.post_attention_layernorm"), c.rms_norm_eps)?,
+                    ),
+                    gate: None,
+                    up: w.linear(&format!("{p}.mlp.fc1"))?,
+                    down: w.linear(&format!("{p}.mlp.fc2"))?,
+                    attn_scale: Some(w.get(&format!("{p}.self_attn_layer_scale.scale"))?),
+                    mlp_scale: Some(w.get(&format!("{p}.mlp_layer_scale.scale"))?),
+                    config: c.clone(),
+                    // Match Qwen's offline encoder and transformers 4.57.3
+                    // Mimi SDPA/eager: its explicit causal mask does not apply
+                    // config.sliding_window (unlike its FlashAttention path).
+                    attention_window: None,
+                    rope: RoPE::new(c.head_dim as i32, Some(false), Some(c.rope_theta), None),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            layers,
+            norm: None,
+            dtype: w
+                .get(&format!("{prefix}.layers.0.self_attn.q_proj.weight"))?
+                .dtype()?,
+        })
+    }
+    pub fn state(&self) -> Vec<AttentionState> {
+        (0..self.layers.len())
+            .map(|_| AttentionState::default())
+            .collect()
+    }
+    pub fn forward(&self, input: &MxArray, states: &mut [AttentionState]) -> Result<MxArray> {
+        let mut x = input.astype(self.dtype)?;
+        for (layer, state) in self.layers.iter().zip(states) {
+            x = layer.forward(&x, state)?;
+        }
+        match &self.norm {
+            Some(norm) => norm.forward(&x),
+            None => Ok(x),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,88 +810,5 @@ mod tests {
             }
         }
         Ok(())
-    }
-}
-
-pub struct Decoder {
-    layers: Vec<DecoderLayer>,
-    norm: Option<RMSNorm>,
-    pub dtype: DType,
-}
-impl Decoder {
-    pub fn load(
-        w: &Weights,
-        prefix: &str,
-        c: &TransformerConfig,
-        qk: bool,
-        scales: bool,
-    ) -> Result<Self> {
-        let layers = (0..c.num_hidden_layers)
-            .map(|i| DecoderLayer::load(w, &format!("{prefix}.layers.{i}"), c, qk, scales))
-            .collect::<Result<_>>()?;
-        let norm = w.rms(&format!("{prefix}.norm"), c.rms_norm_eps)?;
-        let dtype = norm.get_weight().dtype()?;
-        Ok(Self {
-            layers,
-            norm: Some(norm),
-            dtype,
-        })
-    }
-    pub fn load_encoder(w: &Weights, prefix: &str, c: &TransformerConfig) -> Result<Self> {
-        c.validate()?;
-        if c.hidden_act != "gelu" {
-            return Err(Error::from_reason("Unsupported TTS encoder activation"));
-        }
-        let layers = (0..c.num_hidden_layers)
-            .map(|i| {
-                let p = format!("{prefix}.layers.{i}");
-                let a = format!("{p}.self_attn");
-                Ok(DecoderLayer {
-                    q: w.linear(&format!("{a}.q_proj"))?,
-                    k: w.linear(&format!("{a}.k_proj"))?,
-                    v: w.linear(&format!("{a}.v_proj"))?,
-                    o: w.linear(&format!("{a}.o_proj"))?,
-                    q_norm: None,
-                    k_norm: None,
-                    norm1: Norm::Layer(w.norm(&format!("{p}.input_layernorm"), c.rms_norm_eps)?),
-                    norm2: Norm::Layer(
-                        w.norm(&format!("{p}.post_attention_layernorm"), c.rms_norm_eps)?,
-                    ),
-                    gate: None,
-                    up: w.linear(&format!("{p}.mlp.fc1"))?,
-                    down: w.linear(&format!("{p}.mlp.fc2"))?,
-                    attn_scale: Some(w.get(&format!("{p}.self_attn_layer_scale.scale"))?),
-                    mlp_scale: Some(w.get(&format!("{p}.mlp_layer_scale.scale"))?),
-                    config: c.clone(),
-                    // Match Qwen's offline encoder and transformers 4.57.3
-                    // Mimi SDPA/eager: its explicit causal mask does not apply
-                    // config.sliding_window (unlike its FlashAttention path).
-                    attention_window: None,
-                    rope: RoPE::new(c.head_dim as i32, Some(false), Some(c.rope_theta), None),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            layers,
-            norm: None,
-            dtype: w
-                .get(&format!("{prefix}.layers.0.self_attn.q_proj.weight"))?
-                .dtype()?,
-        })
-    }
-    pub fn state(&self) -> Vec<AttentionState> {
-        (0..self.layers.len())
-            .map(|_| AttentionState::default())
-            .collect()
-    }
-    pub fn forward(&self, input: &MxArray, states: &mut [AttentionState]) -> Result<MxArray> {
-        let mut x = input.astype(self.dtype)?;
-        for (layer, state) in self.layers.iter().zip(states) {
-            x = layer.forward(&x, state)?;
-        }
-        match &self.norm {
-            Some(norm) => norm.forward(&x),
-            None => Ok(x),
-        }
     }
 }

@@ -10148,9 +10148,7 @@ mod tests {
             r#"{"weight_map":{"x":"part.safetensors"}}"#,
         )
         .unwrap();
-        let error = validate_model_component(&source)
-            .err()
-            .expect("must reject missing shard");
+        let error = validate_model_component(&source).expect_err("must reject missing shard");
         assert!(error.reason.contains("Missing or invalid component shard"));
         fs::write(source.join("part.safetensors"), "new shard").unwrap();
         fs::write(destination.join("model.safetensors"), "old single").unwrap();
