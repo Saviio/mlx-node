@@ -731,7 +731,7 @@ recipes a comparison is meant to separate.
 
 ## `mlx serve`
 
-Runs the shared inference host (`@mlx-node/server/host`) in the foreground: discovers every model under the models dir, binds an Anthropic/OpenAI-compatible HTTP endpoint, and lazily loads a model on the first request that names one. At most one model stays resident; requesting another swaps it.
+Runs the shared inference host (`@mlx-node/server/host`) in the foreground: discovers models under the models dir, binds an Anthropic/OpenAI-compatible HTTP endpoint, and loads weights on the first request. By default chat/decision, ASR and TTS each have one resident slot; `--model-residency single` limits the host to one global slot. Audio-only directories are supported. See [Audio HTTP serving](serve-audio.md) for transcription, speech, SSE and incremental text input.
 
 ```bash
 mlx serve                                        # auto-picked free port
@@ -742,15 +742,16 @@ mlx serve --host 0.0.0.0 --auth-token "$(openssl rand -hex 16)"
 mlx serve --verbose                              # capture every HTTP turn to a log dir
 ```
 
-| Flag                 | Meaning                                                                                                           |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `--port <n>`         | Port to bind. Omitted ⇒ a free port is picked. `0` ⇒ ephemeral, real port printed                                 |
-| `--host <h>`         | Bind address (default `127.0.0.1`). Non-loopback exposes local models — pair with `--auth-token`                  |
-| `--models-dir <dir>` | Discovery root (default `~/.mlx-node/models`; also `MLX_MODELS_DIR`, `~/.mlx-node/config.json`)                   |
-| `--model <name>`     | Default model. Falls back to `ANTHROPIC_MODEL`, then the first discovered model                                   |
-| `--auth-token <tok>` | Required on every route except `/health`, as `x-api-key` or `Authorization: Bearer`. Also `MLX_SERVER_AUTH_TOKEN` |
-| `-v, --verbose`      | Write every request/response to a log dir                                                                         |
-| `--log-dir <dir>`    | Override the log directory (implies `--verbose`)                                                                  |
+| Flag                         | Meaning                                                                                                           |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `--port <n>`                 | Port to bind. Omitted ⇒ a free port is picked. `0` ⇒ ephemeral, real port printed                                 |
+| `--host <h>`                 | Bind address (default `127.0.0.1`). Non-loopback exposes local models — pair with `--auth-token`                  |
+| `--models-dir <dir>`         | Discovery root (default `~/.mlx-node/models`; also `MLX_MODELS_DIR`, `~/.mlx-node/config.json`)                   |
+| `--model <name>`             | Default model. Falls back to `ANTHROPIC_MODEL`, then the first discovered model                                   |
+| `--model-residency <policy>` | `capability` (default) or `single`                                                                                |
+| `--auth-token <tok>`         | Required on every route except `/health`, as `x-api-key` or `Authorization: Bearer`. Also `MLX_SERVER_AUTH_TOKEN` |
+| `-v, --verbose`              | Write every request/response to a log dir                                                                         |
+| `--log-dir <dir>`            | Override the log directory (implies `--verbose`)                                                                  |
 
 `GET /health` is unauthenticated and reports readiness (`ok` / `loading` / `degraded` / `error`), uptime, pid, resident models, and the last load's outcome — the same body `ServerInstance.health()` returns.
 
