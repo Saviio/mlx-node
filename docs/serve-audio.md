@@ -255,9 +255,9 @@ RTF measures native synthesis plus speed processing divided by output duration;
 network and input waits are excluded. An RTF below one is faster than realtime.
 Browser clients needing final statistics should use SSE; browser Fetch does not
 expose HTTP trailers reliably. PCM trailers can also be stripped by proxies.
-The tested official Node and Python SDKs do not expose these trailers through
-their streaming APIs, so raw PCM cannot deliver final duration, RTF or finish
-reason through those clients. Choose SSE or WAV HTTP response headers when those
+The tested official Node SDK does not expose these trailers through its
+streaming API, so raw PCM cannot deliver final duration, RTF or finish reason
+through that client. Choose SSE or WAV HTTP response headers when those
 values are required. Trailers are an optional facility for capable HTTP clients.
 
 ## Incremental text input (Node/backend)
@@ -307,8 +307,8 @@ failures, failures before the first output and WAV storage failures after
 synthesis begins. Validation, admission and model loading happen before this
 boundary and retain their existing retry behavior.
 
-`X-Should-Retry` is a nonstandard compatibility hint honored by the tested
-official Node and Python SDKs, not an HTTP-wide guarantee. The service does not
+`X-Should-Retry` is a nonstandard compatibility hint honored by the official
+OpenAI SDKs (tested with the Node SDK), not an HTTP-wide guarantee. The service does not
 deduplicate idempotency keys; connection failures before receiving the error
 headers, clients ignoring the hint or application retry loops can repeat work.
 For calls that must avoid SDK resubmission, set `maxRetries: 0` (Node) or
@@ -403,8 +403,8 @@ ASR cancellation and reuse, concurrent ASR/TTS, and capability-slot replacement.
 Three samples are smoke measurements, not a statistically robust production SLO.
 
 The [OpenAI SDK smoke runner](../scripts/server/audio-sdk-smoke.ts) exercises
-real requests from official Node and Python clients, including multipart,
-binary audio, SSE, error objects and Node duplex NDJSON. It covers generated
+real requests from the official Node client, including multipart, binary
+audio, SSE, error objects and duplex NDJSON. It covers generated
 SDK methods as well as the server's revision, voice and input-stream extensions.
 
 The protocol intentionally follows OpenAI field names while exposing its

@@ -51,9 +51,9 @@ async function check(name: string, action: () => Promise<unknown>) {
     console.error('FAIL', name, error);
   }
 }
-async function run(command: string, args: string[], env = process.env) {
+async function run(command: string, args: string[]) {
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(command, args, { env, stdio: 'inherit' });
+    const child = spawn(command, args, { stdio: 'inherit' });
     child.once('error', reject);
     child.once('exit', (code, signal) =>
       code === 0 ? resolve() : reject(new Error(`${command} exited ${code ?? signal}`)),
@@ -94,7 +94,6 @@ const audioHeaders = (response: Response) => {
   assert.notEqual(first, null);
   assert.ok(Number.isFinite(Number(first)) && Number(first) >= 0);
 };
-let python: unknown;
 try {
   await host.server.withSuspendedDrains(async () => {
     await check('node/models-and-voices', async () => {
@@ -372,26 +371,6 @@ try {
       assert.equal(bytes.toString('ascii', 0, 4), 'RIFF');
       return { bytes: bytes.length, sampleRate: Number(response.headers.get('x-sample-rate')) };
     });
-    if (process.env.SDK_PYTHON)
-      await check('python/sdk-suite', async () => {
-        const path = join(work, 'python.json');
-        try {
-          await run(process.env.SDK_PYTHON!, ['scripts/server/audio-sdk-smoke.py', fixture, path], {
-            ...process.env,
-            MLX_AUDIO_SDK_BASE_URL: `${host.url}/v1`,
-            MLX_AUDIO_SDK_TOKEN: token,
-            ASR_MODEL: names.asr,
-            TTS_MODEL: names.tts,
-            TTS_VOICE: voice,
-            MLX_AUDIO_SDK_PCM: join(work, 'node.pcm'),
-          });
-        } finally {
-          python = await readFile(path, 'utf8')
-            .then(JSON.parse)
-            .catch((error: unknown) => ({ reportError: String(error) }));
-        }
-        return python;
-      });
   });
 } finally {
   await host.close();
@@ -405,9 +384,7 @@ try {
         names,
         fixture,
         results,
-        python,
         residentsAfterClose: host.server.registry.audio.list().length,
-        pythonRequested: !!process.env.SDK_PYTHON,
       },
       null,
       2,

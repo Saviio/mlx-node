@@ -272,7 +272,7 @@ export async function uploadWav(
       if (failure) throw failure;
       const accepted = parser.write(chunk);
       if (failure) throw failure;
-      if (!accepted) await drain(parser, inputSignal, 30_000);
+      if (!accepted) await drain(parser, inputSignal, idleMs);
     }
     parser.end();
     await complete;
