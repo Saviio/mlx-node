@@ -37,6 +37,8 @@ export type TtsInput = string | AsyncIterable<TtsInputEvent>;
 export type TtsVoice = string | PreparedVoice | { type: 'description'; description: string };
 export interface PreparedVoice {
   readonly id: string;
+  /** Queries the owning backend, including native cache eviction. */
+  status(): Promise<'active' | 'evicted' | 'released'>;
   /**
    * Release this voice. Repeated disposal is safe. Releases may be requested
    * while the model is busy; they are queued behind the active operation.
@@ -93,7 +95,7 @@ export interface TtsAudio extends AudioData {
 }
 export interface TtsModel {
   readonly capabilities: TtsCapabilities;
-  prepareVoice(input: { audio: AudioData; transcript: string }): Promise<PreparedVoice>;
+  prepareVoice(input: { audio: AudioData; transcript: string; signal?: AbortSignal }): Promise<PreparedVoice>;
   synthesize(input: TtsInput, options: TtsOptions): Promise<TtsAudio>;
   synthesizeStream(input: TtsInput, options: TtsOptions): TtsStream;
   dispose(): Promise<void>;

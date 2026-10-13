@@ -3,3 +3,4 @@ pub(crate) mod dsp;
 #[cfg(target_os = "macos")]
 mod playback;
 mod tempo;
+mod wav;

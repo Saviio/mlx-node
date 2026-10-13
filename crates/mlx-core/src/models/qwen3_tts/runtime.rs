@@ -7,6 +7,7 @@ use crate::model_thread::{ModelThread, ResponseTx, stream_channel};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::{
+    collections::HashSet,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -98,6 +99,24 @@ struct RunGuard {
     busy: Arc<AtomicBool>,
     control: Option<Arc<Control>>,
 }
+type VoiceSnapshot = Arc<Mutex<HashSet<String>>>;
+
+/// Read view of committed native membership, never a second eviction policy.
+/// Queries cannot queue behind Generate: a consumer awaiting status may itself
+/// be holding back the PCM drain that Generate needs to complete.
+struct VoiceSnapshotOwner(VoiceSnapshot);
+impl VoiceSnapshotOwner {
+    fn publish(&self, model: Option<&NativeModel>) {
+        let ids = model.map(|m| m.voice_ids().collect()).unwrap_or_default();
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = ids;
+    }
+}
+impl Drop for VoiceSnapshotOwner {
+    fn drop(&mut self) {
+        // The worker's state owns this guard, including when execution unwinds.
+        self.publish(None);
+    }
+}
 impl Drop for RunGuard {
     fn drop(&mut self) {
         self.busy.store(false, Ordering::Release);
@@ -138,6 +157,7 @@ pub struct TtsNativeModel {
     busy: Arc<AtomicBool>,
     disposed: AtomicBool,
     active: Mutex<Option<ActiveOperation>>,
+    voices: VoiceSnapshot,
 }
 #[napi]
 impl TtsNativeModel {
@@ -152,6 +172,8 @@ impl TtsNativeModel {
             let options: LoadOptions =
                 serde_json::from_str(options_json.as_deref().unwrap_or("{}"))
                     .map_err(|e| Error::from_reason(format!("Invalid TTS load options: {e}")))?;
+            let voices = VoiceSnapshot::default();
+            let worker_voices = VoiceSnapshotOwner(voices.clone());
             let (thread, rx) = ModelThread::spawn_with_init(
                 move || {
                     let (model, bytes) = NativeModel::load(Path::new(&path))?;
@@ -163,6 +185,7 @@ impl TtsNativeModel {
                             Some(model),
                             Some(guard),
                             Some(PrefixCache::new(options.instruction_cache)),
+                            worker_voices,
                         ),
                         metadata,
                     ))
@@ -233,6 +256,7 @@ impl TtsNativeModel {
                             .and_then(|m| {
                                 m.prepare_voice(audio, sample_rate, transcript, &cancelled)
                             });
+                        state.3.publish(state.0.as_ref());
                         drop(_guard);
                         let _ = reply.send(result);
                     }
@@ -240,12 +264,14 @@ impl TtsNativeModel {
                         if let Some(model) = state.0.as_mut() {
                             model.release_voice(&id);
                         }
+                        state.3.publish(state.0.as_ref());
                         let _ = reply.send(Ok(()));
                     }
                     Command::Dispose(reply) => {
                         state.0.take();
                         state.1.take();
                         state.2.take();
+                        state.3.publish(None);
                         let _ = reply.send(Ok(()));
                     }
                 },
@@ -259,6 +285,7 @@ impl TtsNativeModel {
                 busy: Arc::new(AtomicBool::new(false)),
                 disposed: AtomicBool::new(false),
                 active: Mutex::new(None),
+                voices,
             })
         })
     }
@@ -355,6 +382,24 @@ impl TtsNativeModel {
             rx.await
                 .map_err(|_| Error::from_reason("TTS worker exited during voice preparation"))?
         })
+    }
+    #[napi]
+    pub fn has_voice<'env>(&self, env: &'env Env, id: String) -> Result<PromiseRaw<'env, bool>> {
+        let present = !self.disposed.load(Ordering::Acquire)
+            && self
+                .voices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&id);
+        env.spawn_future(async move { Ok(present) })
+    }
+    #[napi]
+    pub fn cancel_voice_preparation(&self) {
+        if let Ok(active) = self.active.lock()
+            && let Some(ActiveOperation::Prepare(cancelled)) = active.as_ref()
+        {
+            cancelled.store(true, Ordering::Release);
+        }
     }
     #[napi]
     pub fn release_voice<'env>(&self, env: &'env Env, id: String) -> Result<PromiseRaw<'env, ()>> {
@@ -477,6 +522,37 @@ mod lifecycle_tests {
     use super::*;
 
     #[test]
+    fn voice_snapshot_is_revoked_when_its_worker_state_unwinds() {
+        let voices = VoiceSnapshot::default();
+        voices.lock().unwrap().insert("prepared".into());
+        let worker_voices = voices.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _owner = VoiceSnapshotOwner(worker_voices);
+            panic!("simulated worker failure");
+        });
+        assert!(result.is_err());
+        assert!(voices.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reference_preparation_cancellation_reaches_the_worker_flag() {
+        let (thread, ready) = ModelThread::spawn_with_init(|| Ok(((), ())), |_, _: Command| {});
+        ready.blocking_recv().unwrap().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let model = TtsNativeModel {
+            thread,
+            metadata: String::new(),
+            busy: Arc::new(AtomicBool::new(true)),
+            disposed: AtomicBool::new(false),
+            active: Mutex::new(Some(ActiveOperation::Prepare(cancelled.clone()))),
+            voices: VoiceSnapshot::default(),
+        };
+        model.cancel_voice_preparation();
+        assert!(super::super::check_cancelled(&cancelled).is_err());
+        assert!(model.busy.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn qwen3_tts_model_drop_cancels_reference_preparation() {
         // No model or MLX arrays are needed to exercise the native owner lifecycle.
         let (thread, ready) = ModelThread::spawn_with_init(|| Ok(((), ())), |_, _: Command| {});
@@ -488,6 +564,7 @@ mod lifecycle_tests {
             busy: Arc::new(AtomicBool::new(true)),
             disposed: AtomicBool::new(false),
             active: Mutex::new(Some(ActiveOperation::Prepare(cancelled.clone()))),
+            voices: VoiceSnapshot::default(),
         };
         drop(model);
         assert!(super::super::check_cancelled(&cancelled).is_err());

@@ -44,6 +44,9 @@ export interface TtsBackend {
   readonly capabilities: TtsCapabilities;
   start(text: string, options: BackendOptions): BackendStream;
   prepareVoice(this: void, audio: Float32Array, sampleRate: number, transcript: string): Promise<string>;
+  /** Backends with an evicting cache must implement this authoritative lookup. */
+  hasVoice?(this: void, id: string): Promise<boolean>;
+  cancelVoicePreparation?(this: void): void;
   releaseVoice(this: void, id: string): Promise<void>;
   dispose(this: void): Promise<void>;
 }
@@ -79,8 +82,9 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
   }
   const model: TtsModel = {
     capabilities,
-    prepareVoice({ audio, transcript }) {
+    prepareVoice({ audio, transcript, signal }) {
       available();
+      signal?.throwIfAborted();
       if (!capabilities.voiceCloning) throw new Error('This model does not support voice cloning');
       const channels = audio.channels ?? 1;
       if (!Number.isSafeInteger(channels) || channels < 1 || audio.samples.length % channels)
@@ -94,12 +98,33 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
         if (!Number.isFinite(sample)) throw new Error('Reference audio contains non-finite samples');
         mono[Math.floor(i / channels)] += sample / channels;
       }
-      preparing = backend
-        .prepareVoice(mono, audio.sampleRate, transcript)
-        .then((id) => {
+      const pending = backend.prepareVoice(mono, audio.sampleRate, transcript);
+      const abort = () => backend.cancelVoicePreparation?.();
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+      preparing = pending
+        .then(async (id) => {
+          if (signal?.aborted) {
+            await backend.releaseVoice(id);
+            throw signal.reason;
+          }
           let release: Promise<void> | undefined;
+          let evicted = false;
           const voice: PreparedVoice = Object.freeze({
             id,
+            async status() {
+              if (release) return 'released';
+              if (disposed || evicted) return 'evicted';
+              try {
+                if (backend.hasVoice && !(await backend.hasVoice(id))) {
+                  evicted = true;
+                  voices.delete(voice);
+                }
+              } catch (error) {
+                if (!disposed) throw error;
+              }
+              return disposed || evicted ? 'evicted' : release ? 'released' : 'active';
+            },
             dispose() {
               if (disposed) return Promise.resolve();
               if (release) return release;
@@ -127,6 +152,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
           return voice;
         })
         .finally(() => {
+          signal?.removeEventListener('abort', abort);
           preparing = undefined;
         });
       return preparing;

@@ -1890,10 +1890,18 @@ export declare class Qwen3AsrCapture {
 export declare class Qwen3AsrModel {
   static load(modelPath: string): Promise<Qwen3AsrModel>;
   transcribe(audio: Float32Array, options?: Qwen3AsrTranscribeOptions | undefined | null): Promise<Qwen3AsrResult>;
+  /**
+   * Start cancellable transcription. Await result() even after cancel() to
+   * observe native completion before releasing an inference lease.
+   */
+  startTranscription(audio: Float32Array, options?: Qwen3AsrTranscribeOptions | undefined | null): Qwen3AsrTask;
+  dispose(): Promise<undefined>;
   createStream(options?: Qwen3AsrStreamOptions | undefined | null): Promise<Qwen3AsrStream>;
 }
 
 export declare class Qwen3AsrStream {
+  cancel(): void;
+  dispose(): Promise<undefined>;
   feed(samples: Float32Array): Promise<Qwen3AsrResult | undefined | null>;
   finish(): Promise<Qwen3AsrResult>;
   /**
@@ -1905,6 +1913,11 @@ export declare class Qwen3AsrStream {
     options: Qwen3AsrCaptureOptions | undefined | null,
     callback: (err: Error | null, arg: Qwen3AsrResult) => void,
   ): Qwen3AsrCapture;
+}
+
+export declare class Qwen3AsrTask {
+  cancel(): void;
+  result(): Promise<Qwen3AsrResult>;
 }
 
 /**
@@ -2661,6 +2674,8 @@ export declare class TtsNativeModel {
   get metadata(): string;
   start(text: string, optionsJson: string): TtsNativeStream;
   prepareVoice(audio: Float32Array, sampleRate: number, transcript: string): Promise<string>;
+  hasVoice(id: string): Promise<boolean>;
+  cancelVoicePreparation(): void;
   releaseVoice(id: string): Promise<undefined>;
   dispose(): Promise<undefined>;
 }
@@ -2776,6 +2791,22 @@ export declare class VLModel {
    */
   static load(modelPath: string): Promise<VLModel>;
 }
+
+export declare function audioDecodeWavFrames(bytes: Buffer, format: AudioWavFormat, mono: boolean): Float32Array;
+
+export declare function audioEncodePcm16(samples: Float32Array): Buffer;
+
+export declare function audioWavFormat(bytes: Buffer): AudioWavFormat;
+
+export interface AudioWavFormat {
+  encoding: number;
+  sampleRate: number;
+  channels: number;
+  bitsPerSample: number;
+  blockAlign: number;
+}
+
+export declare function audioWavHeader(sampleRate: number, channels: number, dataBytes: number): Buffer;
 
 /**
  * Build RewardOutput array from generation results.

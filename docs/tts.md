@@ -3,7 +3,8 @@
 `@mlx-node/tts` runs Qwen3-TTS in Node → Rust → MLX. It supports CustomVoice
 presets, Base reference cloning, and 1.7B VoiceDesign descriptions. Instructions
 are supported for the released 1.7B CustomVoice and VoiceDesign profiles.
-HTTP serving and batching are outside this version.
+HTTP synthesis, SSE output and incremental text input are available through
+[`mlx serve`](serve-audio.md). Native batching is outside this version.
 
 ```ts
 import { loadTtsModel, createAudioPlayer, WavWriter } from '@mlx-node/tts';
@@ -43,6 +44,17 @@ preparation finishes. A released handle
 cannot be used for synthesis. A model retains at most eight prepared voices;
 preparing beyond that evicts the oldest, and an evicted or released handle
 fails on its next use. Model disposal releases all remaining references.
+`await voice.status()` reports `active`, `evicted`, or `released`, querying the
+native cache instead of assuming a live JavaScript object still owns a voice.
+Status reads use the native cache's committed membership snapshot and can be
+awaited during stream consumption without waiting for synthesis to finish.
+Preparation also accepts `signal`; abort requests cooperative cancellation and
+the returned promise settles only after native completion (including releasing
+a result that finished just as cancellation arrived). Handles and prepared
+state are in-memory resources, not serializable voice assets. For the HTTP
+resource lifecycle, see [temporary reference voices](serve-audio.md#temporary-reference-voices).
+Checkpoint reference validation failures, such as audio too short for the
+speaker frontend, reject with `InvalidReferenceAudioError`.
 Reference length is validated against the encoder's configured context capacity
 before resampling or inference; it is not silently truncated.
 

@@ -1,69 +1,119 @@
-import { open, readFile } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 
 import type { AudioChunk, AudioData } from './types.js';
 
+/** Malformed or unsupported WAV data; filesystem failures keep their original type. */
+export class InvalidWavError extends Error {
+  override readonly name = 'InvalidWavError';
+}
+
+function decodeWav<T>(decode: () => T): T {
+  try {
+    return decode();
+  } catch (cause) {
+    throw new InvalidWavError(cause instanceof Error ? cause.message : String(cause), { cause });
+  }
+}
+
+/** A seekable WAV reader: metadata stays small and decoding is bounded per pull. */
+export class WavReader {
+  private constructor(
+    readonly file: FileHandle,
+    readonly format: import('@mlx-node/core').AudioWavFormat,
+    readonly blocks: readonly { offset: number; bytes: number }[],
+    readonly frames: number,
+  ) {}
+  get sampleRate(): number {
+    return this.format.sampleRate;
+  }
+  get channels(): number {
+    return this.format.channels;
+  }
+  static async open(path: string): Promise<WavReader> {
+    const { audioWavFormat } = await import('@mlx-node/core');
+    const file = await open(path, 'r');
+    const read = async (offset: number, size: number): Promise<Buffer> => {
+      const buffer = Buffer.alloc(size);
+      let done = 0;
+      while (done < size) {
+        const { bytesRead } = await file.read(buffer, done, size - done, offset + done);
+        if (!bytesRead) throw new InvalidWavError('Truncated WAV file');
+        done += bytesRead;
+      }
+      return buffer;
+    };
+    try {
+      const header = await read(0, 12);
+      if (header.toString('ascii', 0, 4) !== 'RIFF' || header.toString('ascii', 8, 12) !== 'WAVE')
+        throw new InvalidWavError('Expected a RIFF/WAVE file');
+      const end = header.readUInt32LE(4) + 8;
+      if (end < 12 || end !== (await file.stat()).size) throw new InvalidWavError('Invalid WAV container length');
+      let format: import('@mlx-node/core').AudioWavFormat | undefined;
+      const blocks: { offset: number; bytes: number }[] = [];
+      let at = 12;
+      let chunks = 0;
+      while (at < end) {
+        if (++chunks > 65536 || at + 8 > end) throw new InvalidWavError('Invalid WAV chunks');
+        const chunk = await read(at, 8);
+        const size = chunk.readUInt32LE(4);
+        const body = at + 8;
+        if (body + size + (size & 1) > end) throw new InvalidWavError('Truncated WAV chunk');
+        const name = chunk.toString('ascii', 0, 4);
+        if (name === 'fmt ') {
+          if (format) throw new InvalidWavError('Duplicate WAV format');
+          const bytes = await read(body, Math.min(size, 40));
+          format = decodeWav(() => audioWavFormat(bytes));
+        } else if (name === 'data') blocks.push({ offset: body, bytes: size });
+        at = body + size + (size & 1);
+      }
+      if (!format || !blocks.length) throw new InvalidWavError('WAV is missing format or samples');
+      if (blocks.some((b) => b.bytes % format.blockAlign)) throw new InvalidWavError('Incomplete WAV sample frame');
+      const frames = blocks.reduce((n, b) => n + b.bytes / format.blockAlign, 0);
+      return new WavReader(file, format, blocks, frames);
+    } catch (error) {
+      await file.close();
+      throw error;
+    }
+  }
+  async *chunks(framesPerChunk = 16384, mono = false): AsyncGenerator<Float32Array> {
+    if (!Number.isSafeInteger(framesPerChunk) || framesPerChunk < 1) throw new Error('Invalid WAV chunk size');
+    const { audioDecodeWavFrames } = await import('@mlx-node/core');
+    for (const block of this.blocks) {
+      let at = 0;
+      while (at < block.bytes) {
+        const size = Math.min(framesPerChunk * this.format.blockAlign, block.bytes - at);
+        const buffer = Buffer.allocUnsafe(size);
+        let done = 0;
+        while (done < size) {
+          const { bytesRead } = await this.file.read(buffer, done, size - done, block.offset + at + done);
+          if (!bytesRead) throw new InvalidWavError('Truncated WAV samples');
+          done += bytesRead;
+        }
+        yield decodeWav(() => audioDecodeWavFrames(buffer, this.format, mono));
+        at += size;
+      }
+    }
+  }
+  close(): Promise<void> {
+    return this.file.close();
+  }
+}
+
 /** Read uncompressed RIFF/WAVE audio, preserving source sample rate and channels. */
 export async function readWav(path: string): Promise<AudioData> {
-  const data = await readFile(path);
-  if (data.length < 12 || data.toString('ascii', 0, 4) !== 'RIFF' || data.toString('ascii', 8, 12) !== 'WAVE')
-    throw new Error('Expected a RIFF/WAVE file');
-  const end = data.readUInt32LE(4) + 8;
-  if (end > data.length) throw new Error('Truncated WAV file');
-  let format: { encoding: number; channels: number; rate: number; bits: number; align: number } | undefined;
-  const blocks: Buffer[] = [];
-  for (let at = 12; at + 8 <= end;) {
-    const size = data.readUInt32LE(at + 4);
-    const body = at + 8;
-    if (body + size > end) throw new Error('Truncated WAV chunk');
-    const name = data.toString('ascii', at, body - 4);
-    if (name === 'fmt ') {
-      if (size < 16) throw new Error('Invalid WAV format');
-      let encoding = data.readUInt16LE(body);
-      if (encoding === 0xfffe) {
-        if (
-          size < 40 ||
-          data.readUInt16LE(body + 16) < 22 ||
-          !data.subarray(body + 28, body + 40).equals(Buffer.from('00001000800000aa00389b71', 'hex'))
-        )
-          throw new Error('Unsupported extensible WAV format');
-        encoding = data.readUInt32LE(body + 24);
-      }
-      format = {
-        encoding,
-        channels: data.readUInt16LE(body + 2),
-        rate: data.readUInt32LE(body + 4),
-        align: data.readUInt16LE(body + 12),
-        bits: data.readUInt16LE(body + 14),
-      };
-    } else if (name === 'data') blocks.push(data.subarray(body, body + size));
-    at = body + size + (size & 1);
+  const reader = await WavReader.open(path);
+  try {
+    const samples = new Float32Array(reader.frames * reader.channels);
+    let offset = 0;
+    for await (const chunk of reader.chunks()) {
+      samples.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return { samples, sampleRate: reader.sampleRate, channels: reader.channels };
+  } finally {
+    await reader.close();
   }
-  if (!format || !blocks.length) throw new Error('WAV is missing format or samples');
-  const { encoding, channels, rate, bits, align } = format;
-  if (
-    !channels ||
-    !rate ||
-    align !== (channels * bits) / 8 ||
-    !((encoding === 1 && [8, 16, 24, 32].includes(bits)) || (encoding === 3 && [32, 64].includes(bits)))
-  )
-    throw new Error('Unsupported WAV sample format');
-  const bytes = Buffer.concat(blocks);
-  if (bytes.length % align) throw new Error('Incomplete WAV sample frame');
-  const samples = new Float32Array(bytes.length / (bits / 8));
-  for (let i = 0, at = 0; i < samples.length; i++, at += bits / 8) {
-    const value =
-      encoding === 3
-        ? bits === 32
-          ? bytes.readFloatLE(at)
-          : bytes.readDoubleLE(at)
-        : bits === 8
-          ? (bytes[at] - 128) / 128
-          : bytes.readIntLE(at, bits / 8) / 2 ** (bits - 1);
-    samples[i] = value;
-    if (!Number.isFinite(samples[i])) throw new Error('WAV contains non-finite samples');
-  }
-  return { samples, sampleRate: rate, channels };
 }
 
 /** Streaming PCM16 WAV writer. Memory use is bounded by the caller's chunk. */
@@ -77,6 +127,7 @@ export class WavWriter {
     file: FileHandle,
     readonly sampleRate: number,
     readonly channels: number,
+    private readonly codec: Pick<typeof import('@mlx-node/core'), 'audioWavHeader' | 'audioEncodePcm16'>,
   ) {
     this.#file = file;
   }
@@ -90,8 +141,9 @@ export class WavWriter {
       sampleRate * channels * 2 > 0xffffffff
     )
       throw new Error('Invalid WAV format');
+    const codec = await import('@mlx-node/core');
     const file = await open(path, 'w');
-    const writer = new WavWriter(file, sampleRate, channels);
+    const writer = new WavWriter(file, sampleRate, channels, codec);
     try {
       await writer.#header();
       return writer;
@@ -101,19 +153,7 @@ export class WavWriter {
     }
   }
   async #header() {
-    const header = Buffer.alloc(44);
-    header.write('RIFF');
-    header.writeUInt32LE(this.#bytes + 36, 4);
-    header.write('WAVEfmt ', 8);
-    header.writeUInt32LE(16, 16);
-    header.writeUInt16LE(1, 20);
-    header.writeUInt16LE(this.channels, 22);
-    header.writeUInt32LE(this.sampleRate, 24);
-    header.writeUInt32LE(this.sampleRate * this.channels * 2, 28);
-    header.writeUInt16LE(this.channels * 2, 32);
-    header.writeUInt16LE(16, 34);
-    header.write('data', 36);
-    header.writeUInt32LE(this.#bytes, 40);
+    const header = this.codec.audioWavHeader(this.sampleRate, this.channels, this.#bytes);
     await this.#writeAll(header, 0);
   }
   async #writeAll(buffer: Buffer, position: number) {
@@ -130,10 +170,11 @@ export class WavWriter {
       return Promise.reject(new Error('WAV chunk format changed'));
     const samples = chunk instanceof Float32Array ? chunk : chunk.samples;
     if (samples.length % this.channels) return Promise.reject(new Error('Incomplete PCM frame'));
-    const buffer = Buffer.allocUnsafe(samples.length * 2);
-    for (let i = 0; i < samples.length; i++) {
-      if (!Number.isFinite(samples[i])) return Promise.reject(new Error('Non-finite PCM sample'));
-      buffer.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32768))), i * 2);
+    let buffer: Buffer;
+    try {
+      buffer = this.codec.audioEncodePcm16(samples);
+    } catch (error) {
+      return Promise.reject(error);
     }
     this.#pending = this.#pending.then(async () => {
       if (this.#bytes + buffer.length > 0xffffffff - 36) throw new Error('WAV exceeds the RIFF 4 GiB limit');

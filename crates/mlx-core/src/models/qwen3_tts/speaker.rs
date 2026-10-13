@@ -205,7 +205,8 @@ pub(super) fn speaker_mel(audio: &[f32], config: &SpeakerConfig) -> Result<MxArr
     );
     let (padding, frames) = speaker_geometry(audio.len(), config)?;
     if audio.iter().any(|x| !x.is_finite()) {
-        return Err(Error::from_reason(
+        return Err(Error::new(
+            napi::Status::InvalidArg,
             "Reference audio is too short or contains non-finite samples",
         ));
     }
@@ -262,7 +263,8 @@ fn speaker_geometry(length: usize, c: &SpeakerConfig) -> Result<(usize, usize)> 
         .checked_add(2 * padding)
         .and_then(|n| n.checked_sub(c.fft_size));
     let Some(available) = available.filter(|_| length > padding) else {
-        return Err(Error::from_reason(
+        return Err(Error::new(
+            napi::Status::InvalidArg,
             "Reference audio is too short for the speaker frontend",
         ));
     };
@@ -275,13 +277,22 @@ mod tests {
     #[test]
     fn qwen3_tts_speaker_frontend_rejects_short_and_invalid_geometry() {
         let mut c = SpeakerConfig::default();
-        assert!(speaker_geometry(100, &c).is_err());
+        assert_eq!(
+            speaker_geometry(100, &c).unwrap_err().status,
+            napi::Status::InvalidArg
+        );
         c.hop_size = c.fft_size;
-        assert!(speaker_geometry(100, &c).is_err());
+        assert_eq!(
+            speaker_geometry(100, &c).unwrap_err().status,
+            napi::Status::InvalidArg
+        );
         assert_eq!(speaker_geometry(c.fft_size, &c).unwrap(), (0, 1));
         c.fft_size = 1;
         c.hop_size = 1;
-        assert!(speaker_geometry(100, &c).is_err());
+        assert_eq!(
+            speaker_geometry(100, &c).unwrap_err().status,
+            napi::Status::GenericFailure
+        );
         c.fft_size = 1023;
         assert!(speaker_geometry(10000, &c).is_err());
     }

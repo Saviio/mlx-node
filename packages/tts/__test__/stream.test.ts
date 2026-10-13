@@ -396,6 +396,67 @@ describe('session lifecycle', () => {
     await Promise.all([voice.dispose(), other.dispose()]);
     expect(backend.releaseVoice).toHaveBeenCalledTimes(2);
   });
+  it('reports native eviction, explicit release and model disposal without trusting JS ownership', async () => {
+    const { model, backend } = fake();
+    const reference = { audio: { samples: new Float32Array([0, 1]), sampleRate: 10 }, transcript: 'Hello' };
+    backend.hasVoice = vi.fn(async () => true);
+    const voice = await model.prepareVoice(reference);
+    expect(await voice.status()).toBe('active');
+    vi.mocked(backend.hasVoice).mockResolvedValue(false);
+    expect(await voice.status()).toBe('evicted');
+    expect(() => model.synthesizeStream('Stale.', { voice })).toThrow('does not belong');
+    await voice.dispose();
+    expect(await voice.status()).toBe('released');
+    const other = await model.prepareVoice(reference);
+    await model.dispose();
+    expect(await other.status()).toBe('evicted');
+  });
+  it('does not dispatch an already cancelled preparation', async () => {
+    const { model, backend } = fake();
+    const controller = new AbortController();
+    controller.abort();
+    expect(() =>
+      model.prepareVoice({
+        audio: { samples: new Float32Array([0]), sampleRate: 10 },
+        transcript: 'Hi',
+        signal: controller.signal,
+      }),
+    ).toThrow();
+    expect(backend.prepareVoice).not.toHaveBeenCalled();
+    await model.dispose();
+  });
+  it('holds the busy slot through native cancellation acknowledgement and cleans up a late success', async () => {
+    const { model, backend } = fake();
+    const preparation = deferred<string>();
+    const reference = { audio: { samples: new Float32Array([0, 1]), sampleRate: 10 }, transcript: 'Hello' };
+    vi.spyOn(backend, 'prepareVoice').mockImplementationOnce(() => preparation.promise);
+    backend.cancelVoicePreparation = vi.fn();
+    const controller = new AbortController();
+    const pending = model.prepareVoice({ ...reference, signal: controller.signal });
+    const reason = new Error('Stop');
+    const failed = expect(pending).rejects.toBe(reason);
+    controller.abort(reason);
+    expect(backend.cancelVoicePreparation).toHaveBeenCalledTimes(1);
+    expect(() => model.prepareVoice(reference)).toThrow('busy');
+    preparation.resolve('late-success');
+    await failed;
+    expect(backend.releaseVoice).toHaveBeenCalledExactlyOnceWith('late-success');
+    await model.prepareVoice(reference);
+    await model.dispose();
+  });
+  it('returns evicted if disposal races an outstanding native status query', async () => {
+    const { model, backend } = fake();
+    const lookup = deferred<boolean>();
+    backend.hasVoice = () => lookup.promise;
+    const voice = await model.prepareVoice({
+      audio: { samples: new Float32Array([0]), sampleRate: 10 },
+      transcript: 'Hi',
+    });
+    const status = voice.status();
+    await model.dispose();
+    lookup.reject(new Error('worker exited'));
+    expect(await status).toBe('evicted');
+  });
   it('starts backend shutdown before waiting for an outstanding voice preparation', async () => {
     const { model, backend } = fake();
     const preparation = deferred<string>();

@@ -1,3 +1,4 @@
+import { InvalidReferenceAudioError } from './errors.js';
 import type { TtsBackend } from './model.js';
 import type { TtsCapabilities, TtsLoadOptions } from './types.js';
 
@@ -59,7 +60,17 @@ export async function loadQwen3Backend(path: string, options: TtsLoadOptions = {
         }),
       );
     },
-    prepareVoice: (audio, sampleRate, transcript) => native.prepareVoice(audio, sampleRate, transcript),
+    async prepareVoice(audio, sampleRate, transcript) {
+      try {
+        return await native.prepareVoice(audio, sampleRate, transcript);
+      } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'InvalidArg')
+          throw new InvalidReferenceAudioError(error.message, { cause: error });
+        throw error;
+      }
+    },
+    hasVoice: (id) => native.hasVoice(id),
+    cancelVoicePreparation: () => native.cancelVoicePreparation(),
     releaseVoice: (id) => native.releaseVoice(id),
     dispose: () => native.dispose(),
   };

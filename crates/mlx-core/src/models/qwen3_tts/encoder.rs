@@ -158,7 +158,8 @@ fn validate_encoder_frames(
 ) -> Result<()> {
     let frames = resampled_samples.div_ceil(transformer_stride as u128);
     if frames > max_position_embeddings as u128 {
-        return Err(Error::from_reason(
+        return Err(Error::new(
+            napi::Status::InvalidArg,
             "Reference audio exceeds speech encoder context capacity",
         ));
     }
@@ -305,7 +306,12 @@ mod tests {
     fn qwen3_tts_reference_context_uses_resampled_encoder_rows() {
         let limit = 960 * 8000;
         assert!(validate_audio_length(limit, 24000, 24000, 960, 8000).is_ok());
-        assert!(validate_audio_length(limit + 1, 24000, 24000, 960, 8000).is_err());
+        assert_eq!(
+            validate_audio_length(limit + 1, 24000, 24000, 960, 8000)
+                .unwrap_err()
+                .status,
+            napi::Status::InvalidArg
+        );
         assert!(validate_audio_length(limit * 2 + 1, 48000, 24000, 960, 8000).is_ok());
         assert!(validate_audio_length(limit * 2 + 2, 48000, 24000, 960, 8000).is_err());
         assert!(validate_audio_length(usize::MAX, 1, u32::MAX, 960, 8000).is_err());

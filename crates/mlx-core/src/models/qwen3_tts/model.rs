@@ -296,9 +296,7 @@ impl NativeModel {
     fn instruction_tokens(&self, options: &Options) -> Result<Vec<i32>> {
         super::conditioning::Profile::resolve(&self.config).validate(options)?;
         match super::conditioning::instruction(options) {
-            Some(instruct) => self
-                .tokenizer
-                .encode(&format!("<|im_start|>user\n{instruct}<|im_end|>\n")),
+            Some(instruct) => self.tokenizer.encode_instruction(&instruct),
             None => Ok(vec![]),
         }
     }
@@ -357,7 +355,7 @@ impl NativeModel {
         let bos = self.text_embed(&[self.config.tts_bos_token_id])?;
         let eos = self.text_embed(&[self.config.tts_eos_token_id])?;
         let role = self.text_embed(&self.tokenizer.encode("<|im_start|>assistant\n")?)?;
-        let body = self.tokenizer.encode(text)?;
+        let body = self.tokenizer.encode_text(text)?;
         if body.is_empty() {
             return Err(Error::from_reason("Cannot synthesize empty text"));
         }
@@ -390,7 +388,8 @@ impl NativeModel {
             || audio.iter().any(|x| !x.is_finite())
             || transcript.trim().is_empty()
         {
-            return Err(Error::from_reason(
+            return Err(Error::new(
+                napi::Status::InvalidArg,
                 "Reference audio, sample rate and transcript must be valid and nonempty",
             ));
         }
@@ -426,7 +425,7 @@ impl NativeModel {
             speaker,
             codec_prefix: self.codec.prepare_prefix(&codes, cancelled)?,
             codes,
-            text: self.tokenizer.encode(&transcript)?,
+            text: self.tokenizer.encode_text(&transcript)?,
         };
         super::check_cancelled(cancelled)?;
         let id = uuid::Uuid::new_v4().to_string();
@@ -440,6 +439,9 @@ impl NativeModel {
             }
         }
         Ok(id)
+    }
+    pub fn voice_ids(&self) -> impl Iterator<Item = String> + '_ {
+        self.voices.keys().cloned()
     }
     pub fn release_voice(&mut self, id: &str) {
         self.voices.remove(id);
@@ -459,7 +461,7 @@ impl NativeModel {
     fn prepare_icl(&self, text: &str, options: &Options) -> Result<(MxArray, MxArray, MxArray)> {
         let condition = self.condition(options)?;
         let c = &self.config.talker_config;
-        let target = self.tokenizer.encode(text)?;
+        let target = self.tokenizer.encode_text(text)?;
         if target.is_empty() {
             return Err(Error::from_reason("Cannot synthesize empty text"));
         }

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { it, expect, vi } from 'vite-plus/test';
 
-import { WavWriter, readWav } from '../src/audio.js';
+import { InvalidWavError, WavReader, WavWriter, readWav } from '../src/audio.js';
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const fs = await importOriginal<typeof import('node:fs/promises')>();
@@ -53,10 +53,78 @@ it('rejects floating WAV samples that overflow the public Float32 PCM format', a
       bytes.writeDoubleLE(sample, 44);
       await writeFile(path, bytes);
       await expect(readWav(path)).rejects.toThrow('non-finite');
+      await expect(readWav(path)).rejects.toBeInstanceOf(InvalidWavError);
     }
     bytes.writeDoubleLE(0.25, 44);
     await writeFile(path, bytes);
     expect([...(await readWav(path)).samples]).toEqual([0.25]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it('distinguishes malformed WAV containers and codec formats from filesystem errors', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mlx-tts-'));
+  const path = join(dir, 'audio.wav');
+  try {
+    await expect(WavReader.open(path)).rejects.toMatchObject({ code: 'ENOENT' });
+    await writeFile(path, 'invalid');
+    await expect(WavReader.open(path)).rejects.toBeInstanceOf(InvalidWavError);
+    const writer = await WavWriter.open(path, 24000);
+    await writer.write(new Float32Array([0]));
+    await writer.close();
+    const bytes = await readFile(path);
+    bytes.writeUInt16LE(99, 20);
+    await writeFile(path, bytes);
+    await expect(WavReader.open(path)).rejects.toBeInstanceOf(InvalidWavError);
+    const failure = Object.assign(new Error('WAV disk failed'), { code: 'EIO' });
+    vi.mocked(open).mockRejectedValueOnce(failure);
+    await expect(WavReader.open(path)).rejects.toBe(failure);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it.each([
+  [20, 24],
+  [24, 32],
+])('reads %i-bit PCM in %i-bit extensible WAV containers without changing amplitude', async (validBits, bits) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mlx-tts-'));
+  const path = join(dir, 'extensible.wav');
+  const samples = [0.5, -0.25, -1, 0.25];
+  const width = bits / 8;
+  const bytes = Buffer.alloc(68 + width * samples.length);
+  bytes.write('RIFF');
+  bytes.writeUInt32LE(bytes.length - 8, 4);
+  bytes.write('WAVEfmt ', 8);
+  bytes.writeUInt32LE(40, 16);
+  bytes.writeUInt16LE(0xfffe, 20);
+  bytes.writeUInt16LE(2, 22);
+  bytes.writeUInt32LE(48000, 24);
+  bytes.writeUInt32LE(48000 * width * 2, 28);
+  bytes.writeUInt16LE(width * 2, 32);
+  bytes.writeUInt16LE(bits, 34);
+  bytes.writeUInt16LE(22, 36);
+  bytes.writeUInt16LE(validBits, 38);
+  bytes.writeUInt32LE(3, 40); // Front left and right.
+  Buffer.from('0100000000001000800000aa00389b71', 'hex').copy(bytes, 44);
+  bytes.write('data', 60);
+  bytes.writeUInt32LE(width * samples.length, 64);
+  samples.forEach((sample, i) => bytes.writeIntLE(sample * 2 ** (bits - 1), 68 + i * width, width));
+  try {
+    await writeFile(path, bytes);
+    const audio = await readWav(path);
+    expect(audio.sampleRate).toBe(48000);
+    expect(audio.channels).toBe(2);
+    expect([...audio.samples]).toEqual(samples);
+    const reader = await WavReader.open(path);
+    try {
+      const mono = [];
+      for await (const chunk of reader.chunks(1, true)) mono.push(...chunk);
+      expect(mono).toEqual([0.125, -0.375]);
+    } finally {
+      await reader.close();
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
