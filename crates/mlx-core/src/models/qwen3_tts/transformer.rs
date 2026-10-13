@@ -24,6 +24,25 @@ impl Norm {
             Self::Layer(n) => n.forward(x),
         }
     }
+    /// `h = x + res`, `normed = norm(h)`. RMS layers take the fused
+    /// add_rmsnorm dispatch, which is bit-identical to the separate pair; the
+    /// Mimi encoder's LayerNorm keeps the two ops.
+    fn forward_residual(&self, x: &MxArray, res: &MxArray) -> Result<(MxArray, MxArray)> {
+        if let Self::Rms(n) = self
+            && let Some(pair) = n.forward_residual_add(x, res)
+        {
+            return Ok(pair);
+        }
+        let h = x.add(res)?;
+        Ok((h.clone(), self.forward(&h)?))
+    }
+}
+
+/// A layer output left as `(stream, delta)` so the consumer's norm can fuse
+/// the residual add into its own dispatch.
+struct Residual {
+    stream: MxArray,
+    delta: MxArray,
 }
 
 pub struct DecoderLayer {
@@ -189,11 +208,28 @@ impl DecoderLayer {
         ))
     }
 
+    #[cfg(test)]
     pub fn forward(&self, x: &MxArray, state: &mut AttentionState) -> Result<MxArray> {
+        let out = self.forward_residual(x, None, state)?;
+        out.stream.add(&out.delta)
+    }
+
+    /// One layer on a residual stream. `pending` is the previous layer's
+    /// unapplied delta: adding it here lets norm1 fuse the add.
+    fn forward_residual(
+        &self,
+        x: &MxArray,
+        pending: Option<&MxArray>,
+        state: &mut AttentionState,
+    ) -> Result<Residual> {
         let c = &self.config;
         let shape = x.shape()?;
         let (b, n) = (shape[0], shape[1]);
-        let h = self.norm1.forward(x)?;
+        let (x, h) = match pending {
+            Some(delta) => self.norm1.forward_residual(x, delta)?,
+            None => (x.clone(), self.norm1.forward(x)?),
+        };
+        let x = &x;
         let (q, k, v) = match &self.qkv {
             Some(qkv) => {
                 let q_width = c.num_attention_heads * c.head_dim;
@@ -294,8 +330,7 @@ impl DecoderLayer {
         if let Some(scale) = &self.attn_scale {
             h = h.mul(scale)?;
         }
-        let x = x.add(&h)?;
-        let h = self.norm2.forward(&x)?;
+        let (x, h) = self.norm2.forward_residual(x, &h)?;
         let h = match (&self.gate, &self.gate_up) {
             (Some(_), Some(gate_up)) => {
                 let joined = gate_up.forward(&h)?;
@@ -320,7 +355,10 @@ impl DecoderLayer {
         if let Some(window) = self.attention_window {
             state.kv.retain_recent(window.saturating_sub(1))?;
         }
-        x.add(&h)
+        Ok(Residual {
+            stream: x,
+            delta: h,
+        })
     }
 }
 
@@ -414,12 +452,22 @@ impl Decoder {
     }
     pub fn forward(&self, input: &MxArray, states: &mut [AttentionState]) -> Result<MxArray> {
         let mut x = input.astype(self.dtype)?;
+        let mut pending: Option<MxArray> = None;
         for (layer, state) in self.layers.iter().zip(states) {
-            x = layer.forward(&x, state)?;
+            let out = layer.forward_residual(&x, pending.as_ref(), state)?;
+            x = out.stream;
+            pending = Some(out.delta);
         }
-        match &self.norm {
-            Some(norm) => norm.forward(&x),
-            None => Ok(x),
+        match (&self.norm, pending) {
+            (Some(norm), Some(delta)) => {
+                if let Some((_, normed)) = norm.forward_residual_add(&x, &delta) {
+                    return Ok(normed);
+                }
+                norm.forward(&x.add(&delta)?)
+            }
+            (Some(norm), None) => norm.forward(&x),
+            (None, Some(delta)) => x.add(&delta),
+            (None, None) => Ok(x),
         }
     }
 }
