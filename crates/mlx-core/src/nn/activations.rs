@@ -98,38 +98,13 @@ impl Activations {
     /// This matches PyTorch's `F.gelu(x, approximate="none")`.
     /// Used by Gemma4 MoE experts (vLLM's `activation="gelu"` defaults to exact).
     pub fn gelu_exact(input: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            let half = sys::mlx_array_scalar_float(0.5);
-            let one = sys::mlx_array_scalar_float(1.0);
-            let inv_sqrt2 = sys::mlx_array_scalar_float(std::f64::consts::FRAC_1_SQRT_2);
-
-            // x / sqrt(2)
-            let x_scaled = sys::mlx_array_mul(input.handle.0, inv_sqrt2);
-
-            // erf(x / sqrt(2))
-            let erf_result = sys::mlx_array_erf(x_scaled);
-
-            // 1 + erf(x / sqrt(2))
-            let one_plus_erf = sys::mlx_array_add(one, erf_result);
-
-            // x * (1 + erf(x / sqrt(2)))
-            let x_times_bracket = sys::mlx_array_mul(input.handle.0, one_plus_erf);
-
-            // 0.5 * x * (1 + erf(x / sqrt(2)))
-            let result = sys::mlx_array_mul(half, x_times_bracket);
-
-            // Clean up
-            sys::mlx_array_delete(half);
-            sys::mlx_array_delete(one);
-            sys::mlx_array_delete(inv_sqrt2);
-            sys::mlx_array_delete(x_scaled);
-            sys::mlx_array_delete(erf_result);
-            sys::mlx_array_delete(one_plus_erf);
-            sys::mlx_array_delete(x_times_bracket);
-
-            result
-        };
-        MxArray::from_handle(handle, "gelu_exact")
+        // The scalar ops build their constants in the input's floating dtype.
+        // A float32 scalar array would promote a bf16 activation stream to
+        // float32 for the rest of the graph, including every weight it later
+        // touches. Same expression and operation order as the clef compiled
+        // builder, so both paths compute the same value.
+        let erf = input.mul_scalar(std::f64::consts::FRAC_1_SQRT_2)?.erf()?;
+        input.mul(&erf.add_scalar(1.0)?)?.mul_scalar(0.5)
     }
 
     /// ReLU: max(0, x)
@@ -351,6 +326,46 @@ mod tests {
                         actual[i]
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn gelu_exact_preserves_dtype_and_matches_erf_formula() {
+        use crate::array::DType;
+
+        // A float32 constant anywhere in this chain used to widen bf16
+        // activation streams (the Qwen3-ASR encoder, then its whole decoder)
+        // to float32 for every downstream op.
+        let inputs = [-6.0f32, -2.0, -0.5, 0.0, 0.5, 1.0, 3.0, 8.0];
+        // PyTorch F.gelu(approximate="none") on the same inputs.
+        let reference = [
+            -5.9e-9_f32,
+            -0.045_500_26,
+            -0.154_268_77,
+            0.0,
+            0.345_731_23,
+            0.841_344_75,
+            2.995_950_4,
+            8.0,
+        ];
+        for (dtype, tolerance) in [
+            (DType::Float32, 1e-6_f32),
+            (DType::Float16, 0.01),
+            (DType::BFloat16, 0.05),
+        ] {
+            let input = MxArray::from_float32(&inputs, &[inputs.len() as i64])
+                .unwrap()
+                .astype(dtype)
+                .unwrap();
+            let result = Activations::gelu_exact(&input).unwrap();
+            assert_eq!(result.dtype().unwrap(), dtype);
+            let actual = result.astype(DType::Float32).unwrap().to_float32().unwrap();
+            for ((x, got), expected) in inputs.iter().zip(actual.iter()).zip(reference) {
+                assert!(
+                    (got - expected).abs() <= tolerance * expected.abs().max(1.0),
+                    "{dtype:?} gelu({x}) = {got}, expected {expected}"
+                );
             }
         }
     }

@@ -670,30 +670,20 @@ impl TextDecoder {
         self.logits_from_hidden(&hidden)
     }
 
-    fn decode(&self, token: u32, caches: &mut [KVCache]) -> Result<MxArray> {
-        let ids = MxArray::from_uint32(&[token], &[1, 1])?;
-        let mut hidden = self.embedding.forward(&ids)?;
-        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = layer.forward(&hidden, None, Some(cache))?;
-        }
-        self.logits_from_hidden(&hidden)
-    }
-
     /// One C++ graph-construction call for the entire decoder token. This is
     /// the same dense Qwen3 fused step used by the text model, seeded with the
     /// KV tensors produced by the multimodal prefill above. It removes the
     /// per-layer Rust/FFI dispatch from the latency-critical live path while
     /// retaining the exact Qwen3 attention/MLP graph.
-    fn decode_fused(
-        &self,
-        token: &MxArray,
-        kv_keys: &mut [Option<MxArray>],
-        kv_values: &mut [Option<MxArray>],
-        cache_idx: &mut i32,
-    ) -> Result<MxArray> {
+    fn decode_fused(&self, token: &MxArray, kv: &mut FusedKv) -> Result<MxArray> {
         use mlx_sys as sys;
         use std::ptr;
 
+        let FusedKv {
+            keys: kv_keys,
+            values: kv_values,
+            cache_idx,
+        } = kv;
         let input_ids = token.reshape(&[1, 1])?;
         let rope_offsets = MxArray::from_int32(&[*cache_idx], &[1])?;
         let left_padding = MxArray::from_int32(&[0], &[1])?;
@@ -894,6 +884,51 @@ impl TextDecoder {
     }
 }
 
+/// Decoder KV state in the layout the fused C++ token step reads and writes.
+/// Taken from the dense prefill's `KVCache`s and handed back afterwards so
+/// streaming revisions can keep trimming the same buffers.
+struct FusedKv {
+    keys: Vec<Option<MxArray>>,
+    values: Vec<Option<MxArray>>,
+    cache_idx: i32,
+}
+
+impl FusedKv {
+    fn take(caches: &mut [KVCache]) -> Result<Self> {
+        let mut keys = Vec::with_capacity(caches.len());
+        let mut values = Vec::with_capacity(caches.len());
+        let mut offset = None;
+        for cache in caches.iter_mut() {
+            let (key, value, cache_offset) = std::mem::take(cache).into_parts();
+            if offset.is_some_and(|expected| expected != cache_offset) {
+                return Err(Error::from_reason(
+                    "Qwen3-ASR prefill produced inconsistent layer cache offsets",
+                ));
+            }
+            offset = Some(cache_offset);
+            keys.push(key);
+            values.push(value);
+        }
+        Ok(Self {
+            keys,
+            values,
+            cache_idx: offset.unwrap_or(0),
+        })
+    }
+
+    fn restore(self, caches: &mut [KVCache]) {
+        for ((cache, key), value) in caches.iter_mut().zip(self.keys).zip(self.values) {
+            if let Some(key) = key {
+                cache.set_keys(key);
+            }
+            if let Some(value) = value {
+                cache.set_values(value);
+            }
+            cache.set_offset(self.cache_idx);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct EncodedAudioWindow {
     embeddings: MxArray,
@@ -984,6 +1019,48 @@ impl Qwen3AsrInner {
             Ok(())
         }
     }
+
+    /// Greedy decode with one token of GPU/CPU overlap. The graph for token
+    /// t+1 is built from the lazy argmax of token t and submitted before the
+    /// host reads token t, so the GPU never idles on Rust dispatch or the
+    /// readback. Returns the generated tokens (EOS excluded) and the EOS token
+    /// that ended generation, if any. One speculative step past EOS or the
+    /// budget may have been written to the KV state; callers either discard
+    /// that state or trim it before the next prefill.
+    fn greedy_decode(
+        &self,
+        first_logits: &MxArray,
+        max_tokens: usize,
+        mut step: impl FnMut(&MxArray) -> Result<MxArray>,
+    ) -> Result<(Vec<u32>, Option<u32>)> {
+        let mut generated = Vec::with_capacity(max_tokens);
+        let mut next = first_logits
+            .argmax(-1, Some(false))?
+            .astype(DType::Uint32)?;
+        for index in 0..max_tokens {
+            self.check_cancelled()?;
+            let scheduled = if index + 1 < max_tokens {
+                let logits = step(&next)?;
+                let following = logits.argmax(-1, Some(false))?.astype(DType::Uint32)?;
+                MxArray::async_eval_arrays(&[&following]);
+                Some(following)
+            } else {
+                next.eval();
+                None
+            };
+            let token = next.item_at_uint32(0)?;
+            if self.config.eos_token_id.contains(&token) {
+                return Ok((generated, Some(token)));
+            }
+            generated.push(token);
+            match scheduled {
+                Some(following) => next = following,
+                None => break,
+            }
+        }
+        Ok((generated, None))
+    }
+
     fn transcribe(
         &mut self,
         audio: Vec<f32>,
@@ -1058,78 +1135,24 @@ impl Qwen3AsrInner {
 
         self.check_cancelled()?;
         let prefill_start = Instant::now();
-        let mut logits = self.text_decoder.prefill(&prompt_embeddings, &mut caches)?;
+        let logits = self.text_decoder.prefill(&prompt_embeddings, &mut caches)?;
         logits.eval();
         crate::array::synchronize();
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1_000.0;
 
-        let use_fused_decode = std::env::var("MLX_QWEN3_ASR_FUSED_DECODE")
-            .map(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off"
-                )
-            })
-            .unwrap_or(true);
-        let mut fallback_caches = Some(caches);
-        let (mut fused_keys, mut fused_values, mut fused_cache_idx) = if use_fused_decode {
-            let owned = fallback_caches
-                .take()
-                .ok_or_else(|| Error::from_reason("ASR prefill caches exist"))?;
-            let mut keys = Vec::with_capacity(owned.len());
-            let mut values = Vec::with_capacity(owned.len());
-            let mut offset = None;
-            for cache in owned {
-                let (key, value, cache_offset) = cache.into_parts();
-                if offset.is_some_and(|expected| expected != cache_offset) {
-                    return Err(Error::from_reason(
-                        "Qwen3-ASR prefill produced inconsistent layer cache offsets",
-                    ));
-                }
-                offset = Some(cache_offset);
-                keys.push(key);
-                values.push(value);
-            }
-            (keys, values, offset.unwrap_or(0))
-        } else {
-            (Vec::new(), Vec::new(), 0)
-        };
-
         let decode_start = Instant::now();
-        let mut generated = Vec::new();
-        let max_tokens = options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(1);
-        for _ in 0..max_tokens {
-            self.check_cancelled()?;
-            let next = logits.argmax(-1, Some(false))?.astype(DType::Uint32)?;
-            next.eval();
-            let token = next.item_at_uint32(0)?;
-            generated.push(token);
-            if self.config.eos_token_id.contains(&token) {
-                break;
-            }
-            logits = if use_fused_decode {
-                self.text_decoder.decode_fused(
-                    &next,
-                    &mut fused_keys,
-                    &mut fused_values,
-                    &mut fused_cache_idx,
-                )?
-            } else {
-                self.text_decoder.decode(
-                    token,
-                    fallback_caches
-                        .as_mut()
-                        .ok_or_else(|| Error::from_reason("fallback ASR caches exist"))?,
-                )?
-            };
-        }
+        let max_tokens = options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(1) as usize;
+        let decoder = &self.text_decoder;
+        let mut kv = FusedKv::take(&mut caches)?;
+        let (mut generated, eos) = self.greedy_decode(&logits, max_tokens, |token| {
+            decoder.decode_fused(token, &mut kv)
+        })?;
         crate::array::synchronize();
         self.check_cancelled()?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1_000.0;
-        let reached_max_tokens = generated.len() == max_tokens as usize
-            && !generated
-                .last()
-                .is_some_and(|token| self.config.eos_token_id.contains(token));
+        // `token_ids` keeps the terminating EOS, as before the overlap rewrite.
+        let reached_max_tokens = eos.is_none() && generated.len() == max_tokens;
+        generated.extend(eos);
 
         let raw = self.tokenizer.decode_sync(&generated, true)?;
         let (detected_language, text) = parse_output(&raw, language.as_deref());
@@ -1339,7 +1362,7 @@ impl Qwen3AsrInner {
 
         self.check_cancelled()?;
         let prefill_start = Instant::now();
-        let mut logits = self
+        let logits = self
             .text_decoder
             .prefill(&input_embeddings, &mut state.decoder_caches)?;
         logits.eval();
@@ -1347,24 +1370,21 @@ impl Qwen3AsrInner {
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1_000.0;
 
         let decode_start = Instant::now();
-        let mut generated = Vec::with_capacity(max_tokens as usize);
-        let mut reached_end = false;
-        for _ in 0..max_tokens {
-            self.check_cancelled()?;
-            let next = logits.argmax(-1, Some(false))?.astype(DType::Uint32)?;
-            next.eval();
-            let token = next.item_at_uint32(0)?;
-            if self.config.eos_token_id.contains(&token) {
-                reached_end = true;
-                break;
-            }
-            generated.push(token);
-            logits = self.text_decoder.decode(token, &mut state.decoder_caches)?;
-        }
+        let max_tokens = max_tokens as usize;
+        let decoder = &self.text_decoder;
+        // Rows written past `stable_cache_positions` (suffix, transcript
+        // prefix, generated tokens, one speculative step) are trimmed at the
+        // start of the next revision, so the fused step may write freely.
+        let mut kv = FusedKv::take(&mut state.decoder_caches)?;
+        let decoded = self.greedy_decode(&logits, max_tokens, |token| {
+            decoder.decode_fused(token, &mut kv)
+        });
+        kv.restore(&mut state.decoder_caches);
+        let (mut generated, eos) = decoded?;
         crate::array::synchronize();
         self.check_cancelled()?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1_000.0;
-        let reached_max_tokens = generated.len() == max_tokens as usize && !reached_end;
+        let reached_max_tokens = eos.is_none() && generated.len() == max_tokens;
         let (repeated_tail, _) = stream_tail_repeat_blocks(&generated, STREAM_DEGEN_MAX_PERIOD);
         let repeat_prefix = if recovering {
             &[][..]
@@ -2076,11 +2096,13 @@ fn handle_cmd(state: &mut Qwen3AsrThreadState, cmd: Qwen3AsrCmd) {
             source,
             reply,
         } => {
+            // Live streams always have an entry; an unknown id must surface
+            // the stream lookup error rather than a cancellation error.
             inner.cancelled = inner
                 .stream_cancellations
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+                .unwrap_or_default();
             let _ = reply.send(inner.feed_stream(&id, samples, source));
         }
         Qwen3AsrCmd::PrepareCapture {
@@ -2097,11 +2119,13 @@ fn handle_cmd(state: &mut Qwen3AsrThreadState, cmd: Qwen3AsrCmd) {
             }
         }
         Qwen3AsrCmd::FinishStream { id, reply } => {
+            // Live streams always have an entry; an unknown id must surface
+            // the stream lookup error rather than a cancellation error.
             inner.cancelled = inner
                 .stream_cancellations
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+                .unwrap_or_default();
             let result = inner
                 .check_cancelled()
                 .and_then(|_| inner.finish_stream(&id));
