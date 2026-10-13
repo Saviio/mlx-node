@@ -42,6 +42,7 @@ Options:
   --model <name>      Which discovered model is the default. Must match a
                       directory name under --models-dir. Defaults to
                       ANTHROPIC_MODEL env, else the first discovered model.
+  --model-residency <mode>  capability (default) or single
   --auth-token <tok>  Require this secret on every route except /health,
                       as \`x-api-key\` or \`authorization: Bearer\`. Also
                       readable from MLX_SERVER_AUTH_TOKEN.
@@ -50,8 +51,8 @@ Options:
                       Default: ~/.mlx-node/logs/<ISO-timestamp>/.
   -h, --help          Show this help message
 
-Models load lazily: the first request naming a model loads it, and only one
-model stays resident at a time.
+Models load lazily. Default residency: one chat/decision model, one ASR model,
+and one TTS model. Use --model-residency single for one model globally.
 
 Examples:
   mlx serve
@@ -68,6 +69,7 @@ export interface ServeArgs {
   modelsDir?: string;
   model?: string;
   authToken?: string;
+  modelResidency?: 'capability' | 'single';
   logDir?: string;
 }
 
@@ -88,6 +90,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       host: { type: 'string' },
       'models-dir': { type: 'string' },
       model: { type: 'string' },
+      'model-residency': { type: 'string' },
       'auth-token': { type: 'string' },
       verbose: { type: 'boolean', short: 'v', default: false },
       'log-dir': { type: 'string' },
@@ -106,6 +109,9 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     port = parsedPort;
   }
 
+  const modelResidency = values['model-residency'];
+  if (modelResidency !== undefined && modelResidency !== 'single' && modelResidency !== 'capability')
+    throw new Error('--model-residency must be capability or single');
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;
 
   return {
@@ -114,6 +120,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     host: values.host,
     modelsDir: values['models-dir'],
     model: values.model,
+    ...(modelResidency !== undefined ? { modelResidency } : {}),
     authToken: values['auth-token'],
     logDir: verbose ? resolveLogDir(values['log-dir'], resolveMlxNodeHome()) : undefined,
   };
@@ -155,6 +162,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       host: args.host,
       modelsDir: args.modelsDir,
       model: args.model,
+      modelResidency: args.modelResidency,
       authToken: args.authToken,
       logDir: args.logDir,
       // Same paged-prefill chunking `mlx launch claude` applies. A value
@@ -178,7 +186,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
   }
 
   console.log(
-    `[mlx] models dir: ${host.modelsDir} | listening on ${host.url} | discovered ${host.models.length} model(s) | default: ${host.boundModel}`,
+    `[mlx] models dir: ${host.modelsDir} | listening on ${host.url} | discovered ${host.models.length + (host.audioModels?.length ?? 0)} model(s) | default: ${host.boundModel}`,
   );
   if (host.logDir !== null) console.log(`[mlx] verbose logging → ${host.logDir}`);
   console.log('Press Ctrl+C to stop.');

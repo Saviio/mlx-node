@@ -8,6 +8,7 @@ import { join } from 'node:path';
 
 import { ResponseStore } from '@mlx-node/core';
 
+import { AudioService, type AudioServiceOptions } from './audio-service.js';
 import type { PublicModelEntry } from './handler.js';
 import { createHandler } from './handler.js';
 import { createHealthReporter, type ServerHealth } from './health.js';
@@ -156,6 +157,7 @@ export function resolveAuthToken(explicit: string | undefined): string | undefin
 }
 
 export interface ServerConfig {
+  audio?: AudioServiceOptions;
   /** Port to listen on (default: 8080). */
   port?: number;
   /** Hostname to bind to (default: '127.0.0.1'). */
@@ -439,7 +441,18 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   // so both report the same uptime origin.
   const health = createHealthReporter({ registry, idleSweeper, modelWorkCoordinator });
 
+  const audio = new AudioService(
+    {
+      registry,
+      coordinator: modelWorkCoordinator,
+      idleSweeper,
+      resolveModel: config?.resolveModel,
+      listModels: config?.listModels,
+    },
+    config?.audio,
+  );
   const handler = createHandler(registry, {
+    audio,
     cors,
     store,
     responseRetentionSec,
@@ -491,6 +504,8 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
         : DEFAULT_CLOSE_TIMEOUT_MS;
 
     closePromise = (async (): Promise<CloseResult> => {
+      const audioClosed = audio.close();
+      void audioClosed.catch(() => {});
       clearInterval(cleanupTimer);
       idleSweeper.close();
 
@@ -531,6 +546,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
         clearTimeout(forceTimer);
       }
 
+      await audioClosed;
       return { forced, streamsAborted, durationMs: Date.now() - startedAt };
     })();
 

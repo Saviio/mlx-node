@@ -37,6 +37,7 @@ export function makeSwapController(
   for (const entry of discovered) byName.set(entry.name, entry);
 
   const ordered = [...discovered].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const created = Math.floor(Date.now() / 1000);
 
   // Which entry unknown names (haiku subagent dispatches, etc.) fall back
   // to before anything is resident. Defaults to discovered[0], but the
@@ -187,7 +188,6 @@ export function makeSwapController(
   }
 
   function listModels(): PublicModelEntry[] {
-    const created = Math.floor(Date.now() / 1000);
     return ordered.map((entry) => ({
       id: entry.name,
       object: 'model',

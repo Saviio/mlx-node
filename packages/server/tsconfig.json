@@ -8,5 +8,18 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "references": [{ "path": "../core" }, { "path": "../lm" }]
+  "references": [
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../lm"
+    },
+    {
+      "path": "../tts"
+    },
+    {
+      "path": "../asr"
+    }
+  ]
 }

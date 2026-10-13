@@ -44,10 +44,13 @@ export function trackSSEClientAbort(res: ServerResponse, httpReq: IncomingMessag
   const onError = (_err: unknown): void => {
     aborted = true;
   };
+  const onRequestClose = (): void => {
+    if (httpReq?.complete !== true) onClose();
+  };
   const socket = res.socket;
 
   if (httpReq != null) {
-    httpReq.once('close', onClose);
+    httpReq.once('close', onRequestClose);
     httpReq.on('error', onError);
   }
   res.once('close', onClose);
@@ -68,7 +71,7 @@ export function trackSSEClientAbort(res: ServerResponse, httpReq: IncomingMessag
       if (disposed) return;
       disposed = true;
       if (httpReq != null) {
-        httpReq.removeListener('close', onClose);
+        httpReq.removeListener('close', onRequestClose);
         httpReq.removeListener('error', onError);
       }
       res.removeListener('close', onClose);

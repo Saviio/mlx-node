@@ -16,6 +16,9 @@ import { createWriteStream, mkdirSync } from 'node:fs';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { join } from 'node:path';
 
+import { audioMetrics } from '../audio-metrics.js';
+import { requestPathname } from '../router.js';
+
 export interface Logger {
   /** Absolute log directory in use. */
   readonly logDir: string;
@@ -283,12 +286,28 @@ export function attachLogger(server: Server, logDir: string): Logger {
     const start = Date.now();
     const rid = `${start.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
-    writePretty(`[req ${rid}] ${req.method ?? '?'} ${req.url ?? '?'}`);
-
+    const pathname = requestPathname(req);
+    const audio = pathname.startsWith('/v1/audio/');
+    // Raw WAV requests carry prompt text in their query. Audio logs retain
+    // only the route; validated model/phase metadata comes from audioMetrics.
+    const loggedPath = audio ? pathname : req.url;
+    writePretty(`[req ${rid}] ${req.method ?? '?'} ${loggedPath ?? '?'}`);
     let reqBody = '';
-    req.on('data', (chunk: Buffer) => {
-      reqBody += chunk.toString('utf8');
-    });
+    let reqBytes = 0;
+    let resBytes = 0;
+    if (audio) {
+      // Observing read() does not switch a paused upload into flowing mode.
+      // A data listener here would defeat the audio handler's backpressure.
+      const read = req.read.bind(req);
+      req.read = (size?: number) => {
+        const chunk = read(size);
+        if (chunk != null) reqBytes += Buffer.byteLength(chunk);
+        return chunk;
+      };
+    } else
+      req.on('data', (chunk: Buffer) => {
+        reqBody += chunk.toString('utf8');
+      });
 
     // Wrap res.write / res.end to capture streamed chunks (SSE + regular).
     // Preserve original method semantics — we only observe, never transform.
@@ -300,7 +319,9 @@ export function attachLogger(server: Server, logDir: string): Logger {
     (res as any).write = (chunk: unknown, ...rest: unknown[]): boolean => {
       if (chunk != null) {
         try {
-          chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
+          resBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : (chunk as Uint8Array).byteLength;
+          if (!audio)
+            chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
         } catch {
           /* ignore */
         }
@@ -312,7 +333,9 @@ export function attachLogger(server: Server, logDir: string): Logger {
     (res as any).end = (chunk: unknown, ...rest: unknown[]): ServerResponse => {
       if (chunk != null) {
         try {
-          chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
+          resBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : (chunk as Uint8Array).byteLength;
+          if (!audio)
+            chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
         } catch {
           /* ignore */
         }
@@ -345,12 +368,28 @@ export function attachLogger(server: Server, logDir: string): Logger {
         rid,
         t: new Date(start).toISOString(),
         method: req.method,
-        path: req.url,
+        path: loggedPath,
         reqHeaders: redactRequestHeaders(req.headers),
         reqBody: reqBody || null,
         status: res.statusCode,
         resHeaders: res.getHeaders(),
         resBody,
+        ...(audio
+          ? {
+              reqBytes,
+              resBytes,
+              audio: true,
+              audioMetrics: {
+                ...audioMetrics(res),
+                state:
+                  audioMetrics(res)?.state === 'running'
+                    ? res.writableFinished
+                      ? 'completed'
+                      : 'cancelled'
+                    : audioMetrics(res)?.state,
+              },
+            }
+          : {}),
         elapsedMs: Date.now() - start,
       };
       try {
@@ -360,7 +399,7 @@ export function attachLogger(server: Server, logDir: string): Logger {
       }
       const timingSummary = buildTimingSummary(reqBody, resBody);
       writePretty(
-        `[req ${rid}] ${res.statusCode} ${req.method ?? '?'} ${req.url ?? '?'} ${entry.elapsedMs}ms ${resBody.length}B${timingSummary}`,
+        `[req ${rid}] ${res.statusCode} ${req.method ?? '?'} ${loggedPath ?? '?'} ${entry.elapsedMs}ms ${resBody.length}B${timingSummary}`,
       );
     };
     req.on('end', () => {
