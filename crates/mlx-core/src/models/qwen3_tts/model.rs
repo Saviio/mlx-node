@@ -638,13 +638,26 @@ impl NativeModel {
             .collect();
         let mask = MxArray::from_float32(&mask, &[1, c.vocab_size as i64])?;
         // The reference penalizes only the last 64 group-0 tokens; a monotonic
-        // history progressively over-penalizes long utterances.
+        // history progressively over-penalizes long utterances. The history
+        // lives on the device so frame t+1's graph can be built before frame
+        // t's token is read back: empty slots point at an extra padding
+        // column that the slice below drops, so an all-padding history yields
+        // multipliers of exactly one.
         const REPETITION_CONTEXT_SIZE: usize = 64;
-        let mut recent: VecDeque<i32> = VecDeque::with_capacity(REPETITION_CONTEXT_SIZE);
+        let penalty_columns = c.vocab_size as i64 + 1;
+        let mut history = MxArray::from_int32(
+            &vec![c.vocab_size as i32; REPETITION_CONTEXT_SIZE],
+            &[1, REPETITION_CONTEXT_SIZE as i64],
+        )?;
+        let penalty_values = MxArray::from_float32(
+            &vec![penalty as f32; REPETITION_CONTEXT_SIZE],
+            &[1, REPETITION_CONTEXT_SIZE as i64],
+        )?;
+        let penalty_ones = MxArray::ones(&[1, penalty_columns], Some(DType::Float32))?;
+        let zero = MxArray::scalar_float(0.)?;
         let mut pending = Vec::new();
-        // The previous chunk's codec output is submitted without waiting and
-        // read back only after the next frame's eval_arrays commits, so its
-        // GPU work overlaps that frame's host-side graph build.
+        // Chunk PCM is submitted without waiting and read back one frame
+        // later, so its GPU work overlaps that frame's host-side graph build.
         let mut deferred_pcm: Option<MxArray> = None;
         let mut first_pcm_ms = None;
         let mut blocked = 0.;
@@ -667,10 +680,70 @@ impl NativeModel {
                 chunk_frames,
             )),
         );
+        // Frame t+1's graph is built and submitted before frame t's group-0
+        // token is read, so the host-side build of ~100 layer forwards
+        // overlaps the GPU. The in-flight frame is retired one iteration
+        // later; an EOS there discards the speculative successor, whose only
+        // side effects are KV rows this turn never reads again.
+        let mut in_flight: Option<(MxArray, MxArray)> = None;
+        let mut retired = 0usize;
+        let mut retire = |all: MxArray, token: MxArray, emit_now: bool| -> Result<bool> {
+            // item_at waits for this frame's eval only; the successor is
+            // already queued behind it, so its PCM readback below is cheap.
+            let first = token.item_at_int32(0)?;
+            if let Some(pcm) = deferred_pcm.take() {
+                emit_pcm(
+                    pcm.to_float32()?.to_vec(),
+                    &started,
+                    &mut first_pcm_ms,
+                    &mut blocked,
+                    &mut emit,
+                )?;
+            }
+            if first == c.codec_eos_token_id {
+                return Ok(false);
+            }
+            if first < 0 || first as usize >= valid {
+                return Err(Error::from_reason("Invalid generated codec ID"));
+            }
+            pending.push(all);
+            if pending.len() >= chunk_frames {
+                let pcm = self.codec.step(
+                    &cat(&pending.iter().collect::<Vec<_>>(), 1)?,
+                    &mut codec_state,
+                )?;
+                pending.clear();
+                if emit_now {
+                    emit_pcm(
+                        pcm.to_float32()?.to_vec(),
+                        &started,
+                        &mut first_pcm_ms,
+                        &mut blocked,
+                        &mut emit,
+                    )?;
+                } else {
+                    MxArray::async_eval_arrays(&[&pcm]);
+                    deferred_pcm = Some(pcm);
+                }
+            }
+            Ok(true)
+        };
         for step in 0..max_frames {
             if cancelled.load(Ordering::Acquire) {
                 reason = "cancelled";
                 break;
+            }
+            // The first chunk is retired before this frame is built so its
+            // PCM is not queued behind another frame: one frame of lost
+            // overlap per segment buys the lowest first-PCM latency.
+            if retired + 1 == chunk_frames
+                && let Some((prev_all, prev_token)) = in_flight.take()
+            {
+                if !retire(prev_all, prev_token, true)? {
+                    reason = "eos";
+                    break;
+                }
+                retired += 1;
             }
             let hidden = last(&self.talker.forward(&input, &mut talker_state)?)?;
             let mut logits = self
@@ -679,14 +752,12 @@ impl NativeModel {
                 .reshape(&[1, c.vocab_size as i64])?
                 .astype(DType::Float32)?
                 .add(&mask)?;
-            if penalty != 1. && !recent.is_empty() {
-                let mut multipliers = vec![1f32; c.vocab_size];
-                for &token in &recent {
-                    multipliers[token as usize] = penalty as f32;
-                }
-                let mult = MxArray::from_float32(&multipliers, &[1, c.vocab_size as i64])?;
+            if penalty != 1. {
+                let mult = penalty_ones
+                    .put_along_axis(&history, &penalty_values, 1)?
+                    .slice_axis(1, 0, c.vocab_size as i64)?;
                 logits = logits
-                    .less(&MxArray::scalar_float(0.)?)?
+                    .less(&zero)?
                     .where_(&logits.mul(&mult)?, &logits.div(&mult)?)?;
             }
             let token = draw(&logits, temperature, top_k, top_p, &mut rng)?;
@@ -695,11 +766,16 @@ impl NativeModel {
                 state.kv.reset_keep_capacity();
                 state.position = 0;
             }
+            // The predictor consumes each code's embedding before projection;
+            // the same gathers summed below form the next talker input.
+            let mut embed = self.codec_embedding.forward(&tokens[0])?;
             for i in 0..c.num_code_groups - 1 {
                 let mut x = if i == 0 {
-                    cat(&[&hidden, &self.codec_embedding.forward(&tokens[0])?], 1)?
+                    cat(&[&hidden, &embed], 1)?
                 } else {
-                    self.residual_embeddings[i - 1].forward(&tokens[i])?
+                    let residual = self.residual_embeddings[i - 1].forward(&tokens[i])?;
+                    embed = embed.add(&residual)?;
+                    residual
                 };
                 if let Some(projection) = &self.predictor_projection {
                     x = projection.forward(&x)?;
@@ -710,62 +786,45 @@ impl NativeModel {
                     .reshape(&[1, valid as i64])?;
                 tokens.push(draw(&logits, temperature, top_k, top_p, &mut rng)?);
             }
+            let last_residual = self.residual_embeddings[c.num_code_groups - 2]
+                .forward(&tokens[c.num_code_groups - 1])?;
+            embed = embed.add(&last_residual)?;
             let all = cat(&tokens.iter().collect::<Vec<_>>(), 1)?.reshape(&[
                 1,
                 1,
                 c.num_code_groups as i64,
             ])?;
-            let mut embed = self.codec_embedding.forward(&tokens[0])?;
-            for (layer, token) in self.residual_embeddings.iter().zip(tokens.iter().skip(1)) {
-                embed = embed.add(&layer.forward(token)?)?;
-            }
             let t = if (step as i64) < trailing.shape()?[1] {
                 trailing.slice_axis(1, step as i64, step as i64 + 1)?
             } else {
                 pad.clone()
             };
             input = embed.add(&t)?;
-            MxArray::eval_arrays(&[&all, &input])?;
-            // eval_arrays just waited on the GPU timeline, which already
-            // contains the deferred chunk's commands, so this readback is a
-            // small copy rather than a codec-decode wait.
-            if let Some(pcm) = deferred_pcm.take() {
-                emit_pcm(
-                    pcm.to_float32()?.to_vec(),
-                    &started,
-                    &mut first_pcm_ms,
-                    &mut blocked,
-                    &mut emit,
+            if penalty != 1. {
+                history = cat(
+                    &[
+                        &history.slice_axis(1, 1, REPETITION_CONTEXT_SIZE as i64)?,
+                        &tokens[0].reshape(&[1, 1])?,
+                    ],
+                    1,
                 )?;
             }
-            let first = tokens[0].item_at_int32(0)?;
-            if first == c.codec_eos_token_id {
-                reason = "eos";
-                break;
+            MxArray::async_eval_arrays(&[&all, &input, &history]);
+            if let Some((prev_all, prev_token)) = in_flight.take() {
+                if !retire(prev_all, prev_token, false)? {
+                    reason = "eos";
+                    break;
+                }
+                retired += 1;
             }
-            if first < 0 || first as usize >= valid {
-                return Err(Error::from_reason("Invalid generated codec ID"));
-            }
-            if recent.len() == REPETITION_CONTEXT_SIZE {
-                recent.pop_front();
-            }
-            recent.push_back(first);
-            pending.push(all);
-            if pending.len() >= chunk_frames {
-                let pcm = self.codec.step(
-                    &cat(&pending.iter().collect::<Vec<_>>(), 1)?,
-                    &mut codec_state,
-                )?;
-                // Submit without waiting: the readback lands after the next
-                // frame's eval_arrays, overlapping codec decode with that
-                // frame's tape build. A cancel/error drops the lazy array
-                // un-evaluated, matching the old blocking site's drop.
-                MxArray::async_eval_arrays(&[&pcm]);
-                deferred_pcm = Some(pcm);
-                pending.clear();
-            }
+            in_flight = Some((all, tokens.swap_remove(0)));
         }
         if !cancelled.load(Ordering::Acquire) {
+            if let Some((all, token)) = in_flight.take()
+                && !retire(all, token, false)?
+            {
+                reason = "eos";
+            }
             // The deferred chunk (produced first) drains before the tail.
             if let Some(pcm) = deferred_pcm.take() {
                 emit_pcm(

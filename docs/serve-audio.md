@@ -389,6 +389,8 @@ yarn exec oxnode scripts/server/audio-voices-smoke.ts /path/to/models reference.
 # Native ASR stage timings without the HTTP layer (feature, encoder, prefill, decode)
 yarn exec oxnode scripts/server/asr-bench.ts /path/to/models/<asr-checkpoint> recording.wav
 yarn exec oxnode scripts/server/asr-stream-bench.ts /path/to/models/<asr-checkpoint> recording.wav
+# Native TTS timings without the HTTP layer (synthesis ms, first PCM, RTF, frames/s)
+yarn exec oxnode scripts/server/tts-bench.ts /path/to/models/<tts-checkpoint> [voice] [text]
 ```
 
 `BASE_MODEL` selects the reference-voice smoke checkpoint (default `Base-8bit`).
