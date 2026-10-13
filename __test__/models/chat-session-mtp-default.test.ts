@@ -231,6 +231,6 @@ describe('MTP auto-default: native surface agrees with the TS fallback', () => {
     // Collapsing the two into one would make the head unreachable rather than
     // merely off-by-default.
     expect(typeof NemotronHModel.prototype.hasMtpWeights).toBe('function');
-    expect(NemotronHModel.prototype.mtpAutoEnabled).not.toBe(NemotronHModel.prototype.hasMtpWeights);
+    expect(NemotronHModel.prototype.mtpAutoEnabled === NemotronHModel.prototype.hasMtpWeights).toBe(false);
   });
 });

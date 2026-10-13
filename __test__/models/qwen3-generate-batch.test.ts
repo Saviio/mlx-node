@@ -77,7 +77,7 @@ describe('Qwen3Model - generateBatch', () => {
     });
 
     // Verify token arrays have correct shapes
-    result.tokens.forEach((tokenArray, _) => {
+    result.tokens.forEach((tokenArray) => {
       const shape = tokenArray.shape();
       expect(shape.length).toBe(1); // 1D array
       expect(shape[0]).toBeGreaterThan(0);

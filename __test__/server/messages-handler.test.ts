@@ -658,8 +658,7 @@ describe('handleCreateMessage', () => {
       );
 
       expect(getStatus()).toBe(200);
-      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
-      const config = startSpy.mock.calls[0]?.[1] as { maxNewTokens?: number };
+      const config = vi.mocked(mockModel).chatSessionStart.mock.calls[0]?.[1] as { maxNewTokens?: number };
       expect(config.maxNewTokens).toBe(16);
     });
 
@@ -680,8 +679,7 @@ describe('handleCreateMessage', () => {
       );
 
       expect(getStatus()).toBe(200);
-      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
-      const config = startSpy.mock.calls[0]?.[1] as { maxNewTokens?: number };
+      const config = vi.mocked(mockModel).chatSessionStart.mock.calls[0]?.[1] as { maxNewTokens?: number };
       expect(config.maxNewTokens).toBe(128000);
     });
 
@@ -1195,8 +1193,7 @@ describe('handleCreateMessage', () => {
       );
 
       expect(getStatus()).toBe(200);
-      const streamSpy = mockModel.chatStreamSessionStart as unknown as ReturnType<typeof vi.fn>;
-      const config = streamSpy.mock.calls[0]?.[1] as { maxNewTokens?: number };
+      const config = vi.mocked(mockModel).chatStreamSessionStart.mock.calls[0]?.[1] as { maxNewTokens?: number };
       expect(config.maxNewTokens).toBe(16);
     });
 
@@ -1255,8 +1252,7 @@ describe('handleCreateMessage', () => {
       );
 
       expect(getStatus()).toBe(200);
-      const streamSpy = mockModel.chatStreamSessionStart as unknown as ReturnType<typeof vi.fn>;
-      const config = streamSpy.mock.calls[0]?.[1] as {
+      const config = vi.mocked(mockModel).chatStreamSessionStart.mock.calls[0]?.[1] as {
         maxNewTokens?: number;
         reasoningEffort?: string;
         thinkingTokenBudget?: number;
