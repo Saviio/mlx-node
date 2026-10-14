@@ -2589,6 +2589,10 @@ fn parse_processor_config(data: &str) -> Result<ProcessorConfig> {
 }
 
 #[cfg(test)]
+#[path = "batch_step_probe.rs"]
+mod batch_step_probe;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
