@@ -1024,9 +1024,9 @@ impl Qwen3AsrInner {
     /// t+1 is built from the lazy argmax of token t and submitted before the
     /// host reads token t, so the GPU never idles on Rust dispatch or the
     /// readback. Returns the generated tokens (EOS excluded) and the EOS token
-    /// that ended generation, if any. One speculative step past EOS or the
-    /// budget may have been written to the KV state; callers either discard
-    /// that state or trim it before the next prefill.
+    /// that ended generation, if any. On EOS the step queued past it may still
+    /// be running on the GPU and writing the KV state when this returns;
+    /// callers either drop that state or trim it before the next prefill.
     fn greedy_decode(
         &self,
         first_logits: &MxArray,
@@ -1147,7 +1147,6 @@ impl Qwen3AsrInner {
         let (mut generated, eos) = self.greedy_decode(&logits, max_tokens, |token| {
             decoder.decode_fused(token, &mut kv)
         })?;
-        crate::array::synchronize();
         self.check_cancelled()?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1_000.0;
         // `token_ids` keeps the terminating EOS, as before the overlap rewrite.
