@@ -11,13 +11,24 @@ export interface AudioRequestMetrics {
   tempBytes?: number;
   modelLoadMs?: number;
   queueWaitMs?: number;
+  /** Opening the uploaded WAV and decoding its samples. */
+  wavReadMs?: number;
   computeMs?: number;
+  featureMs?: number;
+  encoderMs?: number;
+  prefillMs?: number;
+  decodeMs?: number;
+  outputTokens?: number;
   firstPcmMs?: number;
+  /** PCM frames per channel sent to the client. */
+  pcmFrames?: number;
   audioSeconds?: number;
   realtimeFactor?: number;
   inputWaitMs?: number;
   consumerWaitMs?: number;
   finishReason?: string;
+  /** Handler entry to handler exit, or to the response flush when that comes first. */
+  totalMs?: number;
 }
 const requests = new WeakMap<ServerResponse, AudioRequestMetrics>();
 export function beginAudioMetrics(res: ServerResponse, task: AudioRequestMetrics['task']): AudioRequestMetrics {

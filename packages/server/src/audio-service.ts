@@ -126,6 +126,11 @@ export class AudioService {
       voiceRequest ? 'voice' : path === '/v1/audio/transcriptions' ? 'asr' : 'tts',
     );
     const started = performance.now();
+    // The logger records on 'finish'; stamp first if the flush beats the handler's exit.
+    const stampTotal = () => {
+      metrics.totalMs ??= performance.now() - started;
+    };
+    res.prependOnceListener('finish', stampTotal);
     let inferenceDispatched = false;
     // Handing work to the SDK is the conservative retry boundary, including
     // synchronous start failures and failures before the first output chunk.
@@ -175,6 +180,8 @@ export class AudioService {
         }
       } finally {
         if (metrics.state === 'running') metrics.state = controller.signal.aborted ? 'cancelled' : 'completed';
+        stampTotal();
+        res.off('finish', stampTotal);
         req.off('aborted', disconnected);
         req.off('close', requestClosed);
         req.off('error', disconnected);
@@ -359,7 +366,9 @@ export class AudioService {
           'Model does not support reference voice cloning',
           'model',
         );
+      const wavStarted = performance.now();
       reader = await WavReader.open(file.path);
+      metrics.wavReadMs = performance.now() - wavStarted;
       if (!reader.frames || reader.frames / reader.sampleRate > this.limits.maxReferenceSeconds)
         bad(`Reference audio must be nonempty and at most ${this.limits.maxReferenceSeconds} seconds`, 'audio_sample');
       const audio = reader;
@@ -371,23 +380,18 @@ export class AudioService {
             'Model does not support reference voice cloning',
             'model',
           );
-        const samples = new Float32Array(audio.frames);
-        let offset = 0;
-        for await (const chunk of audio.chunks(16384, true)) {
-          signal.throwIfAborted();
-          samples.set(chunk, offset);
-          offset += chunk.length;
-        }
-        signal.throwIfAborted();
+        const samples = await readSamples(audio, signal, metrics);
         const reservation = await this.voices.reserve(binding.model);
         try {
           signal.throwIfAborted();
           onDispatch();
+          const prepareStarted = performance.now();
           const prepared = await binding.model.prepareVoice({
             audio: { samples, sampleRate: audio.sampleRate, channels: 1 },
             transcript,
             signal,
           });
+          metrics.computeMs = performance.now() - prepareStarted;
           let record: AudioVoiceRecord | undefined;
           try {
             signal.throwIfAborted();
@@ -475,7 +479,9 @@ export class AudioService {
       metrics.uploadMs = performance.now() - uploadStarted;
       metrics.tempBytes = file.bytesReserved;
       const request = transcriptionRequest(fields);
+      const wavStarted = performance.now();
       reader = await WavReader.open(file.path);
+      metrics.wavReadMs = performance.now() - wavStarted;
       if (!reader.frames) bad('WAV contains no audio', 'file');
       // A tiny source rate must not expand a small upload into unbounded
       // resampled audio or feature tensors.
@@ -485,14 +491,7 @@ export class AudioService {
       await this.withModel(request.model, 'asr', signal, metrics, async (binding) => {
         if (binding.kind !== 'asr') throw new Error('Invalid ASR binding');
         if (!request.stream) {
-          const samples = new Float32Array(audio.frames);
-          let offset = 0;
-          for await (const chunk of audio.chunks(16384, true)) {
-            signal.throwIfAborted();
-            samples.set(chunk, offset);
-            offset += chunk.length;
-          }
-          signal.throwIfAborted();
+          const samples = await readSamples(audio, signal, metrics);
           onDispatch();
           const task = binding.model.startTranscription(samples, request.options);
           const abort = () => task.cancel();
@@ -500,8 +499,8 @@ export class AudioService {
           try {
             if (signal.aborted) task.cancel();
             const result = await task.result();
+            addAsrStages(metrics, result);
             Object.assign(metrics, {
-              computeMs: result.totalMs,
               audioSeconds: result.audioSeconds,
               finishReason: result.reachedMaxTokens ? 'length' : 'stop',
             });
@@ -543,7 +542,7 @@ export class AudioService {
                 ? result.stableText
                 : '';
             const provisional = result.text.slice(stable.length);
-            metrics.computeMs = (metrics.computeMs ?? 0) + result.totalMs;
+            addAsrStages(metrics, result);
             metrics.audioSeconds = result.audioSeconds;
             if (result.isFinal) metrics.finishReason = budgetExhausted ? 'length' : 'stop';
             signal.throwIfAborted();
@@ -711,6 +710,7 @@ export class AudioService {
             Object.assign(metrics, {
               computeMs: stats.synthesisMs + processed.stats.processingMs,
               firstPcmMs,
+              pcmFrames: frames,
               audioSeconds: seconds,
               realtimeFactor: rtf,
               finishReason: stats.finishReason,
@@ -800,4 +800,28 @@ export class AudioService {
         Trailer: 'X-Audio-Seconds, X-Realtime-Factor, X-Finish-Reason',
       });
   }
+}
+
+/** Decodes the whole WAV as mono and adds the time to `wavReadMs`. */
+async function readSamples(audio: WavReader, signal: AbortSignal, metrics: AudioRequestMetrics): Promise<Float32Array> {
+  const started = performance.now();
+  const samples = new Float32Array(audio.frames);
+  let offset = 0;
+  for await (const chunk of audio.chunks(16384, true)) {
+    signal.throwIfAborted();
+    samples.set(chunk, offset);
+    offset += chunk.length;
+  }
+  signal.throwIfAborted();
+  metrics.wavReadMs = (metrics.wavReadMs ?? 0) + performance.now() - started;
+  return samples;
+}
+/** Stage times add up over streaming revisions; a stream's tokenIds is its whole transcript so far. */
+function addAsrStages(metrics: AudioRequestMetrics, result: Qwen3AsrResult): void {
+  metrics.computeMs = (metrics.computeMs ?? 0) + result.totalMs;
+  metrics.featureMs = (metrics.featureMs ?? 0) + result.featureMs;
+  metrics.encoderMs = (metrics.encoderMs ?? 0) + result.encoderMs;
+  metrics.prefillMs = (metrics.prefillMs ?? 0) + result.prefillMs;
+  metrics.decodeMs = (metrics.decodeMs ?? 0) + result.decodeMs;
+  metrics.outputTokens = result.tokenIds.length;
 }

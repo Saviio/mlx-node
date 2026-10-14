@@ -633,6 +633,90 @@ it('audio logs omit query payloads from both structured and pretty logs', async 
   }
 });
 
+it('audio logs record ASR stage times and TTS frames in structured and pretty logs', async () => {
+  const { server, url } = await start();
+  const result = {
+    ...asrResult(),
+    tokenIds: [1, 2, 3],
+    featureMs: 2,
+    encoderMs: 30,
+    prefillMs: 20,
+    decodeMs: 100,
+    totalMs: 155,
+    isFinal: true,
+  };
+  server.registry.audio.register('asr', {
+    kind: 'asr',
+    model: {
+      startTranscription: vi.fn(() => ({ cancel() {}, result: async () => result })),
+      createStream: vi.fn(),
+      dispose: async () => {},
+    },
+  });
+  server.registry.audio.register('tts', { kind: 'tts', model: createTtsModel(backend()) });
+  const dir = await mkdtemp(join(tmpdir(), 'audio-stage-log-'));
+  const log = attachLogger(server.server, dir);
+  const pcm = audioEncodePcm16(new Float32Array(100));
+  try {
+    const asr = await fetch(`${url}/v1/audio/transcriptions?model=asr`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/wav' },
+      body: Buffer.concat([audioWavHeader(16000, 1, pcm.length), pcm]),
+    });
+    expect(asr.status).toBe(200);
+    await asr.text();
+    const speech = await fetch(`${url}/v1/audio/speech`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'tts', voice: 'v', input: 'Hello.', response_format: 'pcm' }),
+    });
+    expect(speech.status).toBe(200);
+    expect((await speech.arrayBuffer()).byteLength).toBe(48);
+    await server.close();
+    await log.close();
+    const entries = (await readFile(join(dir, 'requests.ndjson'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(entries).toHaveLength(2);
+    const asrEntry = entries.find((entry) => entry.path === '/v1/audio/transcriptions');
+    expect(asrEntry.audioMetrics).toMatchObject({
+      task: 'asr',
+      model: 'asr',
+      state: 'completed',
+      featureMs: 2,
+      encoderMs: 30,
+      prefillMs: 20,
+      decodeMs: 100,
+      computeMs: 155,
+      outputTokens: 3,
+      audioSeconds: 1,
+      finishReason: 'stop',
+    });
+    for (const key of ['uploadMs', 'queueWaitMs', 'wavReadMs', 'totalMs'])
+      expect(asrEntry.audioMetrics[key], key).toBeGreaterThanOrEqual(0);
+    const ttsEntry = entries.find((entry) => entry.path === '/v1/audio/speech');
+    expect(ttsEntry.audioMetrics).toMatchObject({
+      task: 'tts',
+      state: 'completed',
+      pcmFrames: 24,
+      finishReason: 'eos',
+    });
+    for (const key of ['queueWaitMs', 'firstPcmMs', 'computeMs', 'totalMs'])
+      expect(ttsEntry.audioMetrics[key], key).toBeGreaterThanOrEqual(0);
+    const pretty = await readFile(join(dir, 'session.log'), 'utf8');
+    expect(pretty).toMatch(
+      /200 POST \/v1\/audio\/transcriptions \d+ms 0B model=asr task=asr server\(upload=\d+ms queue=\d+ms wav=\d+ms total=\d+ms\) perf\(feature=2ms encoder=30ms prefill=20ms decode=100ms compute=155ms\) audio\(sec=1\.00 out=3\) stop=stop\n/,
+    );
+    expect(pretty).toMatch(
+      /200 POST \/v1\/audio\/speech \d+ms 0B model=tts task=tts server\(queue=\d+ms total=\d+ms\) perf\(compute=\d+ms first_pcm=\d+ms\) audio\(sec=0\.00 frames=24 rtf=[\d.]+\) stop=eos\n/,
+    );
+  } finally {
+    await log.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 it('bounds generation for a stalled PCM client and waits for cancellation on drain timeout', async () => {
   const { server, url } = await start({ audio: { outputDrainMs: 40 } });
   const native = backend();
