@@ -241,6 +241,59 @@ describe('extractBakedMetallibBinding', () => {
     ]);
     expect(() => extractBakedMetallibBinding(conflicting)).toThrow(/distinct METAL_PATH/);
   });
+
+  it('source form: accepts a matching paged_attn.metallib origin and rejects one naming another mlx-sys build', () => {
+    const same = fakeAddon([bakedPathFor(BAKED_DIR_A), `${BAKED_DIR_A}/paged_attn.metallib`]);
+    expect(extractBakedMetallibBinding(same)).toMatchObject({ kind: 'source', outDir: BAKED_DIR_A });
+
+    const other = fakeAddon([
+      bakedPathFor(BAKED_DIR_A),
+      `/repo/target/${TRIPLE}/release/build/mlx-sys-bbbb2222/out/paged_attn.metallib`,
+    ]);
+    expect(() => extractBakedMetallibBinding(other)).toThrow(/two different mlx-sys builds/);
+  });
+});
+
+const PREBUILT_TAG = 'mlx-prebuilt-e091d678454e-4610d72d';
+/** The producer's sentinel: `<producer OUT_DIR>/mlx-prebuilt/<tag>/kernels/mlx.metallib`. */
+const PRODUCER_OUT = '/Users/runner/work/mlx-node/target/aarch64-apple-darwin/release/build/mlx-sys-0123abcd/out';
+const sentinelFor = (tag: string, prefix: string = PRODUCER_OUT, doubleSlash = false) =>
+  `${prefix}/mlx-prebuilt/${tag}/kernels/${doubleSlash ? '/' : ''}mlx.metallib`;
+const PAGED_ORIGIN = `${BAKED_DIR_A}/paged_attn.metallib`;
+
+describe('extractBakedMetallibBinding (prebuilt MLX sentinel)', () => {
+  it('binds the sentinel to <OUT_DIR>/lib/mlx.metallib of the paged_attn origin', () => {
+    const addon = fakeAddon(['decoy mlx.metallib', sentinelFor(PREBUILT_TAG), PAGED_ORIGIN, 'paged_attn.metallib']);
+    const binding = extractBakedMetallibBinding(addon);
+    expect(binding).toMatchObject({
+      kind: 'prebuilt',
+      prebuiltTag: PREBUILT_TAG,
+      outDir: BAKED_DIR_A,
+      libDir: `${BAKED_DIR_A}/lib`,
+      bakedPath: `${BAKED_DIR_A}/lib/mlx.metallib`,
+    });
+    // one file only: no separate install copy to compare against
+    expect(binding!.installCopyPath).toBe(binding!.bakedPath);
+  });
+
+  it('accepts the root-anchored and double-slash sentinel forms', () => {
+    for (const sentinel of [sentinelFor(PREBUILT_TAG, ''), sentinelFor(PREBUILT_TAG, PRODUCER_OUT, true)]) {
+      const binding = extractBakedMetallibBinding(fakeAddon([sentinel, PAGED_ORIGIN]));
+      expect(binding?.prebuiltTag).toBe(PREBUILT_TAG);
+    }
+  });
+
+  it('throws when the sentinel comes without a paged_attn.metallib origin (no way to find the mlx-sys build)', () => {
+    expect(() => extractBakedMetallibBinding(fakeAddon([sentinelFor(PREBUILT_TAG)]))).toThrow(
+      /bakes no paged_attn\.metallib origin/,
+    );
+  });
+
+  it('rejects a source METAL_PATH and a prebuilt sentinel in one addon', () => {
+    expect(() =>
+      extractBakedMetallibBinding(fakeAddon([bakedPathFor(BAKED_DIR_A), sentinelFor(PREBUILT_TAG), PAGED_ORIGIN])),
+    ).toThrow(/distinct METAL_PATH/);
+  });
 });
 
 describe('selectMetallib', () => {
@@ -377,6 +430,41 @@ describe('selectMetallib', () => {
       }
     },
   );
+
+  it('PREBUILT: ships <OUT_DIR>/lib/mlx.metallib of the mlx-sys build named by the paged origin', () => {
+    // A newer unbound source build must not win over the prebuilt binding.
+    addOutDir(`${TRIPLE}/release/build/mlx-sys-ffff2222`, 'newer-unbound', 0);
+    const outDir = join(root, `${TRIPLE}/release/build/mlx-sys-aaaa1111/out`);
+    const libDir = join(outDir, 'lib');
+    mkdirSync(libDir, { recursive: true });
+    const linked = join(libDir, 'mlx.metallib');
+    writeFileSync(linked, 'release-bytes');
+    const warnings: string[] = [];
+    const picked = selectMetallib({
+      addonBinary: fakeAddon([sentinelFor(PREBUILT_TAG), `${outDir}/paged_attn.metallib`]),
+      addonPath: 'fake.node',
+      targetRoot: root,
+      triple: TRIPLE,
+      profile: 'release',
+      strict: true,
+      warn: (m) => warnings.push(m),
+    });
+    expect(picked).toEqual({ source: 'prebuilt', metallibPath: linked, outDir, libDir });
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('PREBUILT: throws (never scans) when <OUT_DIR>/lib/mlx.metallib is missing', () => {
+    addOutDir(`${TRIPLE}/release/build/mlx-sys-ffff2222`, 'newer-unbound', 0);
+    expect(() =>
+      selectMetallib({
+        addonBinary: fakeAddon([sentinelFor(PREBUILT_TAG), PAGED_ORIGIN]),
+        addonPath: 'fake.node',
+        targetRoot: root,
+        triple: TRIPLE,
+        profile: 'release',
+      }),
+    ).toThrow(new RegExp(`links prebuilt MLX ${PREBUILT_TAG} .* does not exist`));
+  });
 
   it('falls back to the mtime scan only when the addon bakes no METAL_PATH', () => {
     const newest = addOutDir(`${TRIPLE}/release/build/mlx-sys-ffff2222`, 'fresh', 0);
