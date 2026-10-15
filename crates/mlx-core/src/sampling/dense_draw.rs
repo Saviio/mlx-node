@@ -36,6 +36,28 @@ pub(crate) fn sample_dense_distribution_array<R: Rng + ?Sized>(
     MxArray::from_handle(raw, "sample_probabilities")
 }
 
+/// [`sample_dense_distribution_array`] applied to `softmax` of a `[1, V]`
+/// logits row divided by `temperature` (> 0), keeping only the values >= the
+/// `top_k`-th largest when `0 < top_k < V`. Consumes one RNG word per call,
+/// as that function does, and draws the same token for the same word. Metal
+/// runs it as one kernel. Returns an int32 `[1, 1]` token.
+pub(crate) fn sample_logits_array<R: Rng + ?Sized>(
+    logits: &MxArray,
+    temperature: f64,
+    top_k: i32,
+    rng: &mut R,
+) -> Result<MxArray> {
+    let raw = unsafe {
+        mlx_sys::mlx_array_sample_logits(
+            logits.handle.0,
+            temperature as f32,
+            top_k,
+            rng.random::<u64>(),
+        )
+    };
+    MxArray::from_handle(raw, "sample_logits")
+}
+
 /// One completion boundary for a parallel or chained proposal. Keeping every
 /// output alive also lets callers reject invalid intermediate rows before any
 /// proposal is admitted to target verification.
@@ -190,6 +212,140 @@ mod tests {
                     assert_eq!(first.random::<u64>(), keys.random::<u64>());
                 }
             }
+        }
+    }
+
+    /// The ops `sample_logits_array` replaces in the TTS frame loop.
+    fn composed_logits_draw(
+        logits: &MxArray,
+        temperature: f64,
+        top_k: i32,
+        rng: &mut StdRng,
+    ) -> MxArray {
+        let mut x = logits
+            .astype(crate::array::DType::Float32)
+            .unwrap()
+            .div_scalar(temperature)
+            .unwrap();
+        if top_k > 0 && i64::from(top_k) < x.shape_at(1).unwrap() {
+            x = crate::sampling::apply_top_k(&x, top_k).unwrap();
+        }
+        let probabilities = crate::nn::Activations::softmax(&x, Some(-1))
+            .unwrap()
+            .reshape(&[-1])
+            .unwrap();
+        sample_dense_distribution_array(&probabilities, rng).unwrap()
+    }
+
+    #[test]
+    fn logits_draw_matches_the_composed_sampler() {
+        let mut values = StdRng::seed_from_u64(7);
+        // Odd rows, both TTS heads, the fused width limit, and one row past it.
+        for width in [1usize, 5, 7, 130, 2048, 3072, 4096, 4099] {
+            let mut normal = || (0..4).map(|_| values.random::<f32>()).sum::<f32>() * 3.0 - 6.0;
+            let peaked: Vec<f32> = (0..width)
+                .map(|i| if i % 97 == 3 { 18.0 } else { normal() })
+                .collect();
+            let masked: Vec<f32> = (0..width)
+                .map(|i| {
+                    if i % 4 == 1 {
+                        f32::NEG_INFINITY
+                    } else {
+                        normal()
+                    }
+                })
+                .collect();
+            // NaN of either sign ranks above every number in MLX's sort.
+            let nan: Vec<f32> = (0..width)
+                .map(|i| match i % 9 {
+                    2 => f32::NAN,
+                    5 => -f32::NAN,
+                    _ => normal(),
+                })
+                .collect();
+            // Some(no mass) where the row decides it; NaN poisons softmax unless top-k drops it.
+            let rows = [
+                (peaked, Some(false)),
+                (masked, Some(false)),
+                (vec![0.5; width], Some(false)),
+                (
+                    (0..width).map(|i| (i % 3) as f32 - 1.0).collect(),
+                    Some(false),
+                ),
+                (
+                    (0..width)
+                        .map(|i| [0.0, -0.0, 0.25][i % 3])
+                        .collect::<Vec<f32>>(),
+                    Some(false),
+                ),
+                (nan, None),
+                (vec![f32::NEG_INFINITY; width], Some(true)),
+            ];
+            for (row_index, (row, no_mass)) in rows.iter().enumerate() {
+                for dtype in [crate::array::DType::Float32, crate::array::DType::BFloat16] {
+                    let logits = MxArray::from_float32(row, &[1, width as i64])
+                        .unwrap()
+                        .astype(dtype)
+                        .unwrap();
+                    let mut pairs = Vec::new();
+                    for temperature in [0.5, 0.9, 1.0, 1.7] {
+                        let width = width as i32;
+                        for top_k in [0, 1, 2, 50, width - 1, width, width + 1] {
+                            for seed in 0..8 {
+                                let mut fused_rng = StdRng::seed_from_u64(seed);
+                                let mut composed_rng = StdRng::seed_from_u64(seed);
+                                let fused = sample_logits_array(
+                                    &logits,
+                                    temperature,
+                                    top_k,
+                                    &mut fused_rng,
+                                )
+                                .unwrap();
+                                let composed = composed_logits_draw(
+                                    &logits,
+                                    temperature,
+                                    top_k,
+                                    &mut composed_rng,
+                                );
+                                assert_eq!(
+                                    (
+                                        fused.ndim().unwrap(),
+                                        fused.shape_at(0).unwrap(),
+                                        fused.shape_at(1).unwrap()
+                                    ),
+                                    (2, 1, 1)
+                                );
+                                assert_eq!(fused_rng.random::<u64>(), composed_rng.random::<u64>());
+                                pairs.push((fused, composed, temperature, top_k, seed));
+                            }
+                        }
+                    }
+                    let arrays: Vec<_> = pairs.iter().flat_map(|(f, c, ..)| [f, c]).collect();
+                    MxArray::eval_arrays_with_context(&arrays, "logits draw parity").unwrap();
+                    for (fused, composed, temperature, top_k, seed) in &pairs {
+                        let fused = fused.item_at_int32(0).unwrap();
+                        assert_eq!(
+                            fused,
+                            composed.item_at_int32(0).unwrap(),
+                            "width {width} row {row_index} {dtype:?} T {temperature} top_k {top_k} seed {seed}"
+                        );
+                        if let Some(no_mass) = no_mass {
+                            assert_eq!(fused < 0, *no_mass);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logits_draw_rejects_invalid_rows_and_temperatures() {
+        let row = MxArray::from_float32(&[0.0, 1.0, 2.0], &[1, 3]).unwrap();
+        let flat = MxArray::from_float32(&[0.0, 1.0, 2.0], &[3]).unwrap();
+        let mut rng = StdRng::seed_from_u64(42);
+        assert!(sample_logits_array(&flat, 1.0, 0, &mut rng).is_err());
+        for temperature in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(sample_logits_array(&row, temperature, 0, &mut rng).is_err());
         }
     }
 

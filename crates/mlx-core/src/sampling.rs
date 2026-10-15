@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 mod dense_draw;
 pub(crate) use dense_draw::{
     materialize_draft_tokens, sample_dense_distribution, sample_dense_distribution_array,
+    sample_logits_array,
 };
 
 /// Configuration for sampling strategies

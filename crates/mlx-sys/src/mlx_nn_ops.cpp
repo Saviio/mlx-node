@@ -2,6 +2,7 @@
 #include "mlx_portable_sdpa.h"
 #include "mlx_sampling.h"
 #include <limits>
+#include <mutex>
 
 namespace {
 mlx::core::array sample_probabilities_with_uniforms(
@@ -11,6 +12,54 @@ mlx::core::array sample_probabilities_with_uniforms(
   auto logits = where(valid, log(p), array(-std::numeric_limits<float>::infinity()));
   auto token = astype(mlx_categorical_with_uniforms(logits, uniforms, -1), int32);
   return where(any(valid), token, array(-1, int32));
+}
+
+mlx::core::array explicit_key(uint64_t seed) {
+  const uint32_t key_words[] = {static_cast<uint32_t>(seed >> 32),
+                                static_cast<uint32_t>(seed)};
+  return mlx::core::array(key_words, {2}, mlx::core::uint32);
+}
+
+// block_softmax's width limit (softmax.cpp): the fused kernel reproduces that
+// kernel's reduction order, so wider rows take the unfused ops.
+constexpr int kFusedSampleMaxWidth = 4096;
+
+const char* kSampleLogitsBody =
+#include "metal/common/sample_logits.metal.inc"
+    ;
+
+mlx::core::fast::CustomKernelFunction& sample_logits_kernel() {
+  static std::mutex mtx;
+  static std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+  std::lock_guard<std::mutex> lock(mtx);
+  if (!kernel.has_value()) {
+    kernel = mlx::core::fast::metal_kernel(
+        "mlx_node_sample_logits",
+        /* input_names  */ {"logits", "key", "temperature", "top_k"},
+        /* output_names */ {"token"},
+        /* source       */ kSampleLogitsBody,
+        /* header       */ "",
+        /* ensure_row_contiguous */ true,
+        /* atomic_outputs        */ false);
+  }
+  return kernel.value();
+}
+
+mlx::core::array sample_logits_unfused(const mlx::core::array& logits,
+                                       float temperature, int top_k,
+                                       const mlx::core::array& key) {
+  using namespace mlx::core;
+  auto x = divide(astype(logits, float32), array(temperature, float32));
+  const int width = x.shape(1);
+  if (top_k > 0 && top_k < width) {
+    auto kth = slice(sort(x, -1), {0, width - top_k}, {1, width - top_k + 1});
+    x = where(greater_equal(x, kth), x,
+              array(-std::numeric_limits<float>::infinity(), float32));
+  }
+  auto probabilities = reshape(softmax(x, -1), {width});
+  auto token = sample_probabilities_with_uniforms(
+      probabilities, random::uniform(probabilities.shape(), float32, key));
+  return reshape(token, {1, 1});
 }
 }  // namespace
 
@@ -61,6 +110,48 @@ mlx_array* mlx_array_sample_probabilities(mlx_array* handle, uint64_t seed) {
     return reinterpret_cast<mlx_array*>(new array(std::move(result[0])));
   } catch (const std::exception& e) {
     mlx_trace_native_error("sample_probabilities", e.what());
+    return nullptr;
+  } catch (...) { return nullptr; }
+}
+
+// One keyed draw from a [1, V] logits row: divide by `temperature`, keep the
+// values >= the top_k-th largest when 0 < top_k < V, softmax, then the draw
+// of mlx_array_sample_probabilities with the same key. On Metal this is one
+// kernel with the same bits as those ops. Returns an int32 [1, 1] token; -1
+// reports no finite positive mass after evaluation.
+mlx_array* mlx_array_sample_logits(mlx_array* handle, float temperature,
+                                   int32_t top_k, uint64_t seed) {
+  using namespace mlx::core;
+  if (!handle) return nullptr;
+  try {
+    const auto& logits = *reinterpret_cast<array*>(handle);
+    if (logits.ndim() != 2 || logits.shape(0) != 1 || logits.shape(1) == 0 ||
+        !issubdtype(logits.dtype(), floating) || !(temperature > 0.0f) ||
+        !std::isfinite(temperature)) {
+      return nullptr;
+    }
+    const int width = logits.shape(1);
+    const auto dtype = logits.dtype();
+    const auto key = explicit_key(seed);
+    if (width <= kFusedSampleMaxWidth &&
+        (dtype == float32 || dtype == bfloat16 || dtype == float16) &&
+        metal::is_available() && default_device().type == Device::gpu) {
+      const int threads = 32 * ((width + 127) / 128);
+      auto outs = sample_logits_kernel()(
+          {logits, key, array(temperature, float32), array(top_k, int32)},
+          /* output_shapes */ {Shape{1, 1}},
+          /* output_dtypes */ {int32},
+          /* grid        */ {threads, 1, 1},
+          /* threadgroup */ {threads, 1, 1},
+          /* template_args */ {{"T", dtype}, {"V", width}},
+          /* init_value */ std::nullopt,
+          /* verbose */ false, default_stream(Device::gpu));
+      return reinterpret_cast<mlx_array*>(new array(std::move(outs[0])));
+    }
+    auto token = sample_logits_unfused(logits, temperature, top_k, key);
+    return reinterpret_cast<mlx_array*>(new array(std::move(token)));
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("sample_logits", e.what());
     return nullptr;
   } catch (...) { return nullptr; }
 }

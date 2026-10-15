@@ -325,6 +325,14 @@ unsafe extern "C-unwind" {
         uniforms: *mut mlx_array,
     ) -> *mut mlx_array;
     pub fn mlx_array_sample_probabilities(handle: *mut mlx_array, seed: u64) -> *mut mlx_array;
+    /// Lazy keyed draw from a [1, V] logits row (temperature, top-k, softmax,
+    /// then the draw above); int32 [1, 1], -1 means no valid mass.
+    pub fn mlx_array_sample_logits(
+        handle: *mut mlx_array,
+        temperature: f32,
+        top_k: i32,
+        seed: u64,
+    ) -> *mut mlx_array;
     /// macOS shared-memory draft sampling; both functions validate rank/dtype
     /// and wait for completion before reading. No pointer escapes the call.
     pub fn mlx_array_positive_probability_mass(handle: *mut mlx_array, out: *mut f64) -> bool;

@@ -9,7 +9,7 @@ use super::{
 use crate::{
     array::{DType, MxArray},
     nn::{Activations, Embedding, Linear},
-    sampling::{apply_top_k, apply_top_p, sample_dense_distribution_array},
+    sampling::{apply_top_k, apply_top_p, sample_logits_array},
     transformer::KVCache,
 };
 use napi::{Error, Result};
@@ -903,21 +903,22 @@ fn draw(
     top_p: f64,
     rng: &mut StdRng,
 ) -> Result<MxArray> {
-    let mut x = logits.astype(DType::Float32)?;
     if temperature <= 1e-6 {
-        return x.argmax(-1, Some(true))?.astype(DType::Int32);
+        return logits
+            .astype(DType::Float32)?
+            .argmax(-1, Some(true))?
+            .astype(DType::Int32);
     }
     // Reference order: temperature first, then filters on tempered logits;
     // EOS receives no protection from top_k/top_p.
-    x = x.div_scalar(temperature)?;
-    if top_k > 0 && i64::from(top_k) < x.shape()?[1] {
-        x = apply_top_k(&x, top_k)?;
-    }
     if top_p > 0. && top_p < 1. {
-        x = apply_top_p(&x, top_p)?;
+        let mut x = logits.astype(DType::Float32)?.div_scalar(temperature)?;
+        if top_k > 0 && i64::from(top_k) < x.shape()?[1] {
+            x = apply_top_k(&x, top_k)?;
+        }
+        return sample_logits_array(&apply_top_p(&x, top_p)?, 1., 0, rng);
     }
-    let probabilities = Activations::softmax(&x, Some(-1))?.reshape(&[-1])?;
-    sample_dense_distribution_array(&probabilities, rng)?.reshape(&[1, 1])
+    sample_logits_array(logits, temperature, top_k, rng)
 }
 
 /// First-order estimate of the short-lived bytes one decode step allocates
