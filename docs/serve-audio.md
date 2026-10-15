@@ -143,8 +143,9 @@ subtitles and diarization) are rejected. Empty/malformed, compressed, misaligned
 non-finite or oversized audio is rejected. Maximum duration is 20 minutes in
 addition to the byte limit; a one-shot model context budget may be tighter.
 
-Ordinary requests use the one-shot SDK method, with a default output budget of
-4096 tokens. Audio, prompt and output budget must fit the checkpoint context.
+Ordinary requests use the one-shot SDK method. Without `sampling.max_tokens`, the
+output budget is 10 tokens per audio second, at least 128. Audio, prompt and
+output budget must fit the checkpoint context.
 The server does not silently split the input or switch algorithms. JSON returns
 `text`, `language`, `duration` and `finish_reason` (`stop` or `length`). Text
 responses expose `X-Finish-Reason`.

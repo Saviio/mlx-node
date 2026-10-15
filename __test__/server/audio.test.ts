@@ -201,11 +201,34 @@ describe('audio HTTP contract', () => {
       });
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({ text: 'whole', finish_reason: 'stop' });
-      expect(fake.options[0]).toMatchObject({ sampleRate: rate, maxTokens: 4096 });
+      expect(fake.options[0]).toMatchObject({ sampleRate: rate });
+      expect(fake.options[0]).not.toHaveProperty('maxTokens');
       expect(fake.feeds[0].length).toBe(Math.round(rate * 0.01));
       expect(fake.feeds[0][0]).toBe(0.25);
     },
   );
+  it('leaves the one-shot output budget to the model unless sampling.max_tokens sets it', async () => {
+    const { server, url } = await start();
+    const fake = asr();
+    server.registry.audio.register('asr', { kind: 'asr', model: fake.model });
+    const post = (query: string) =>
+      fetch(`${url}/v1/audio/transcriptions?model=asr${query}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'audio/wav' },
+        body: wav(16000, 0.01),
+      });
+    const sampling = (maxTokens: number) =>
+      `&sampling=${encodeURIComponent(JSON.stringify({ max_tokens: maxTokens }))}`;
+    for (const query of ['', sampling(16), sampling(16384), '&stream=true']) {
+      const res = await post(query);
+      expect(res.status).toBe(200);
+      await res.text();
+    }
+    expect(fake.options[0]).not.toHaveProperty('maxTokens');
+    expect(fake.options[1]).toMatchObject({ maxTokens: 16 });
+    expect(fake.options[2]).toMatchObject({ maxTokens: 16384 });
+    expect(fake.options[3]).toMatchObject({ maxTokens: 32 });
+  });
   it('extracts multipart file bytes with model fields after the file and matches raw input', async () => {
     const { server, url } = await start();
     const fake = asr();

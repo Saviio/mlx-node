@@ -9,7 +9,7 @@
  * the client's evaluation-input fingerprint and refuses a set that does not match `sets.json`.
  *
  * Requests mirror the server path: WAV read like audio-service.ts, `startTranscription`, `language` = split,
- * `maxTokens` = the server's non-streaming default (4096). Decoding is greedy (temperature 0).
+ * no `maxTokens` unless `--max-tokens` is given (the server's non-streaming default). Decoding is greedy (temperature 0).
  * `--concurrency N` keeps N transcriptions in flight against ONE loaded model.
  * Rows are written in set order. Run metadata goes to `<out>.meta.json`.
  */
@@ -29,7 +29,7 @@ const { values } = parseArgs({
     set: { type: 'string' },
     out: { type: 'string' },
     concurrency: { type: 'string', default: '1' },
-    'max-tokens': { type: 'string', default: '4096' },
+    'max-tokens': { type: 'string' },
     warmup: { type: 'string', default: '1' },
     force: { type: 'boolean', default: false },
   },
@@ -43,7 +43,7 @@ const positiveInt = (raw: string, name: string, min: number): number => {
   return value;
 };
 const concurrency = positiveInt(values.concurrency, 'concurrency', 1);
-const maxTokens = positiveInt(values['max-tokens'], 'max-tokens', 1);
+const maxTokens = values['max-tokens'] === undefined ? undefined : positiveInt(values['max-tokens'], 'max-tokens', 1);
 const warmup = positiveInt(values.warmup, 'warmup', 0);
 const clipsDir = resolve(values.clips);
 const outPath = resolve(values.out);
@@ -123,7 +123,7 @@ const mapped = () => {
 };
 
 const language = info.split;
-const options = { language, maxTokens };
+const options = { language, ...(maxTokens === undefined ? {} : { maxTokens }) };
 const startedAt = new Date().toISOString();
 const loadStart = performance.now();
 const model = await Qwen3AsrModel.load(resolve(values.model));

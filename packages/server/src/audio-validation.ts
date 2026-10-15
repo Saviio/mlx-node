@@ -184,14 +184,10 @@ export function transcriptionRequest(body: Record<string, unknown>): {
     if (!['chunk_seconds', 'provisional_tokens', 'unfixed_chunks'].includes(key))
       bad(`Unsupported stream_options.${key}`, `stream_options.${key}`);
   if (!stream && Object.keys(rolling).length) bad('stream_options requires stream:true', 'stream_options');
-  const options: Qwen3AsrTranscribeOptions & Qwen3AsrStreamOptions = {
-    maxTokens:
-      sampling.max_tokens === undefined
-        ? stream
-          ? 32
-          : 4096
-        : numeric(sampling.max_tokens, 'sampling.max_tokens', 1, 16384, true),
-  };
+  const options: Qwen3AsrTranscribeOptions & Qwen3AsrStreamOptions = {};
+  if (sampling.max_tokens !== undefined)
+    options.maxTokens = numeric(sampling.max_tokens, 'sampling.max_tokens', 1, 16384, true);
+  else if (stream) options.maxTokens = 32;
   if (body.language !== undefined) options.language = string(body.language, 'language');
   if (body.prompt !== undefined) {
     if (typeof body.prompt !== 'string' || textLength(body.prompt) > 4096) bad('Invalid prompt', 'prompt');

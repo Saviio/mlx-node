@@ -5570,7 +5570,11 @@ export interface Qwen3AsrTranscribeOptions {
    * automatic language detection.
    */
   language?: string;
-  /** Maximum number of newly generated tokens (default 256). */
+  /**
+   * Maximum number of newly generated tokens. Omit for 10 tokens per audio
+   * second, at least 128, capped by the remaining context while that cap
+   * still allows 128.
+   */
   maxTokens?: number;
 }
 

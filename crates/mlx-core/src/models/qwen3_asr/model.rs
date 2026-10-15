@@ -27,7 +27,8 @@ use super::config::{
     Qwen3AsrStreamOptions, Qwen3AsrTranscribeOptions, TextConfig,
 };
 
-const DEFAULT_MAX_TOKENS: u32 = 256;
+const MIN_OUTPUT_TOKENS: usize = 128;
+const OUTPUT_TOKENS_PER_AUDIO_SECOND: u64 = 10;
 const DEFAULT_STREAM_CHUNK_SECONDS: f64 = 2.0;
 const DEFAULT_PROVISIONAL_TOKENS: u32 = 5;
 const DEFAULT_UNFIXED_CHUNKS: u32 = 2;
@@ -1094,14 +1095,22 @@ impl Qwen3AsrInner {
         let chunk_len = self.audio_tower.config.n_window * 2;
         let audio_positions = (valid_frames / chunk_len) * AudioTower::post_cnn_length(chunk_len)
             + AudioTower::post_cnn_length(valid_frames % chunk_len);
-        let required = audio_positions
+        let prompt_positions = audio_positions
             + asr_prefix_tokens(&self.tokenizer, options.prompt.as_deref())?.len()
             + self
                 .tokenizer
                 .encode_sync(&asr_suffix_text(language.as_deref()), Some(false))?
-                .len()
-            + options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS) as usize;
-        if required > self.text_decoder.config.max_position_embeddings {
+                .len();
+        let max_tokens = transcription_token_budget(
+            options.max_tokens,
+            native_samples,
+            self.feature_extractor.sample_rate(),
+            self.text_decoder
+                .config
+                .max_position_embeddings
+                .saturating_sub(prompt_positions),
+        );
+        if prompt_positions + max_tokens > self.text_decoder.config.max_position_embeddings {
             return Err(Error::from_reason(
                 "ASR input plus output budget exceeds context capacity",
             ));
@@ -1123,8 +1132,7 @@ impl Qwen3AsrInner {
             options.prompt.as_deref(),
             language.as_deref(),
         )?;
-        if prompt_embeddings.shape_at(1)? as usize
-            + options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS) as usize
+        if prompt_embeddings.shape_at(1)? as usize + max_tokens
             > self.text_decoder.config.max_position_embeddings
         {
             return Err(Error::from_reason(format!(
@@ -1140,7 +1148,6 @@ impl Qwen3AsrInner {
         self.check_cancelled()?;
         let logits = self.text_decoder.prefill(&prompt_embeddings, &mut caches)?;
 
-        let max_tokens = options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(1) as usize;
         let decoder = &self.text_decoder;
         let mut kv = FusedKv::take(&mut caches)?;
         let (mut generated, eos, first_token_at) =
@@ -1655,6 +1662,28 @@ fn validate_audio_samples(samples: &[f32]) -> Result<()> {
         return Err(Error::from_reason("audio contains NaN or infinity"));
     }
     Ok(())
+}
+
+/// The remaining context caps the scaled budget only while it still allows the
+/// 128 floor. Below that the budget stays uncut, so the caller's context check
+/// rejects the request instead of returning a few tokens of a long clip.
+fn transcription_token_budget(
+    requested: Option<u32>,
+    native_samples: usize,
+    native_rate: u32,
+    remaining_context: usize,
+) -> usize {
+    if let Some(requested) = requested {
+        return requested.max(1) as usize;
+    }
+    let scaled = (native_samples as u64 * OUTPUT_TOKENS_PER_AUDIO_SECOND)
+        .div_ceil(u64::from(native_rate)) as usize;
+    let budget = scaled.max(MIN_OUTPUT_TOKENS);
+    if remaining_context >= MIN_OUTPUT_TOKENS {
+        budget.min(remaining_context)
+    } else {
+        budget
+    }
 }
 
 fn stream_chunk_seconds(options: &Qwen3AsrStreamOptions) -> Result<f64> {
@@ -2806,6 +2835,31 @@ mod tests {
             let error = validate_audio_samples(&[0.25, invalid, 0.5]).unwrap_err();
             assert!(error.reason.contains("NaN or infinity"), "{}", error.reason);
         }
+    }
+
+    #[test]
+    fn transcription_budget_scales_with_audio_and_honors_requests() {
+        const RATE: u32 = 16_000;
+        let room = 65_536;
+        let budget = |requested, samples, remaining| {
+            transcription_token_budget(requested, samples, RATE, remaining)
+        };
+        assert_eq!(budget(None, 0, room), 128);
+        assert_eq!(budget(None, 16_000, room), 128);
+        assert_eq!(budget(None, 204_800, room), 128);
+        assert_eq!(budget(None, 204_801, room), 129);
+        assert_eq!(budget(None, 206_400, room), 129);
+        assert_eq!(budget(None, 206_401, room), 130);
+        assert_eq!(budget(None, 30 * 16_000, room), 300);
+        assert_eq!(budget(None, 1_200 * 16_000, room), 12_000);
+        assert_eq!(budget(Some(16), 30 * 16_000, room), 16);
+        assert_eq!(budget(Some(4_096), 30 * 16_000, room), 4_096);
+        assert_eq!(budget(Some(4_096), 16_000, 100), 4_096);
+        assert_eq!(budget(Some(0), 16_000, room), 1);
+        assert_eq!(budget(None, 1_200 * 16_000, 5_000), 5_000);
+        assert_eq!(budget(None, 1_200 * 16_000, 128), 128);
+        assert_eq!(budget(None, 1_200 * 16_000, 127), 12_000);
+        assert_eq!(budget(None, 16_000, 127), 128);
     }
 
     #[test]

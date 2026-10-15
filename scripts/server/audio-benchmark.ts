@@ -192,7 +192,7 @@ try {
     for (let i = 0; i < 3; i++) {
       const start = performance.now();
       const sdk: Qwen3AsrResult = await host.server.modelWork.withInference((): Promise<Qwen3AsrResult> =>
-        asr.model.startTranscription(audio.samples, { sampleRate: audio.sampleRate, maxTokens: 4096 }).result(),
+        asr.model.startTranscription(audio.samples, { sampleRate: audio.sampleRate }).result(),
       );
       asrSdk.push(performance.now() - start);
       const http = await transcribe();
