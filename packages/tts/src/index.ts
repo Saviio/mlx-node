@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { createTtsModel } from './model.js';
+export { NON_STREAMING_CHUNK_DURATION_MS } from './model.js';
 import { loadQwen3Backend } from './qwen3.js';
 import type { TtsModel, TtsLoadOptions } from './types.js';
 export type * from './types.js';

@@ -77,7 +77,10 @@ punctuation can commit immediately. Each segment has fresh generator state and i
 own codec state (initialized from the prepared reference prefix for Base), and
 reuses the voice condition. Natural pauses between segments are expected.
 
-The default output target is 160 ms, rounded up to whole codec frames. Native
+The default output target is 160 ms for `synthesizeStream` and 640 ms
+(`NON_STREAMING_CHUNK_DURATION_MS`) for `synthesize`, rounded up to whole codec
+frames. Wider codec steps cost less per frame; their PCM is not bit-identical to
+160 ms chunks. Native
 PCM buffering is bounded to about one second and text buffering to two segments.
 `chunkDurationMs`, `audioBufferSeconds`, `queuedSegments` and
 `maxSegmentGraphemes` configure these policies. Slow consumers apply backpressure.

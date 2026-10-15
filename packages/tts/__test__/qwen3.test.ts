@@ -149,9 +149,13 @@ describe('Qwen3 backend adapter', () => {
       voice: 'vivian',
       language: 'chinese',
       seed: 1,
-      chunk_frames: 2,
-      buffer_chunks: 6,
+      chunk_frames: 8,
+      buffer_chunks: 1,
     });
+    await model.synthesize('你好。', { voice: 'vivian', chunkDurationMs: 160 });
+    expect(mock.startArgs.at(-1)?.[1]).toMatchObject({ chunk_frames: 2, buffer_chunks: 6 });
+    for await (const _ of model.synthesizeStream('你好。', { voice: 'vivian' }));
+    expect(mock.startArgs.at(-1)?.[1]).toMatchObject({ chunk_frames: 2, buffer_chunks: 6 });
     await model.dispose();
   });
 });

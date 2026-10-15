@@ -187,6 +187,18 @@ describe('audio HTTP contract', () => {
     expect(Buffer.from(events[0].audio, 'base64').length).toBe(6);
     expect(events[1].audio_seconds).toBeCloseTo(3 / 24000);
   });
+  it('synthesizes WAV with whole-utterance codec chunks and keeps streaming chunks for PCM', async () => {
+    const { server, url } = await start();
+    const fake = tts();
+    const backendStart = vi.spyOn(fake.backend, 'start');
+    server.registry.audio.register('tts', { kind: 'tts', model: fake.model });
+    for (const extra of [{}, { response_format: 'pcm' }, { stream: { chunk_duration_ms: 200 } }]) {
+      const res = await speech(url, extra);
+      expect(res.status).toBe(200);
+      await res.arrayBuffer();
+    }
+    expect(backendStart.mock.calls.map(([, options]) => options.chunkDurationMs)).toEqual([640, 160, 200]);
+  });
   it.each([16000, 22050, 24000, 44100, 48000, 96000])(
     'passes %i Hz source metadata and downmixes without server resampling',
     async (rate) => {

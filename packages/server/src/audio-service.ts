@@ -2,7 +2,14 @@ import { createReadStream } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { Qwen3AsrResult } from '@mlx-node/core';
-import { InvalidReferenceAudioError, InvalidWavError, WavReader, WavWriter, changeAudioSpeed } from '@mlx-node/tts';
+import {
+  InvalidReferenceAudioError,
+  InvalidWavError,
+  NON_STREAMING_CHUNK_DURATION_MS,
+  WavReader,
+  WavWriter,
+  changeAudioSpeed,
+} from '@mlx-node/tts';
 import type { TtsModel, TtsOptions } from '@mlx-node/tts';
 
 import {
@@ -661,7 +668,8 @@ export class AudioService {
           validateVoice(binding.model, options);
           const input = records ? textEvents(records, binding.model, options) : request.input!;
           onDispatch();
-          const source = binding.model.synthesizeStream(input, { ...options, signal });
+          const chunkDurationMs = options.chunkDurationMs ?? (file ? NON_STREAMING_CHUNK_DURATION_MS : undefined);
+          const source = binding.model.synthesizeStream(input, { ...options, chunkDurationMs, signal });
           void source.completed.catch(() => {});
           const processed = changeAudioSpeed(source, request.speed);
           let writer: WavWriter | undefined;

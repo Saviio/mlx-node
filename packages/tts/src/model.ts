@@ -51,6 +51,8 @@ export interface TtsBackend {
   dispose(this: void): Promise<void>;
 }
 
+export const NON_STREAMING_CHUNK_DURATION_MS = 640;
+
 function positive(value: number, name: string): number {
   if (!Number.isFinite(value) || value <= 0) throw new RangeError(`${name} must be positive and finite`);
   return value;
@@ -439,7 +441,10 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
       return stream;
     },
     async synthesize(input, options): Promise<TtsAudio> {
-      const stream = model.synthesizeStream(input, options);
+      const stream = model.synthesizeStream(input, {
+        ...options,
+        chunkDurationMs: options.chunkDurationMs ?? NON_STREAMING_CHUNK_DURATION_MS,
+      });
       const chunks: Float32Array[] = [];
       let length = 0;
       for await (const chunk of stream) {
