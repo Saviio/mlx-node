@@ -15,8 +15,9 @@ export interface AudioRequestMetrics {
   wavReadMs?: number;
   computeMs?: number;
   featureMs?: number;
-  encoderMs?: number;
+  /** Audio encoder plus decoder prefill, up to the first generated token read. */
   prefillMs?: number;
+  /** First generated token read to the last one. */
   decodeMs?: number;
   outputTokens?: number;
   firstPcmMs?: number;

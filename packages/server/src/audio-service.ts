@@ -820,7 +820,6 @@ async function readSamples(audio: WavReader, signal: AbortSignal, metrics: Audio
 function addAsrStages(metrics: AudioRequestMetrics, result: Qwen3AsrResult): void {
   metrics.computeMs = (metrics.computeMs ?? 0) + result.totalMs;
   metrics.featureMs = (metrics.featureMs ?? 0) + result.featureMs;
-  metrics.encoderMs = (metrics.encoderMs ?? 0) + result.encoderMs;
   metrics.prefillMs = (metrics.prefillMs ?? 0) + result.prefillMs;
   metrics.decodeMs = (metrics.decodeMs ?? 0) + result.decodeMs;
   metrics.outputTokens = result.tokenIds.length;

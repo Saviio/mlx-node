@@ -395,13 +395,8 @@ impl AudioTower {
             .map(|start| (start as i64, (start + window_len).min(total) as i64))
             .collect();
 
-        for (index, layer) in self.layers.iter().enumerate() {
+        for layer in &self.layers {
             hidden = layer.forward(&hidden, &windows)?;
-            // Bound the lazy graph without introducing a barrier on every
-            // layer. This cadence mirrors the long-prefill memory policy.
-            if (index + 1).is_multiple_of(8) {
-                hidden.eval();
-            }
         }
         hidden = self.ln_post.forward(&hidden)?;
         hidden = self.projector_1.forward(&hidden)?;
@@ -432,6 +427,16 @@ fn asr_suffix_text(language: Option<&str>) -> String {
         suffix.push_str("<asr_text>");
     }
     suffix
+}
+
+/// Decode rate over the tokens read after the first one: `decode_ms` starts
+/// at the first read, which waits for the prefill.
+fn tokens_after_first_per_second(tokens_read: usize, decode_ms: f64) -> f64 {
+    if decode_ms > 0.0 {
+        tokens_read.saturating_sub(1) as f64 * 1_000.0 / decode_ms
+    } else {
+        0.0
+    }
 }
 
 struct TextDecoder {
@@ -661,11 +666,8 @@ impl TextDecoder {
             .then(|| create_causal_mask(seq_len, Some(offset), None))
             .transpose()?;
         let mut hidden = embeddings.clone();
-        for (index, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
-            hidden = layer.forward(&hidden, mask.as_ref(), Some(cache))?;
-            if (index + 1).is_multiple_of(8) {
-                hidden.eval();
-            }
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            hidden = layer.forward_cached_without_attention_eval(&hidden, mask.as_ref(), cache)?;
         }
         self.logits_from_hidden(&hidden)
     }
@@ -1023,20 +1025,25 @@ impl Qwen3AsrInner {
     /// Greedy decode with one token of GPU/CPU overlap. The graph for token
     /// t+1 is built from the lazy argmax of token t and submitted before the
     /// host reads token t, so the GPU never idles on Rust dispatch or the
-    /// readback. Returns the generated tokens (EOS excluded) and the EOS token
-    /// that ended generation, if any. On EOS the step queued past it may still
-    /// be running on the GPU and writing the KV state when this returns;
-    /// callers either drop that state or trim it before the next prefill.
+    /// readback. The first argmax is submitted on its own, so a lazy prefill
+    /// runs while the first step is built and the first read waits for the
+    /// prefill only. Returns the generated tokens (EOS excluded), the EOS
+    /// token that ended generation, if any, and when the first token was read.
+    /// On EOS the step queued past it may still be running on the GPU and
+    /// writing the KV state when this returns; callers either drop that state
+    /// or trim it before the next prefill.
     fn greedy_decode(
         &self,
         first_logits: &MxArray,
         max_tokens: usize,
         mut step: impl FnMut(&MxArray) -> Result<MxArray>,
-    ) -> Result<(Vec<u32>, Option<u32>)> {
+    ) -> Result<(Vec<u32>, Option<u32>, Instant)> {
         let mut generated = Vec::with_capacity(max_tokens);
         let mut next = first_logits
             .argmax(-1, Some(false))?
             .astype(DType::Uint32)?;
+        MxArray::async_eval_arrays(&[&next]);
+        let mut first_token_at = None;
         for index in 0..max_tokens {
             self.check_cancelled()?;
             let scheduled = if index + 1 < max_tokens {
@@ -1049,8 +1056,9 @@ impl Qwen3AsrInner {
                 None
             };
             let token = next.item_at_uint32(0)?;
+            let first_token_at = *first_token_at.get_or_insert_with(Instant::now);
             if self.config.eos_token_id.contains(&token) {
-                return Ok((generated, Some(token)));
+                return Ok((generated, Some(token), first_token_at));
             }
             generated.push(token);
             match scheduled {
@@ -1058,7 +1066,7 @@ impl Qwen3AsrInner {
                 None => break,
             }
         }
-        Ok((generated, None))
+        Ok((generated, None, first_token_at.unwrap_or_else(Instant::now)))
     }
 
     fn transcribe(
@@ -1107,11 +1115,8 @@ impl Qwen3AsrInner {
             .map_err(Error::from_reason)?;
         let feature_ms = feature_start.elapsed().as_secs_f64() * 1_000.0;
         self.check_cancelled()?;
-        let encoder_start = Instant::now();
+        let prefill_start = Instant::now();
         let audio_embeddings = self.audio_tower.forward(features)?;
-        audio_embeddings.eval();
-        crate::array::synchronize();
-        let encoder_ms = encoder_start.elapsed().as_secs_f64() * 1_000.0;
 
         let prompt_embeddings = self.text_decoder.embed_prompt(
             &self.tokenizer,
@@ -1134,21 +1139,18 @@ impl Qwen3AsrInner {
             .collect();
 
         self.check_cancelled()?;
-        let prefill_start = Instant::now();
         let logits = self.text_decoder.prefill(&prompt_embeddings, &mut caches)?;
-        logits.eval();
-        crate::array::synchronize();
-        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1_000.0;
 
-        let decode_start = Instant::now();
         let max_tokens = options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(1) as usize;
         let decoder = &self.text_decoder;
         let mut kv = FusedKv::take(&mut caches)?;
-        let (mut generated, eos) = self.greedy_decode(&logits, max_tokens, |token| {
-            decoder.decode_fused(token, &mut kv)
-        })?;
+        let (mut generated, eos, first_token_at) =
+            self.greedy_decode(&logits, max_tokens, |token| {
+                decoder.decode_fused(token, &mut kv)
+            })?;
         self.check_cancelled()?;
-        let decode_ms = decode_start.elapsed().as_secs_f64() * 1_000.0;
+        let prefill_ms = first_token_at.duration_since(prefill_start).as_secs_f64() * 1_000.0;
+        let decode_ms = first_token_at.elapsed().as_secs_f64() * 1_000.0;
         // `token_ids` keeps the terminating EOS, as before the overlap rewrite.
         let reached_max_tokens = eos.is_none() && generated.len() == max_tokens;
         generated.extend(eos);
@@ -1167,11 +1169,7 @@ impl Qwen3AsrInner {
             )?
         };
         let total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
-        let tokens_per_second = if decode_ms > 0.0 {
-            generated.len() as f64 * 1_000.0 / decode_ms
-        } else {
-            0.0
-        };
+        let tokens_per_second = tokens_after_first_per_second(generated.len(), decode_ms);
         Ok(Qwen3AsrResult {
             text,
             stable_text,
@@ -1182,7 +1180,6 @@ impl Qwen3AsrInner {
             audio_seconds,
             segment_audio_seconds: audio_seconds,
             feature_ms,
-            encoder_ms,
             prefill_ms,
             decode_ms,
             total_ms,
@@ -1366,9 +1363,7 @@ impl Qwen3AsrInner {
             .prefill(&input_embeddings, &mut state.decoder_caches)?;
         logits.eval();
         crate::array::synchronize();
-        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1_000.0;
 
-        let decode_start = Instant::now();
         let max_tokens = max_tokens as usize;
         let decoder = &self.text_decoder;
         // Rows written past `stable_cache_positions` (suffix, transcript
@@ -1379,10 +1374,13 @@ impl Qwen3AsrInner {
             decoder.decode_fused(token, &mut kv)
         });
         kv.restore(&mut state.decoder_caches);
-        let (mut generated, eos) = decoded?;
+        let (mut generated, eos, first_token_at) = decoded?;
         crate::array::synchronize();
         self.check_cancelled()?;
-        let decode_ms = decode_start.elapsed().as_secs_f64() * 1_000.0;
+        let prefill_ms =
+            encoder_ms + first_token_at.duration_since(prefill_start).as_secs_f64() * 1_000.0;
+        let decode_ms = first_token_at.elapsed().as_secs_f64() * 1_000.0;
+        let decoded_tokens = generated.len() + usize::from(eos.is_some());
         let reached_max_tokens = eos.is_none() && generated.len() == max_tokens;
         let (repeated_tail, _) = stream_tail_repeat_blocks(&generated, STREAM_DEGEN_MAX_PERIOD);
         let repeat_prefix = if recovering {
@@ -1462,15 +1460,10 @@ impl Qwen3AsrInner {
             audio_seconds: state.processed_samples as f64 / source_rate as f64,
             segment_audio_seconds,
             feature_ms,
-            encoder_ms,
             prefill_ms,
             decode_ms,
             total_ms,
-            tokens_per_second: if decode_ms > 0.0 {
-                generated.len() as f64 * 1_000.0 / decode_ms
-            } else {
-                0.0
-            },
+            tokens_per_second: tokens_after_first_per_second(decoded_tokens, decode_ms),
             real_time_factor: total_ms / 1_000.0 / segment_audio_seconds,
             revision: state.revision,
             is_final,
@@ -1562,7 +1555,6 @@ impl Qwen3AsrInner {
                     audio_seconds: state.processed_samples as f64 / sample_rate as f64,
                     segment_audio_seconds: 0.0,
                     feature_ms: 0.0,
-                    encoder_ms: 0.0,
                     prefill_ms: 0.0,
                     decode_ms: 0.0,
                     total_ms: 0.0,

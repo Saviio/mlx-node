@@ -120,7 +120,6 @@ function asrResult(): Qwen3AsrResult {
     audioSeconds: 1,
     segmentAudioSeconds: 1,
     featureMs: 0,
-    encoderMs: 0,
     prefillMs: 0,
     decodeMs: 1,
     totalMs: 1,
@@ -639,7 +638,6 @@ it('audio logs record ASR stage times and TTS frames in structured and pretty lo
     ...asrResult(),
     tokenIds: [1, 2, 3],
     featureMs: 2,
-    encoderMs: 30,
     prefillMs: 20,
     decodeMs: 100,
     totalMs: 155,
@@ -685,7 +683,6 @@ it('audio logs record ASR stage times and TTS frames in structured and pretty lo
       model: 'asr',
       state: 'completed',
       featureMs: 2,
-      encoderMs: 30,
       prefillMs: 20,
       decodeMs: 100,
       computeMs: 155,
@@ -706,7 +703,7 @@ it('audio logs record ASR stage times and TTS frames in structured and pretty lo
       expect(ttsEntry.audioMetrics[key], key).toBeGreaterThanOrEqual(0);
     const pretty = await readFile(join(dir, 'session.log'), 'utf8');
     expect(pretty).toMatch(
-      /200 POST \/v1\/audio\/transcriptions \d+ms 0B model=asr task=asr server\(upload=\d+ms queue=\d+ms wav=\d+ms total=\d+ms\) perf\(feature=2ms encoder=30ms prefill=20ms decode=100ms compute=155ms\) audio\(sec=1\.00 out=3\) stop=stop\n/,
+      /200 POST \/v1\/audio\/transcriptions \d+ms 0B model=asr task=asr server\(upload=\d+ms queue=\d+ms wav=\d+ms total=\d+ms\) perf\(feature=2ms prefill=20ms decode=100ms compute=155ms\) audio\(sec=1\.00 out=3\) stop=stop\n/,
     );
     expect(pretty).toMatch(
       /200 POST \/v1\/audio\/speech \d+ms 0B model=tts task=tts server\(queue=\d+ms total=\d+ms\) perf\(compute=\d+ms first_pcm=\d+ms\) audio\(sec=0\.00 frames=24 rtf=[\d.]+\) stop=eos\n/,

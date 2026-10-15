@@ -202,9 +202,12 @@ pub struct Qwen3AsrResult {
     pub audio_seconds: f64,
     /// Newly consumed audio duration for this update.
     pub segment_audio_seconds: f64,
+    /// Resampling and log-mel features on the CPU.
     pub feature_ms: f64,
-    pub encoder_ms: f64,
+    /// Audio encoder plus decoder prefill, up to the read of the first
+    /// generated token.
     pub prefill_ms: f64,
+    /// From the first generated token read to the last one.
     pub decode_ms: f64,
     pub total_ms: f64,
     pub tokens_per_second: f64,

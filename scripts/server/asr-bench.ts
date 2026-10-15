@@ -12,8 +12,8 @@ const fixtures = process.argv.length > 3 ? process.argv.slice(3) : ['examples/au
 const rounds = Number(process.env.ROUNDS ?? 3);
 const model = await Qwen3AsrModel.load(modelPath);
 const med = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
-type Key = 'featureMs' | 'encoderMs' | 'prefillMs' | 'decodeMs' | 'totalMs' | 'tokensPerSecond' | 'realTimeFactor';
-const keys: Key[] = ['featureMs', 'encoderMs', 'prefillMs', 'decodeMs', 'totalMs', 'tokensPerSecond', 'realTimeFactor'];
+type Key = 'featureMs' | 'prefillMs' | 'decodeMs' | 'totalMs' | 'tokensPerSecond' | 'realTimeFactor';
+const keys: Key[] = ['featureMs', 'prefillMs', 'decodeMs', 'totalMs', 'tokensPerSecond', 'realTimeFactor'];
 try {
   for (const fixture of fixtures) {
     const wav = await readWav(resolve(fixture));

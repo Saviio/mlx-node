@@ -36,7 +36,6 @@ try {
       feedWallMedMs: Number(med(wall).toFixed(1)),
       feedWallMaxMs: Number(Math.max(...wall).toFixed(1)),
       featureMedMs: Number(med(revisions.map((r) => r.featureMs)).toFixed(1)),
-      encoderMedMs: Number(med(revisions.map((r) => r.encoderMs)).toFixed(1)),
       prefillMedMs: Number(med(revisions.map((r) => r.prefillMs)).toFixed(1)),
       decodeMedMs: Number(med(revisions.map((r) => r.decodeMs)).toFixed(1)),
       totalMedMs: Number(med(revisions.map((r) => r.totalMs)).toFixed(1)),

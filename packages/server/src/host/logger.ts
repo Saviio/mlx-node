@@ -229,7 +229,6 @@ function buildAudioSummary(metrics: Partial<AudioRequestMetrics>): string {
   ]);
   group('perf', [
     ['feature', fmtMs(metrics.featureMs)],
-    ['encoder', fmtMs(metrics.encoderMs)],
     ['prefill', fmtMs(metrics.prefillMs)],
     ['decode', fmtMs(metrics.decodeMs)],
     ['compute', fmtMs(metrics.computeMs)],

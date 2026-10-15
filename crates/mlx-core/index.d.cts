@@ -5514,9 +5514,14 @@ export interface Qwen3AsrResult {
   audioSeconds: number;
   /** Newly consumed audio duration for this update. */
   segmentAudioSeconds: number;
+  /** Resampling and log-mel features on the CPU. */
   featureMs: number;
-  encoderMs: number;
+  /**
+   * Audio encoder plus decoder prefill, up to the read of the first
+   * generated token.
+   */
   prefillMs: number;
+  /** From the first generated token read to the last one. */
   decodeMs: number;
   totalMs: number;
   tokensPerSecond: number;

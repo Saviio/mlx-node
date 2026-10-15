@@ -161,7 +161,6 @@ try {
         audioSeconds: result.audioSeconds,
         totalMs: result.totalMs,
         featureMs: result.featureMs,
-        encoderMs: result.encoderMs,
         prefillMs: result.prefillMs,
         decodeMs: result.decodeMs,
         callMs,

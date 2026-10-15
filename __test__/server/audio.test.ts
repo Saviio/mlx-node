@@ -72,7 +72,6 @@ function result(text: string, revision = 0, isFinal = true): Qwen3AsrResult {
     audioSeconds: 1,
     segmentAudioSeconds: 1,
     featureMs: 0,
-    encoderMs: 0,
     prefillMs: 0,
     decodeMs: 1,
     totalMs: 1,

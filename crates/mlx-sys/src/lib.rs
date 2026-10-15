@@ -210,6 +210,7 @@ unsafe extern "C-unwind" {
         head_dim: i32,
         attn_scale: f32,
         use_causal: bool,
+        eval_attention: bool,
     ) -> *mut mlx_array;
 
     pub fn mlx_array_transpose(
