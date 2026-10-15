@@ -688,7 +688,6 @@ impl TextDecoder {
         } = kv;
         let input_ids = token.reshape(&[1, 1])?;
         let rope_offsets = MxArray::from_int32(&[*cache_idx], &[1])?;
-        let left_padding = MxArray::from_int32(&[0], &[1])?;
         let mut layer_weights: Vec<*mut sys::mlx_array> =
             Vec::with_capacity(self.layers.len() * 11);
         let mut quant_scales: Vec<*mut sys::mlx_array> = Vec::with_capacity(self.layers.len() * 7);
@@ -847,7 +846,7 @@ impl TextDecoder {
                 value_ptrs.as_ptr(),
                 *cache_idx,
                 rope_offsets.handle.0,
-                left_padding.handle.0,
+                ptr::null_mut(),
                 &mut logits_ptr,
                 key_outputs.as_mut_ptr(),
                 value_outputs.as_mut_ptr(),

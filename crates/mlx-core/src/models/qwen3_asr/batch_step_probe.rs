@@ -474,7 +474,10 @@ impl Probe {
         let rows = rope.len() as i64;
         assert_eq!(rope.len(), pad.len());
         let rope_offsets = MxArray::from_int32(rope, &[rows]).unwrap();
-        let left_padding = MxArray::from_int32(pad, &[rows]).unwrap();
+        let left_padding = pad
+            .iter()
+            .any(|&pad| pad != 0)
+            .then(|| MxArray::from_int32(pad, &[rows]).unwrap());
         let mut layer_weights: Vec<*mut sys::mlx_array> =
             Vec::with_capacity(decoder.layers.len() * 11);
         for layer in &decoder.layers {
@@ -557,7 +560,9 @@ impl Probe {
                 value_ptrs.as_ptr(),
                 kv.cache_idx,
                 rope_offsets.handle.0,
-                left_padding.handle.0,
+                left_padding
+                    .as_ref()
+                    .map_or(ptr::null_mut(), |array| array.handle.0),
                 &mut logits_ptr,
                 key_outputs.as_mut_ptr(),
                 value_outputs.as_mut_ptr(),

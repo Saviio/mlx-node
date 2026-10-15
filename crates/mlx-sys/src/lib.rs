@@ -1066,7 +1066,7 @@ unsafe extern "C-unwind" {
         cache_idx_in: i32,                   // Shared cache write position
         // Array offsets for batched generation
         rope_offsets: *mut mlx_array, // [batch] - per-sequence RoPE offsets
-        left_padding: *mut mlx_array, // [batch] - left padding amounts
+        left_padding: *mut mlx_array, // [batch] left padding; null = no row padded, one-token step unmasked
         // Outputs
         out_logits: *mut *mut mlx_array,    // [batch, seq_len, vocab]
         out_kv_keys: *mut *mut mlx_array,   // [num_layers]
