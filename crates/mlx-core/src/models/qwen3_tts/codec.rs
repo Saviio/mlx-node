@@ -250,6 +250,11 @@ impl CodecState {
         arrays
     }
 
+    /// Allocated bytes of the retained state, including unused KV rows.
+    pub fn nbytes(&self) -> u64 {
+        self.retained().iter().map(|x| x.nbytes() as u64).sum()
+    }
+
     /// Materialize every retained tail, including histories not needed by the
     /// most recent PCM output, so a prepared prefix retains no growing graph.
     fn eval(&self) -> Result<()> {

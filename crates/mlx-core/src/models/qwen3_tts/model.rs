@@ -3,6 +3,7 @@ use super::{
     config::{CodecConfig, ModelConfig, TransformerConfig, read_json},
     tokenizer::TextTokenizer,
     transformer::Decoder,
+    voices::{Limits, VoiceKey, VoiceStore},
     weights::Weights,
 };
 use crate::{
@@ -14,8 +15,8 @@ use crate::{
 use napi::{Error, Result};
 use rand::{SeedableRng, rngs::StdRng};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
@@ -79,9 +80,35 @@ pub struct VoiceCondition {
     text: Vec<i32>,
     codec_prefix: CodecState,
 }
+impl VoiceCondition {
+    fn nbytes(&self) -> u64 {
+        (self.speaker.nbytes() + self.codes.nbytes() + std::mem::size_of_val(&self.text[..])) as u64
+            + self.codec_prefix.nbytes()
+    }
+}
 // Each prepared voice retains a speaker embedding, codec codes and a
-// materialized codec prefix, so retained voices are bounded FIFO.
-const MAX_PREPARED_VOICES: usize = 8;
+// materialized codec prefix, so voice ids are bounded FIFO and the content
+// cache is bounded by entries and allocated bytes.
+const VOICE_LIMITS: Limits = Limits {
+    ids: 8,
+    entries: 256,
+    bytes: 64 * 1024 * 1024,
+};
+/// Every input that changes a prepared condition; model and its config are
+/// instance scoped.
+fn voice_key(audio: &[f32], sample_rate: u32, transcript: &str) -> VoiceKey {
+    let mut hasher = Sha256::new();
+    hasher.update(sample_rate.to_le_bytes());
+    hasher.update((transcript.len() as u64).to_le_bytes());
+    hasher.update(transcript.as_bytes());
+    let mut bytes = Vec::with_capacity(4096 * 4);
+    for chunk in audio.chunks(4096) {
+        bytes.clear();
+        bytes.extend(chunk.iter().flat_map(|x| x.to_le_bytes()));
+        hasher.update(&bytes);
+    }
+    hasher.finalize().into()
+}
 /// Up-front talker KV reservation and growth-slab granularity (~160 s of
 /// audio, ~215 MiB of KV): generation longer than the horizon grows the cache
 /// at this step instead of holding the full bound turn-long.
@@ -90,8 +117,7 @@ const RESERVE_HORIZON_FRAMES: usize = 2048;
 pub struct NativeModel {
     speaker: Option<super::speaker::SpeakerEncoder>,
     encoder: Option<super::encoder::CodecEncoder>,
-    voices: HashMap<String, VoiceCondition>,
-    voice_order: VecDeque<String>,
+    voices: VoiceStore<VoiceCondition>,
     pub config: ModelConfig,
     pub codec: CodecDecoder,
     tokenizer: TextTokenizer,
@@ -205,8 +231,7 @@ impl NativeModel {
             } else {
                 None
             },
-            voices: HashMap::new(),
-            voice_order: VecDeque::new(),
+            voices: VoiceStore::new(VOICE_LIMITS),
             tokenizer: TextTokenizer::load(path)?,
             talker: Decoder::load(&w, "talker.model", &c.transformer, true, false)?,
             predictor: Decoder::load(
@@ -406,6 +431,10 @@ impl NativeModel {
             sample_rate,
             self.codec.config.input_sample_rate,
         )?;
+        let key = voice_key(&audio, sample_rate, &transcript);
+        if let Some(id) = self.voices.reuse(key) {
+            return Ok(id);
+        }
         let speaker_audio =
             crate::audio::dsp::resample_mono(&audio, sample_rate, speaker.config.sample_rate);
         super::check_cancelled(cancelled)?;
@@ -428,26 +457,14 @@ impl NativeModel {
             text: self.tokenizer.encode_text(&transcript)?,
         };
         super::check_cancelled(cancelled)?;
-        let id = uuid::Uuid::new_v4().to_string();
-        self.voices.insert(id.clone(), condition);
-        self.voice_order.push_back(id.clone());
-        while self.voice_order.len() > MAX_PREPARED_VOICES {
-            if let Some(evicted) = self.voice_order.pop_front() {
-                self.voices.remove(&evicted);
-            } else {
-                break;
-            }
-        }
-        Ok(id)
+        let bytes = condition.nbytes();
+        Ok(self.voices.insert(key, condition, bytes))
     }
     pub fn voice_ids(&self) -> impl Iterator<Item = String> + '_ {
-        self.voices.keys().cloned()
+        self.voices.ids()
     }
     pub fn release_voice(&mut self, id: &str) {
-        self.voices.remove(id);
-        if let Some(index) = self.voice_order.iter().position(|v| v == id) {
-            self.voice_order.remove(index);
-        }
+        self.voices.release(id);
     }
     fn condition(&self, options: &Options) -> Result<&VoiceCondition> {
         let id = options

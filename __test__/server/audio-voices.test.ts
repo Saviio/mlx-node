@@ -328,6 +328,37 @@ describe('temporary HTTP voice resources', () => {
     native.resolve('reserved');
     expect((await first).status).toBe(200);
   });
+  it('queues a concurrent same-reference create behind native preparation and deletes only one ID', async () => {
+    const { url, fake, server } = await start();
+    const native = deferred<string>();
+    vi.mocked(fake.backend.prepareVoice).mockImplementationOnce(async () => {
+      const id = await native.promise;
+      fake.cache.add(id);
+      return id;
+    });
+    const first = create(url);
+    const second = create(url);
+    await vi.waitFor(() => expect(server.registry.audio.pending).toBe(2));
+    expect(fake.backend.prepareVoice).toHaveBeenCalledTimes(1);
+    native.resolve('shared');
+    const [a, b] = await Promise.all([first, second]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const [voiceA, voiceB] = [await a.json(), await b.json()];
+    expect(voiceA.id).not.toBe(voiceB.id);
+    expect([voiceA.status, voiceB.status]).toEqual(['active', 'active']);
+    const calls = vi.mocked(fake.backend.prepareVoice).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toEqual(calls[0]);
+    expect((await fetch(`${url}/voices/${voiceA.id}`, { method: 'DELETE' })).status).toBe(200);
+    expect(fake.backend.releaseVoice).toHaveBeenCalledTimes(1);
+    expect(fake.cache.size).toBe(1);
+    expect(await (await fetch(`${url}/voices/${voiceB.id}`)).json()).toMatchObject({ status: 'active' });
+    const again = await create(url);
+    expect(again.status).toBe(200);
+    expect(await again.json()).toMatchObject({ status: 'active' });
+    expect(calls).toHaveLength(3);
+    expect(calls[2]).toEqual(calls[0]);
+  });
   it('reacquires a surviving alias lease before deleting behind another synthesis', async () => {
     const { url, fake, server } = await start();
     const voice = await (await create(url)).json();

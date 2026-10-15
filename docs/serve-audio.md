@@ -98,6 +98,10 @@ Metadata is bounded (128 records by default); new creations may discard the
 oldest inactive records, after which lookup returns 404. If all records are
 active or reserved by creations, admission returns 429 before preparation.
 Native cache capacity is separate: actual native lookup determines eviction.
+Creating a voice from the same reference samples and transcript reuses the
+model's prepared state instead of preparing it again. DELETE releases the ID
+only; the prepared state leaves the native cache by least-recently-used
+eviction.
 Creation, use and deletion share the model's serial queue. Cancellation waits
 for native acknowledgement and releases any late preparation result.
 

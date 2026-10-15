@@ -43,7 +43,11 @@ valid while the model is busy and run after the active synthesis or
 preparation finishes. A released handle
 cannot be used for synthesis. A model retains at most eight prepared voices;
 preparing beyond that evicts the oldest, and an evicted or released handle
-fails on its next use. Model disposal releases all remaining references.
+fails on its next use. Preparation is keyed by the reference samples, sample
+rate and transcript: preparing the same reference again returns a new handle
+without recomputing it. Disposal releases the handle only; its prepared state
+stays in a least-recently-used cache (256 entries, 64 MiB of retained state
+per model) until evicted. Model disposal releases all remaining references.
 `await voice.status()` reports `active`, `evicted`, or `released`, querying the
 native cache instead of assuming a live JavaScript object still owns a voice.
 Status reads use the native cache's committed membership snapshot and can be
