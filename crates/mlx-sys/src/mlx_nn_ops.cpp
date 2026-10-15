@@ -1108,6 +1108,27 @@ mlx_array* mlx_gelu_approx(mlx_array* handle) {
     return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+// Compiled GELU exact: x * (1 + erf(x / sqrt(2))) * 0.5, fused into one Metal
+// kernel. The fused kernel rounds every intermediate to its array dtype, so it
+// matches the five separate ops bit for bit only while these stay the same ops
+// in the same order with the same constants: float constants cast to the
+// input's floating dtype, as mlx_array_mul_scalar / mlx_array_add_scalar do.
+static auto compiled_gelu_exact = mlx::core::compile(
+    [](const std::vector<array>& inputs) -> std::vector<array> {
+        const auto& x = inputs[0];
+        auto dt = mlx::core::issubdtype(x.dtype(), mlx::core::floating) ? x.dtype() : mlx::core::float32;
+        auto erf = mlx::core::erf(x * array(static_cast<float>(0.70710678118654752440), dt));
+        return {x * (erf + array(1.0f, dt)) * array(0.5f, dt)};
+    },
+    /* shapeless */ true
+);
+
+mlx_array* mlx_gelu_exact(mlx_array* handle) {
+    auto& x = *reinterpret_cast<array*>(handle);
+    auto result = compiled_gelu_exact({x})[0];
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
 // Compiled GeGLU — matches Python's @partial(mx.compile, shapeless=True) geglu.
 // Fuses gelu_approx(gate) * up into a single Metal kernel.
 // Called once per decoder layer per step (30+ times per decode step).

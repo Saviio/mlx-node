@@ -98,13 +98,13 @@ impl Activations {
     /// This matches PyTorch's `F.gelu(x, approximate="none")`.
     /// Used by Gemma4 MoE experts (vLLM's `activation="gelu"` defaults to exact).
     pub fn gelu_exact(input: &MxArray) -> Result<MxArray> {
-        // The scalar ops build their constants in the input's floating dtype.
+        // One fused kernel with its constants in the input's floating dtype.
         // A float32 scalar array would promote a bf16 activation stream to
         // float32 for the rest of the graph, including every weight it later
         // touches. Same expression and operation order as the clef compiled
         // builder, so both paths compute the same value.
-        let erf = input.mul_scalar(std::f64::consts::FRAC_1_SQRT_2)?.erf()?;
-        input.mul(&erf.add_scalar(1.0)?)?.mul_scalar(0.5)
+        let handle = unsafe { sys::mlx_gelu_exact(input.handle.0) };
+        MxArray::from_handle(handle, "gelu_exact")
     }
 
     /// ReLU: max(0, x)
@@ -367,6 +367,115 @@ mod tests {
                     "{dtype:?} gelu({x}) = {got}, expected {expected}"
                 );
             }
+        }
+    }
+
+    /// The compiled GELU (Qwen3-ASR encoder, Qwen3-TTS codec) and SwiGLU
+    /// (fused Qwen3 decode step) kernels replaced the separate ops below, and
+    /// those models' output bytes must not move: every fused value must equal
+    /// the separate ops bit for bit. All bf16 and f16 values; f32 at every
+    /// sign and exponent.
+    #[test]
+    fn compiled_gelu_exact_and_swiglu_match_separate_ops_bit_for_bit() {
+        use crate::array::DType;
+
+        let bits = |a: &MxArray| -> Vec<u32> {
+            if a.dtype().unwrap() == DType::Float32 {
+                a.to_float32()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect()
+            } else {
+                a.to_uint16_native()
+                    .unwrap()
+                    .into_iter()
+                    .map(u32::from)
+                    .collect()
+            }
+        };
+        let check = |what: &str, fused: &MxArray, separate: &MxArray| {
+            assert_eq!(fused.dtype().unwrap(), separate.dtype().unwrap());
+            let (f, s) = (bits(fused), bits(separate));
+            assert_eq!(f.len(), s.len());
+            let differ = f.iter().zip(&s).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "{what}: {differ} of {} differ", f.len());
+        };
+        let array = |values: &[f32], dtype: DType| {
+            MxArray::from_float32(values, &[values.len() as i64])
+                .unwrap()
+                .astype(dtype)
+                .unwrap()
+        };
+        let every_16_bit = |dtype: DType| -> Vec<f32> {
+            (0..=u16::MAX)
+                .map(|p| match dtype {
+                    DType::BFloat16 => f32::from_bits(u32::from(p) << 16),
+                    _ => half::f16::from_bits(p).to_f32(),
+                })
+                .collect()
+        };
+        let f32_sample: Vec<f32> = (0..512u32)
+            .flat_map(|sign_exp| {
+                (0..4096u32).map(move |m| {
+                    f32::from_bits(sign_exp << 23 | (m.wrapping_mul(0x9E37_79B1) >> 9))
+                })
+            })
+            .collect();
+        let ups: Vec<f32> = [
+            -130, -126, -100, -20, -8, -3, -1, 0, 1, 3, 8, 15, 60, 100, 127,
+        ]
+        .into_iter()
+        .flat_map(|e| [1.0f32, 1.3, 1.7, -1.0, -1.3, -1.7].map(|m| m * 2f32.powi(e)))
+        .chain([0.0, -0.0])
+        .collect();
+
+        for (dtype, gates) in [
+            (DType::BFloat16, every_16_bit(DType::BFloat16)),
+            (DType::Float16, every_16_bit(DType::Float16)),
+            (DType::Float32, f32_sample.clone()),
+        ] {
+            let x = array(&gates, dtype);
+            let erf = x
+                .mul_scalar(std::f64::consts::FRAC_1_SQRT_2)
+                .unwrap()
+                .erf()
+                .unwrap();
+            let separate = x
+                .mul(&erf.add_scalar(1.0).unwrap())
+                .unwrap()
+                .mul_scalar(0.5)
+                .unwrap();
+            check(
+                &format!("gelu_exact {dtype:?}"),
+                &Activations::gelu_exact(&x).unwrap(),
+                &separate,
+            );
+
+            let (gate, up) = if dtype == DType::Float32 {
+                let mut shuffled = gates.clone();
+                shuffled.rotate_left(gates.len() / 3);
+                (gates, shuffled)
+            } else {
+                let gate = gates.repeat(ups.len());
+                let up = ups
+                    .iter()
+                    .flat_map(|&u| std::iter::repeat_n(u, gates.len()))
+                    .collect();
+                (gate, up)
+            };
+            let (gate, up) = (array(&gate, dtype), array(&up, dtype));
+            let separate = Activations::sigmoid(&gate)
+                .unwrap()
+                .mul(&gate)
+                .unwrap()
+                .mul(&up)
+                .unwrap();
+            check(
+                &format!("swiglu {dtype:?}"),
+                &Activations::swiglu_compiled(&gate, &up).unwrap(),
+                &separate,
+            );
         }
     }
 

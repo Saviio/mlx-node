@@ -38,6 +38,24 @@ static array qwen_linear(
   return matmul(x, transpose(weight, {1, 0}));
 }
 
+// ============================================================================
+// Compiled SwiGLU activation
+// ============================================================================
+// Python's nn.silu uses @mx.compile to fuse sigmoid(x)*x into a single Metal
+// kernel. We do the same here for the full SwiGLU: silu(gate) * up.
+// This avoids 2 extra memory round-trips per layer (18 layers = 36 saved).
+
+static std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
+    const auto& gate = inputs[0];
+    const auto& up = inputs[1];
+    return {mlx::core::sigmoid(gate) * gate * up};
+}
+
+static auto& compiled_swiglu() {
+    static auto fn = mlx::core::compile(swiglu_impl, /*shapeless=*/true);
+    return fn;
+}
+
 // Helper: Apply one transformer block with OPTIMIZED KV cache
 // Uses pre-allocated buffers with slice_update for O(N) total instead of O(N²)
 /// Transformer block forward with array RoPE offsets for batched generation.
@@ -179,7 +197,7 @@ static array transformer_block_forward_cached(
       mlp_input, w_gate, qs(4), qb(4), quant_group_size, quant_bits, quant_mode);
   auto up = qwen_linear(
       mlp_input, w_up, qs(5), qb(5), quant_group_size, quant_bits, quant_mode);
-  auto activated = mlx::core::sigmoid(gate) * gate * up;  // SiLU(gate) * up
+  auto activated = compiled_swiglu()({gate, up})[0];
   auto mlp_output = qwen_linear(activated, w_down, qs(6), qb(6), quant_group_size, quant_bits, quant_mode);
 
   auto output = h + mlp_output;
@@ -294,24 +312,6 @@ static array rotate_half_impl(const array& x) {
     // Negate x2 and concatenate: [-x2, x1]
     auto neg_x2 = -x2;
     return concatenate({neg_x2, x1}, ndim - 1);
-}
-
-// ============================================================================
-// Compiled SwiGLU activation
-// ============================================================================
-// Python's nn.silu uses @mx.compile to fuse sigmoid(x)*x into a single Metal
-// kernel. We do the same here for the full SwiGLU: silu(gate) * up.
-// This avoids 2 extra memory round-trips per layer (18 layers = 36 saved).
-
-static std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
-    const auto& gate = inputs[0];
-    const auto& up = inputs[1];
-    return {mlx::core::sigmoid(gate) * gate * up};
-}
-
-static auto& compiled_swiglu() {
-    static auto fn = mlx::core::compile(swiglu_impl, /*shapeless=*/true);
-    return fn;
 }
 
 // ============================================================================

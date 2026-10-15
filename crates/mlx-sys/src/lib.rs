@@ -555,6 +555,8 @@ unsafe extern "C-unwind" {
 
     // Compiled GELU approximate (fused kernel, matches Python nn.gelu_approx)
     pub fn mlx_gelu_approx(handle: *mut mlx_array) -> *mut mlx_array;
+    // Compiled GELU exact: x * (1 + erf(x / sqrt(2))) * 0.5 (fused kernel)
+    pub fn mlx_gelu_exact(handle: *mut mlx_array) -> *mut mlx_array;
     // Compiled GeGLU: gelu_approx(gate) * up (fused kernel)
     pub fn mlx_geglu(gate: *mut mlx_array, up: *mut mlx_array) -> *mut mlx_array;
     // Compiled logit softcap: tanh(x / softcap) * softcap (fused kernel)
