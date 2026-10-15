@@ -703,7 +703,7 @@ impl NativeModel {
         // later; an EOS there discards the speculative successor, whose only
         // side effects are KV rows this turn never reads again.
         let mut in_flight: Option<(MxArray, MxArray)> = None;
-        let mut retired = 0usize;
+        let mut width = 1;
         let mut retire = |all: MxArray, token: MxArray, emit_now: bool| -> Result<bool> {
             // item_at waits for this frame's eval only; the successor is
             // already queued behind it, so its PCM readback below is cheap.
@@ -724,12 +724,13 @@ impl NativeModel {
                 return Err(Error::from_reason("Invalid generated codec ID"));
             }
             pending.push(all);
-            if pending.len() >= chunk_frames {
+            if pending.len() >= width {
                 let pcm = self.codec.step(
                     &cat(&pending.iter().collect::<Vec<_>>(), 1)?,
                     &mut codec_state,
                 )?;
                 pending.clear();
+                width = chunk_frames;
                 if emit_now {
                     emit_pcm(
                         pcm.to_float32()?.to_vec(),
@@ -750,17 +751,15 @@ impl NativeModel {
                 reason = "cancelled";
                 break;
             }
-            // The first chunk is retired before this frame is built so its
-            // PCM is not queued behind another frame: one frame of lost
-            // overlap per segment buys the lowest first-PCM latency.
-            if retired + 1 == chunk_frames
+            // The one-frame first chunk is retired before the next frame is
+            // built so its PCM is not queued behind another frame: one frame
+            // of lost overlap per segment buys the lowest first-PCM latency.
+            if step == 1
                 && let Some((prev_all, prev_token)) = in_flight.take()
+                && !retire(prev_all, prev_token, true)?
             {
-                if !retire(prev_all, prev_token, true)? {
-                    reason = "eos";
-                    break;
-                }
-                retired += 1;
+                reason = "eos";
+                break;
             }
             let hidden = last(&self.talker.forward(&input, &mut talker_state)?)?;
             let mut logits = self
@@ -827,12 +826,11 @@ impl NativeModel {
                 )?;
             }
             MxArray::async_eval_arrays(&[&all, &input, &history]);
-            if let Some((prev_all, prev_token)) = in_flight.take() {
-                if !retire(prev_all, prev_token, false)? {
-                    reason = "eos";
-                    break;
-                }
-                retired += 1;
+            if let Some((prev_all, prev_token)) = in_flight.take()
+                && !retire(prev_all, prev_token, false)?
+            {
+                reason = "eos";
+                break;
             }
             in_flight = Some((all, tokens.swap_remove(0)));
         }

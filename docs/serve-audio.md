@@ -216,7 +216,8 @@ Model controls remain in extension objects:
 | `stream`   | `chunk_duration_ms`, `audio_buffer_seconds`, `max_segment_graphemes`, `queued_segments` |
 
 `response_format: wav` is sent after synthesis finishes, so its `chunk_duration_ms`
-defaults to 640 ms (the SDK's non-streaming default); `pcm` keeps 160 ms.
+defaults to 640 ms (the SDK's non-streaming default); `pcm` keeps 160 ms. Each
+segment's first chunk is one 80 ms codec frame.
 
 `max_duration_seconds` limits **each generated segment**, not the whole request.
 Truncation is reported as `finish_reason:length` (normal TTS completion is `eos`).

@@ -79,8 +79,9 @@ reuses the voice condition. Natural pauses between segments are expected.
 
 The default output target is 160 ms for `synthesizeStream` and 640 ms
 (`NON_STREAMING_CHUNK_DURATION_MS`) for `synthesize`, rounded up to whole codec
-frames. Wider codec steps cost less per frame; their PCM is not bit-identical to
-160 ms chunks. Native
+frames. The first chunk of each segment is one codec frame (80 ms), so first PCM
+waits on one generated frame only. Wider codec steps cost less per frame; their PCM
+is not bit-identical to 160 ms chunks. Native
 PCM buffering is bounded to about one second and text buffering to two segments.
 `chunkDurationMs`, `audioBufferSeconds`, `queuedSegments` and
 `maxSegmentGraphemes` configure these policies. Slow consumers apply backpressure.
