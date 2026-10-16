@@ -78,12 +78,21 @@ describe('Qwen3Model — block-paged zero-delta regression', () => {
     async () => {
       if (!pagedModel) throw new Error('paged model failed to load');
 
-      const messages: ChatMessage[] = [{ role: 'user', content: 'Say hi.' }];
+      // The prompt must span several 16-token blocks, or turn 2 has no full
+      // block to hit. `reasoningEffort: 'none'` keeps the reply out of an
+      // unclosed <think> block, which would leave `text` empty.
+      const messages: ChatMessage[] = [
+        {
+          role: 'user',
+          content:
+            'The quick brown fox jumps over the lazy dog while the small cat sleeps under the warm afternoon sun near the old wooden fence. Say hi.',
+        },
+      ];
       const opts = {
-        maxNewTokens: 8,
+        maxNewTokens: 16,
         temperature: 0,
         repetitionPenalty: 1.0,
-        thinkingTokenBudget: 8,
+        reasoningEffort: 'none',
         reuseCache: true,
       };
 
@@ -99,6 +108,8 @@ describe('Qwen3Model — block-paged zero-delta regression', () => {
       // so at least one suffix token survives for the prefill chunk.
       const second = await pagedModel.chatSessionStart(messages, opts);
       expect(second.text.length).toBeGreaterThan(0);
+      expect(second.cachedTokens).toBeGreaterThan(0);
+      expect(second.cachedTokens).toBeLessThan(second.promptTokens);
     },
     300_000,
   );
