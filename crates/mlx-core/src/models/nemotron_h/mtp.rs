@@ -841,6 +841,11 @@ mod mtp_turn_tests {
     /// An MTP-capable tiny inner: dense backbone MoE + a real lm_head + the
     /// MTP head armed.
     fn mtp_ready_inner() -> NemotronHInner {
+        // The weights are random. Without a fixed seed they depend on how many
+        // draws earlier tests in this process made, and the 5e-2 "unshifted
+        // differs" margin in mtp_prompt_seed_shifts_ids_by_one fails on some
+        // of those draws (0.0445 seen in a full `cargo test` run).
+        unsafe { mlx_sys::mlx_seed(1) };
         let mut inner = NemotronHInner::new(tiny_mtp_config()).expect("inner builds");
         install_dense_moe(&mut inner).expect("dense backbone MoE");
         let h = inner.config.hidden_size as u32;
