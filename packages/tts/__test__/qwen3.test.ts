@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+import { InvalidReferenceAudioError } from '../src/errors.js';
 import { createTtsModel } from '../src/model.js';
 import type { BackendOptions } from '../src/model.js';
 import { loadQwen3Backend } from '../src/qwen3.js';
@@ -21,6 +22,9 @@ const mock = vi.hoisted(() => ({
   } as TtsCapabilities & { samplesPerFrame: number },
   loadArgs: [] as [string, string][],
   startArgs: [] as [string, Record<string, unknown>][],
+  hasVoice: vi.fn(async (id: string) => id === 'prepared'),
+  cancelPreparation: vi.fn(),
+  prepareVoice: vi.fn(async () => 'prepared'),
 }));
 vi.mock('@mlx-node/core', () => ({
   TtsNativeModel: {
@@ -36,7 +40,9 @@ vi.mock('@mlx-node/core', () => ({
             waitFinished: async () => {},
           };
         },
-        prepareVoice: async () => 'prepared',
+        prepareVoice: mock.prepareVoice,
+        hasVoice: mock.hasVoice,
+        cancelVoicePreparation: mock.cancelPreparation,
         releaseVoice: async () => {},
         dispose: async () => {},
       };
@@ -49,16 +55,42 @@ const options = (overrides: Partial<BackendOptions> = {}): BackendOptions => ({
   language: 'chinese',
   chunkDurationMs: 160,
   audioBufferSeconds: 1,
+  suppressBootstrapSilence: false,
   ...overrides,
 });
 
 describe('Qwen3 backend adapter', () => {
+  it('preserves reference validation as a typed SDK error without relabeling inference failures', async () => {
+    const backend = await loadQwen3Backend('/model');
+    const invalid = Object.assign(new Error('Reference rejected'), { code: 'InvalidArg' });
+    mock.prepareVoice.mockRejectedValueOnce(invalid);
+    await expect(backend.prepareVoice(new Float32Array([0]), 16000, 'Hi')).rejects.toMatchObject({
+      name: 'InvalidReferenceAudioError',
+      message: 'Reference rejected',
+      cause: invalid,
+    });
+    mock.prepareVoice.mockRejectedValueOnce(invalid);
+    await expect(backend.prepareVoice(new Float32Array([0]), 16000, 'Hi')).rejects.toBeInstanceOf(
+      InvalidReferenceAudioError,
+    );
+    const failure = new Error('Worker failed');
+    mock.prepareVoice.mockRejectedValueOnce(failure);
+    await expect(backend.prepareVoice(new Float32Array([0]), 16000, 'Hi')).rejects.toBe(failure);
+  });
+  it('forwards reference status and cancellation to the native owner', async () => {
+    const backend = await loadQwen3Backend('/model');
+    expect(await backend.hasVoice!('prepared')).toBe(true);
+    expect(await backend.hasVoice!('missing')).toBe(false);
+    backend.cancelVoicePreparation!();
+    expect(mock.cancelPreparation).toHaveBeenCalledTimes(1);
+  });
   it('passes instruction-cache options through to the native loader', async () => {
     const backend = await loadQwen3Backend('/model', {
       instructionCache: { enabled: true, maxBytes: 1024, maxEntries: 4 },
     });
-    expect(mock.loadArgs).toEqual([
-      ['/model', JSON.stringify({ instruction_cache: { enabled: true, max_bytes: 1024, max_entries: 4 } })],
+    expect(mock.loadArgs.at(-1)).toEqual([
+      '/model',
+      JSON.stringify({ instruction_cache: { enabled: true, max_bytes: 1024, max_entries: 4 } }),
     ]);
     const { samplesPerFrame, ...rest } = mock.capabilities;
     expect(samplesPerFrame).toBe(1920);
@@ -76,7 +108,10 @@ describe('Qwen3 backend adapter', () => {
   });
   it('maps SDK options to the native start JSON', async () => {
     const backend = await loadQwen3Backend('/model');
-    backend.start('你好。', options({ instruct: '慢速读。', seed: 534, topP: 0.9, repetitionPenalty: 1.1 }));
+    backend.start(
+      '你好。',
+      options({ instruct: '慢速读。', seed: 534, topP: 0.9, repetitionPenalty: 1.1, suppressBootstrapSilence: true }),
+    );
     expect(mock.startArgs.at(-1)).toEqual([
       '你好。',
       {
@@ -92,7 +127,8 @@ describe('Qwen3 backend adapter', () => {
         seed: 534,
         chunk_frames: 2, // 160 ms / 80 ms frames
         buffer_chunks: 6, // 1 s buffer / 160 ms chunks
-        max_frames: 1500, // default 120 s / 80 ms frames
+        max_frames: 2048, // default when maxDurationSeconds is unset
+        suppress_bootstrap_silence: true,
       },
     ]);
   });
@@ -118,9 +154,13 @@ describe('Qwen3 backend adapter', () => {
       voice: 'vivian',
       language: 'chinese',
       seed: 1,
-      chunk_frames: 2,
-      buffer_chunks: 6,
+      chunk_frames: 8,
+      buffer_chunks: 1,
     });
+    await model.synthesize('你好。', { voice: 'vivian', chunkDurationMs: 160 });
+    expect(mock.startArgs.at(-1)?.[1]).toMatchObject({ chunk_frames: 2, buffer_chunks: 6 });
+    for await (const _ of model.synthesizeStream('你好。', { voice: 'vivian' }));
+    expect(mock.startArgs.at(-1)?.[1]).toMatchObject({ chunk_frames: 2, buffer_chunks: 6 });
     await model.dispose();
   });
 });

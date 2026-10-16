@@ -41,6 +41,7 @@ import type { ChatConfig } from '@mlx-node/core';
 import type { DecisionModel } from '@mlx-node/lm';
 import type { SessionCapableModel } from '@mlx-node/lm';
 
+import { AudioRegistry } from './audio-registry.js';
 import { DecisionRegistry } from './decision-registry.js';
 import type { ModelAdmissionLane } from './model-work-coordinator.js';
 import { SessionRegistry } from './session-registry.js';
@@ -154,6 +155,7 @@ export interface RegisterOptions {
 
 export class ModelRegistry {
   readonly decisions: DecisionRegistry;
+  readonly audio: AudioRegistry;
   getAny(name: string): ServableModel | DecisionModel | undefined {
     return this.get(name) ?? this.decisions.get(name);
   }
@@ -221,6 +223,7 @@ export class ModelRegistry {
   constructor(opts?: ModelRegistryOptions) {
     this.maxQueueDepth = opts?.maxQueueDepth;
     this.decisions = new DecisionRegistry(opts?.maxQueueDepth);
+    this.audio = new AudioRegistry(opts?.maxQueueDepth);
   }
 
   /** Configured per-model waiter cap, or `undefined` when unbounded. */
@@ -247,6 +250,7 @@ export class ModelRegistry {
       coordinator?.bindRequestLoadAdmissions(entry.id, lane);
     }
     this.modelLoadAdmissionCoordinator = coordinator;
+    this.audio.setCoordinator(coordinator);
     if (coordinator) {
       for (const [name, entry] of this.models) {
         coordinator.bindRequestLoadAdmissions(name, entry.sessionRegistry);
@@ -714,7 +718,7 @@ export class ModelRegistry {
         owned_by: 'mlx-node',
       });
     }
-    return [...result, ...this.decisions.list()];
+    return [...result, ...this.decisions.list(), ...this.audio.list()];
   }
 
   /**

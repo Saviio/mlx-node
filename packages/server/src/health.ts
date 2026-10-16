@@ -183,6 +183,14 @@ export function createHealthReporter(deps: HealthReporterDeps): () => ServerHeal
       }
     }
 
+    if (deps.registry.audio) {
+      depth = Math.max(depth, deps.registry.audio.queueDepth);
+      const audioLimit = deps.registry.queueDepthLimit;
+      if (audioLimit !== undefined && deps.registry.audio.pending) {
+        limit = limit === null ? audioLimit : Math.min(limit, audioLimit);
+        saturated ||= deps.registry.audio.queueDepth >= audioLimit;
+      }
+    }
     const writerActive = deps.modelWorkCoordinator?.writerActive ?? false;
     const waitingWriters = deps.modelWorkCoordinator?.waitingWriters ?? 0;
     const lastLoad = deps.modelWorkCoordinator?.lastLoad ?? null;

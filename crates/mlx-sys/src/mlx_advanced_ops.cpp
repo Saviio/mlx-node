@@ -12,13 +12,6 @@
 // KV cache chunk size for pre-allocation (matches mlx-lm step=256)
 constexpr int KV_CACHE_CHUNK_SIZE = 256;
 
-// Forward declaration for batched causal mask (defined later in the file)
-static array create_batched_causal_mask(
-    const array& left_padding,
-    int seq_len,
-    int kv_len,
-    int cache_idx);
-
 static array qwen_linear(
     const array& x,
     const array& weight,
@@ -45,13 +38,31 @@ static array qwen_linear(
   return matmul(x, transpose(weight, {1, 0}));
 }
 
+// ============================================================================
+// Compiled SwiGLU activation
+// ============================================================================
+// Python's nn.silu uses @mx.compile to fuse sigmoid(x)*x into a single Metal
+// kernel. We do the same here for the full SwiGLU: silu(gate) * up.
+// This avoids 2 extra memory round-trips per layer (18 layers = 36 saved).
+
+static std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
+    const auto& gate = inputs[0];
+    const auto& up = inputs[1];
+    return {mlx::core::sigmoid(gate) * gate * up};
+}
+
+static auto& compiled_swiglu() {
+    static auto fn = mlx::core::compile(swiglu_impl, /*shapeless=*/true);
+    return fn;
+}
+
 // Helper: Apply one transformer block with OPTIMIZED KV cache
 // Uses pre-allocated buffers with slice_update for O(N) total instead of O(N²)
 /// Transformer block forward with array RoPE offsets for batched generation.
 ///
 /// Unlike the scalar offset version, this uses per-sequence offsets for RoPE
-/// and creates a proper batched causal mask respecting left-padding.
-/// This enables correct generation when group_size > 1.
+/// and takes the step's left-padding-aware causal mask (nullopt = attend to
+/// every cached position). This enables correct generation when group_size > 1.
 static array transformer_block_forward_cached(
     const array& x,
     // Weights for this layer
@@ -72,8 +83,7 @@ static array transformer_block_forward_cached(
     int& cache_idx,  // Current write position in cache (shared)
     // Batched offsets for RoPE
     const array& rope_offsets,  // [batch] - per-sequence RoPE offsets
-    // Left padding info for mask
-    const array& left_padding   // [batch] - left padding amounts
+    const std::optional<array>& mask  // [batch, 1, seq_len, kv_len] bool, shared by all layers
 ) {
   int batch = static_cast<int>(x.shape()[0]);
   int seq_len = static_cast<int>(x.shape()[1]);
@@ -127,7 +137,6 @@ static array transformer_block_forward_cached(
   keys = fast::rope(keys, rope_dims, traditional, std::optional<float>(rope_base), rope_scale, rope_offsets, std::nullopt, {});
 
   // === KV Cache Update (shared buffer, batch write) ===
-  int prev_cache_idx = cache_idx;  // Save for mask computation
   int new_idx = cache_idx + seq_len;
 
   if (!cached_keys.has_value()) {
@@ -172,12 +181,7 @@ static array transformer_block_forward_cached(
   // Update cache_idx for next call
   cache_idx = new_idx;
 
-  // Compute attention output with proper left-padding aware mask
-  // Create mask that respects left-padding (prevents attending to padding tokens)
-  auto mask = create_batched_causal_mask(left_padding, seq_len, new_idx, prev_cache_idx);
-
   // MLX SDPA: mask where true = attend (keep), false = mask out
-  // create_batched_causal_mask returns true = attend, so pass directly
   // NOTE: Do NOT call eval() here - this is called per-layer and would destroy pipelining
   auto attn_output = fast::scaled_dot_product_attention(queries, keys_valid, values_valid, attn_scale, "", mask, std::nullopt, {});
 
@@ -193,7 +197,7 @@ static array transformer_block_forward_cached(
       mlp_input, w_gate, qs(4), qb(4), quant_group_size, quant_bits, quant_mode);
   auto up = qwen_linear(
       mlp_input, w_up, qs(5), qb(5), quant_group_size, quant_bits, quant_mode);
-  auto activated = mlx::core::sigmoid(gate) * gate * up;  // SiLU(gate) * up
+  auto activated = compiled_swiglu()({gate, up})[0];
   auto mlp_output = qwen_linear(activated, w_down, qs(6), qb(6), quant_group_size, quant_bits, quant_mode);
 
   auto output = h + mlp_output;
@@ -308,24 +312,6 @@ static array rotate_half_impl(const array& x) {
     // Negate x2 and concatenate: [-x2, x1]
     auto neg_x2 = -x2;
     return concatenate({neg_x2, x1}, ndim - 1);
-}
-
-// ============================================================================
-// Compiled SwiGLU activation
-// ============================================================================
-// Python's nn.silu uses @mx.compile to fuse sigmoid(x)*x into a single Metal
-// kernel. We do the same here for the full SwiGLU: silu(gate) * up.
-// This avoids 2 extra memory round-trips per layer (18 layers = 36 saved).
-
-static std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
-    const auto& gate = inputs[0];
-    const auto& up = inputs[1];
-    return {mlx::core::sigmoid(gate) * gate * up};
-}
-
-static auto& compiled_swiglu() {
-    static auto fn = mlx::core::compile(swiglu_impl, /*shapeless=*/true);
-    return fn;
 }
 
 // ============================================================================
@@ -638,7 +624,7 @@ void mlx_qwen3_forward_step(
 
     // Array offsets for batched generation
     mlx_array* rope_offsets_handle,     // [batch] - per-sequence RoPE offsets
-    mlx_array* left_padding_handle,     // [batch] - left padding amounts
+    mlx_array* left_padding_handle,     // [batch] left padding; null = no row padded, one-token step unmasked
 
     // Outputs (caller must free)
     mlx_array** out_logits,             // [batch, seq_len, vocab]
@@ -650,7 +636,6 @@ void mlx_qwen3_forward_step(
     auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_handle);
     auto& final_norm_w = *reinterpret_cast<array*>(final_norm_weight_handle);
     auto& rope_offsets = *reinterpret_cast<array*>(rope_offsets_handle);
-    auto& left_padding = *reinterpret_cast<array*>(left_padding_handle);
     array* lm_head_w = lm_head_weight_handle ? reinterpret_cast<array*>(lm_head_weight_handle) : nullptr;
     array* embedding_scales = embedding_quant_scales
         ? reinterpret_cast<array*>(embedding_quant_scales) : nullptr;
@@ -663,6 +648,19 @@ void mlx_qwen3_forward_step(
 
     int batch = static_cast<int>(input_ids.shape()[0]);
     int seq_len = static_cast<int>(input_ids.shape()[1]);
+
+    // Null left_padding runs a one-token step with no mask. Unmasked GQA
+    // 8/12/16 decode at 8192+ keys takes the fork's gqa 2-pass SDPA kernel,
+    // which sums keys in another order than the masked kernel, so a caller
+    // that must keep its bytes for such heads passes an array. Every masked
+    // step builds the mask once: all layers share one write position.
+    std::optional<array> mask;
+    if (left_padding_handle != nullptr || seq_len > 1) {
+        array left_padding = left_padding_handle != nullptr
+            ? *reinterpret_cast<array*>(left_padding_handle)
+            : zeros({batch}, mlx::core::int32);
+        mask = create_batched_causal_mask(left_padding, seq_len, cache_idx_in + seq_len, cache_idx_in);
+    }
 
     // Initialize KV cache state with per-layer cache indices
     std::vector<std::optional<array>> kv_keys(num_layers);
@@ -742,7 +740,7 @@ void mlx_qwen3_forward_step(
             attn_scale, rope_theta, rope_dims,
             norm_eps, norm_eps,
             kv_keys[i], kv_values[i], cache_indices[i],
-            rope_offsets, left_padding);
+            rope_offsets, mask);
     }
 
     // Final normalization

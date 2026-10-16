@@ -112,6 +112,18 @@ impl Attention {
         mask: Option<&MxArray>,
         cache: Option<&mut KVCache>,
     ) -> Result<MxArray> {
+        self.forward_with_attention_eval(x, mask, cache, true)
+    }
+
+    /// `forward`, choosing whether the dense fused path evaluates the SDPA
+    /// output before the output projection. `false` keeps the layer lazy.
+    pub(crate) fn forward_with_attention_eval(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut KVCache>,
+        eval_attention: bool,
+    ) -> Result<MxArray> {
         if self.is_quantized() || mask.is_some() {
             return self.forward_quantized(x, mask, cache);
         }
@@ -201,6 +213,7 @@ impl Attention {
                 self.head_dim as i32,
                 self.scale as f32,
                 use_causal,
+                eval_attention,
             )
         };
 

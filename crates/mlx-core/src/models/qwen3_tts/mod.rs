@@ -9,6 +9,7 @@ mod runtime;
 mod speaker;
 mod tokenizer;
 mod transformer;
+mod voices;
 mod weights;
 
 fn check_cancelled(cancelled: &std::sync::atomic::AtomicBool) -> napi::Result<()> {

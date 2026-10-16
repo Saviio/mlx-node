@@ -50,7 +50,7 @@ export async function run(args: string[]): Promise<void> {
   --chunk-ms <ms>             Target PCM chunk duration (default: 160)
   --prebuffer-seconds <s>     Playback prebuffer (default: 0.32; at most buffer capacity)
   --buffer-seconds <s>        Playback buffer capacity (default: 1)
-  --max-duration <seconds>    Per-segment generation limit (default: 120); truncation is reported
+  --max-duration <seconds>    Per-segment generation limit (default: 163.84); truncation is reported
   --seed <integer>            Reproducible sampling
   --speed <factor>            Pitch-preserving speech speed (0.25..4; default: 1)
 
@@ -136,6 +136,7 @@ fractional values are supported, and unset/0 uses the normal cache policy.`);
       chunkDurationMs: values['chunk-ms'] === undefined ? undefined : Number(values['chunk-ms']),
       maxDurationSeconds: values['max-duration'] === undefined ? undefined : Number(values['max-duration']),
       seed: values.seed === undefined ? undefined : Number(values.seed),
+      suppressBootstrapSilence: values.play === true && values.output === undefined,
     });
     const processed = changeAudioSpeed(stream, Number(values.speed));
     for await (const chunk of processed) {

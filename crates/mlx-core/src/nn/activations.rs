@@ -98,37 +98,12 @@ impl Activations {
     /// This matches PyTorch's `F.gelu(x, approximate="none")`.
     /// Used by Gemma4 MoE experts (vLLM's `activation="gelu"` defaults to exact).
     pub fn gelu_exact(input: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            let half = sys::mlx_array_scalar_float(0.5);
-            let one = sys::mlx_array_scalar_float(1.0);
-            let inv_sqrt2 = sys::mlx_array_scalar_float(std::f64::consts::FRAC_1_SQRT_2);
-
-            // x / sqrt(2)
-            let x_scaled = sys::mlx_array_mul(input.handle.0, inv_sqrt2);
-
-            // erf(x / sqrt(2))
-            let erf_result = sys::mlx_array_erf(x_scaled);
-
-            // 1 + erf(x / sqrt(2))
-            let one_plus_erf = sys::mlx_array_add(one, erf_result);
-
-            // x * (1 + erf(x / sqrt(2)))
-            let x_times_bracket = sys::mlx_array_mul(input.handle.0, one_plus_erf);
-
-            // 0.5 * x * (1 + erf(x / sqrt(2)))
-            let result = sys::mlx_array_mul(half, x_times_bracket);
-
-            // Clean up
-            sys::mlx_array_delete(half);
-            sys::mlx_array_delete(one);
-            sys::mlx_array_delete(inv_sqrt2);
-            sys::mlx_array_delete(x_scaled);
-            sys::mlx_array_delete(erf_result);
-            sys::mlx_array_delete(one_plus_erf);
-            sys::mlx_array_delete(x_times_bracket);
-
-            result
-        };
+        // One fused kernel with its constants in the input's floating dtype.
+        // A float32 scalar array would promote a bf16 activation stream to
+        // float32 for the rest of the graph, including every weight it later
+        // touches. Same expression and operation order as the clef compiled
+        // builder, so both paths compute the same value.
+        let handle = unsafe { sys::mlx_gelu_exact(input.handle.0) };
         MxArray::from_handle(handle, "gelu_exact")
     }
 
@@ -352,6 +327,155 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn gelu_exact_preserves_dtype_and_matches_erf_formula() {
+        use crate::array::DType;
+
+        // A float32 constant anywhere in this chain used to widen bf16
+        // activation streams (the Qwen3-ASR encoder, then its whole decoder)
+        // to float32 for every downstream op.
+        let inputs = [-6.0f32, -2.0, -0.5, 0.0, 0.5, 1.0, 3.0, 8.0];
+        // PyTorch F.gelu(approximate="none") on the same inputs.
+        let reference = [
+            -5.9e-9_f32,
+            -0.045_500_26,
+            -0.154_268_77,
+            0.0,
+            0.345_731_23,
+            0.841_344_8,
+            2.995_950_4,
+            8.0,
+        ];
+        for (dtype, tolerance) in [
+            (DType::Float32, 1e-6_f32),
+            (DType::Float16, 0.01),
+            (DType::BFloat16, 0.05),
+        ] {
+            let input = MxArray::from_float32(&inputs, &[inputs.len() as i64])
+                .unwrap()
+                .astype(dtype)
+                .unwrap();
+            let result = Activations::gelu_exact(&input).unwrap();
+            assert_eq!(result.dtype().unwrap(), dtype);
+            let actual = result.astype(DType::Float32).unwrap().to_float32().unwrap();
+            for ((x, got), expected) in inputs.iter().zip(actual.iter()).zip(reference) {
+                assert!(
+                    (got - expected).abs() <= tolerance * expected.abs().max(1.0),
+                    "{dtype:?} gelu({x}) = {got}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// The compiled GELU (Qwen3-ASR encoder, Qwen3-TTS codec) and SwiGLU
+    /// (fused Qwen3 decode step) kernels replaced the separate ops below, and
+    /// those models' output bytes must not move: every fused value must equal
+    /// the separate ops bit for bit. All bf16 and f16 values; f32 at every
+    /// sign and exponent.
+    #[test]
+    fn compiled_gelu_exact_and_swiglu_match_separate_ops_bit_for_bit() {
+        use crate::array::DType;
+
+        let bits = |a: &MxArray| -> Vec<u32> {
+            if a.dtype().unwrap() == DType::Float32 {
+                a.to_float32()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect()
+            } else {
+                a.to_uint16_native()
+                    .unwrap()
+                    .into_iter()
+                    .map(u32::from)
+                    .collect()
+            }
+        };
+        let check = |what: &str, fused: &MxArray, separate: &MxArray| {
+            assert_eq!(fused.dtype().unwrap(), separate.dtype().unwrap());
+            let (f, s) = (bits(fused), bits(separate));
+            assert_eq!(f.len(), s.len());
+            let differ = f.iter().zip(&s).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "{what}: {differ} of {} differ", f.len());
+        };
+        let array = |values: &[f32], dtype: DType| {
+            MxArray::from_float32(values, &[values.len() as i64])
+                .unwrap()
+                .astype(dtype)
+                .unwrap()
+        };
+        let every_16_bit = |dtype: DType| -> Vec<f32> {
+            (0..=u16::MAX)
+                .map(|p| match dtype {
+                    DType::BFloat16 => f32::from_bits(u32::from(p) << 16),
+                    _ => half::f16::from_bits(p).to_f32(),
+                })
+                .collect()
+        };
+        let f32_sample: Vec<f32> = (0..512u32)
+            .flat_map(|sign_exp| {
+                (0..4096u32).map(move |m| {
+                    f32::from_bits(sign_exp << 23 | (m.wrapping_mul(0x9E37_79B1) >> 9))
+                })
+            })
+            .collect();
+        let ups: Vec<f32> = [
+            -130, -126, -100, -20, -8, -3, -1, 0, 1, 3, 8, 15, 60, 100, 127,
+        ]
+        .into_iter()
+        .flat_map(|e| [1.0f32, 1.3, 1.7, -1.0, -1.3, -1.7].map(|m| m * 2f32.powi(e)))
+        .chain([0.0, -0.0])
+        .collect();
+
+        for (dtype, gates) in [
+            (DType::BFloat16, every_16_bit(DType::BFloat16)),
+            (DType::Float16, every_16_bit(DType::Float16)),
+            (DType::Float32, f32_sample.clone()),
+        ] {
+            let x = array(&gates, dtype);
+            let erf = x
+                .mul_scalar(std::f64::consts::FRAC_1_SQRT_2)
+                .unwrap()
+                .erf()
+                .unwrap();
+            let separate = x
+                .mul(&erf.add_scalar(1.0).unwrap())
+                .unwrap()
+                .mul_scalar(0.5)
+                .unwrap();
+            check(
+                &format!("gelu_exact {dtype:?}"),
+                &Activations::gelu_exact(&x).unwrap(),
+                &separate,
+            );
+
+            let (gate, up) = if dtype == DType::Float32 {
+                let mut shuffled = gates.clone();
+                shuffled.rotate_left(gates.len() / 3);
+                (gates, shuffled)
+            } else {
+                let gate = gates.repeat(ups.len());
+                let up = ups
+                    .iter()
+                    .flat_map(|&u| std::iter::repeat_n(u, gates.len()))
+                    .collect();
+                (gate, up)
+            };
+            let (gate, up) = (array(&gate, dtype), array(&up, dtype));
+            let separate = Activations::sigmoid(&gate)
+                .unwrap()
+                .mul(&gate)
+                .unwrap()
+                .mul(&up)
+                .unwrap();
+            check(
+                &format!("swiglu {dtype:?}"),
+                &Activations::swiglu_compiled(&gate, &up).unwrap(),
+                &separate,
+            );
         }
     }
 

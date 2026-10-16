@@ -4622,6 +4622,9 @@ impl Qwen3Model {
                 kv_values_ptrs.as_ptr(),
                 *cache_idx,
                 rope_offsets.handle.0,
+                // Never null: GQA 8/12/16 checkpoints (e.g. Qwen3-32B) would
+                // decode unmasked past 8192 keys on another SDPA kernel and
+                // change their logits bytes.
                 left_padding.handle.0,
                 &mut out_logits,
                 out_kv_keys.as_mut_ptr(),

@@ -86,7 +86,7 @@ The detailed support matrix is in [docs/models.md](docs/models.md).
 
 ## Server
 
-`mlx serve` scans the models directory and loads a model when it is first requested. One model is resident at a time.
+`mlx serve` scans the models directory and loads a model when it is first requested. By default it keeps one chat/decision, one ASR and one TTS model resident. Use `--model-residency single` for a single global slot.
 
 ```bash
 mlx serve
@@ -100,6 +100,8 @@ The server implements:
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 - `GET /v1/models`
+- `POST /v1/audio/transcriptions`, `POST /v1/audio/speech`, `POST /v1/audio/speech/stream`
+- `GET /v1/audio/voices` — see [audio protocols and examples](docs/serve-audio.md)
 - `GET /health` and `GET /v1/health`
 
 Paged text models use continuous batching when the model supports it. Media turns and request-specific speculative decoding stay on ordered paths. The server also bounds admission and callback queues, propagates cancellation, and honors SSE backpressure. See [docs/concurrent-inference.md](docs/concurrent-inference.md) for the scheduler details.

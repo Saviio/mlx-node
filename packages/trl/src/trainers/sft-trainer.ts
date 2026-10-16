@@ -36,7 +36,6 @@ import {
   MxArray,
   type SftEngineConfig,
   type SftStepMetrics,
-  type SftEpochMetrics,
 } from '@mlx-node/core';
 import { loadModel, type TrainableModel } from '@mlx-node/lm';
 

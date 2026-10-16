@@ -2,7 +2,7 @@
  * `@mlx-node/server/host` — the reusable inference-host bootstrap.
  *
  * Everything a process needs to go from "a directory of downloaded models" to
- * "a listening Anthropic/OpenAI-compatible endpoint with one resident model
+ * "a listening Anthropic/OpenAI-compatible endpoint with typed resident models
  * and a working `/model` swap", with none of the opinions about WHO supervises
  * the process.
  *
@@ -50,8 +50,11 @@ import {
 } from '@mlx-node/lm';
 import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
 
+import type { AudioModel } from '../audio-registry.js';
+import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
+import { discoverAudioModels, loadAudioModel, withAudioModels, type DiscoveredAudioModel } from './audio-models.js';
 import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
 import { attachLogger as defaultAttachLogger, type Logger } from './logger.js';
@@ -113,6 +116,9 @@ export class InferenceHostClosedError extends Error {
 }
 
 export interface InferenceHostOptions {
+  modelResidency?: 'capability' | 'single';
+  audio?: AudioServiceOptions;
+  loadAudioModel?: (entry: DiscoveredAudioModel) => Promise<AudioModel>;
   /**
    * Port to bind. Omitted ⇒ a free port is picked up-front (so the URL is
    * known before the server starts, which `mlx launch claude` needs in order
@@ -184,9 +190,10 @@ export interface InferenceHost {
   host: string;
   /** The resolved model discovery root. */
   modelsDir: string;
-  /** Everything discovered under `modelsDir`, alphabetical. */
+  /** Chat/decision inventory for existing chat pickers, alphabetical. */
   models: DiscoveredModel[];
-  /** Name of the default/bound model. Always a member of {@link models}. */
+  audioModels: DiscoveredAudioModel[];
+  /** Name of the default model in models or audioModels. */
   boundModel: string;
   /** Verbose log directory, or `null` when logging is off. */
   logDir: string | null;
@@ -248,6 +255,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   // it as loopback, but Node's listen host must be the bare literal. Normalize
   // only after the reachability gate, and only the exact safe form.
   const bindHost = normalizeLoopbackBindHost(host);
+  if (opts.modelResidency !== undefined && !['capability', 'single'].includes(opts.modelResidency))
+    throw new Error('modelResidency must be capability or single');
 
   // FIRST, before anything can touch the engine: the native side latches
   // these via `OnceLock` on first read, so a policy applied after a load has
@@ -264,7 +273,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const modelsDir = resolveModelsDir(opts.modelsDir);
   let firstScanError: unknown;
   const models = await discoverModels(modelsDir, { onEntryFailure: (error) => (firstScanError ??= error) });
-  if (models.length === 0) {
+  const audioModels = await discoverAudioModels(modelsDir, (error) => (firstScanError ??= error));
+  const allModels = [...models, ...audioModels];
+  if (allModels.length === 0) {
     // NoModelsDiscoveredError means "a completed scan found nothing" — the
     // desktop sidecar maps it to a permanent exit. An INCOMPLETE scan's empty
     // result carries no such evidence, so the underlying I/O error propagates
@@ -275,15 +286,15 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
 
   // Precedence: explicit option > ANTHROPIC_MODEL > discovered[0].
   const requestedModel = opts.model ?? process.env.ANTHROPIC_MODEL;
-  const requestedEntry = requestedModel != null ? models.find((m) => m.name === requestedModel) : undefined;
+  const requestedEntry = requestedModel != null ? allModels.find((m) => m.name === requestedModel) : undefined;
   if (requestedModel != null && requestedEntry === undefined) {
     throw new ModelNotFoundError(
       requestedModel,
       modelsDir,
-      models.map((m) => m.name),
+      allModels.map((m) => m.name),
     );
   }
-  const boundEntry = requestedEntry ?? models.find((model) => model.modelType !== 'clef') ?? models[0];
+  const boundEntry = requestedEntry ?? models.find((model) => model.modelType !== 'clef') ?? allModels[0];
 
   // `undefined` means "you pick"; `0` means "the kernel picks and I will read
   // it back". Only the former needs the up-front probe.
@@ -308,6 +319,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   };
 
   const serverConfig = {
+    audio: opts.audio,
     port: requestedPort,
     host: bindHost,
     resolveModel: resolveHttpModel,
@@ -347,7 +359,15 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       throw error;
     }
   };
-  const controller = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name);
+  const chatController = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name);
+  const controller = withAudioModels(
+    chatController,
+    audioModels,
+    server.registry,
+    opts.loadAudioModel ?? loadAudioModel,
+    opts.modelResidency ?? 'capability',
+    models.length > 0,
+  );
   ctrlRef.current = controller;
 
   // Attach AFTER `createServer` so the wrapper sees every incoming request,
@@ -391,7 +411,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const address = server.server.address();
   const boundPort = address !== null && typeof address === 'object' ? address.port : requestedPort;
 
-  const byName = new Map(models.map((m) => [m.name, m]));
+  const byName = new Map<string, DiscoveredModel | DiscoveredAudioModel>(allModels.map((m) => [m.name, m]));
 
   // `closeStarted` is an admission latch, checked and flipped synchronously:
   // once close() returns its promise no later out-of-band load can join this
@@ -408,6 +428,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     host,
     modelsDir,
     models,
+    audioModels,
     boundModel: boundEntry.name,
     logDir: logger?.logDir ?? null,
     server,
@@ -420,7 +441,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
           new ModelNotFoundError(
             name,
             modelsDir,
-            models.map((m) => m.name),
+            allModels.map((m) => m.name),
           ),
         );
       }
@@ -473,6 +494,15 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         // `allSettled` preserves cleanup when either kind of loader rejects;
         // the original operation still carries that error to its caller.
         await Promise.allSettled([...admittedHostLoads, ...admittedHttpModelLoads]);
+        // Out-of-band audio loads admitted before close may finish after the
+        // HTTP audio service drained. Dispose those late residents as well.
+        let disposalError: unknown;
+        try {
+          if (server.registry.audio.list().length)
+            await server.modelWork.withModelLoad(() => server.registry.audio.disposeAll(), 'host audio shutdown');
+        } catch (error) {
+          disposalError = error;
+        }
         // Only once nothing is still serving. The logger writes a request's
         // record from that request's `finish` handler, so ending the streams
         // first both drops the record and — with no `error` listener — makes
@@ -490,6 +520,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         } catch {
           /* the startup sweep of the next host will reclaim it */
         }
+        if (disposalError) throw disposalError;
       })();
       return closePromise;
     },

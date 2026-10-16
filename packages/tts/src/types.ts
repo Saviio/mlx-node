@@ -37,6 +37,8 @@ export type TtsInput = string | AsyncIterable<TtsInputEvent>;
 export type TtsVoice = string | PreparedVoice | { type: 'description'; description: string };
 export interface PreparedVoice {
   readonly id: string;
+  /** Queries the owning backend, including native cache eviction. */
+  status(): Promise<'active' | 'evicted' | 'released'>;
   /**
    * Release this voice. Repeated disposal is safe. Releases may be requested
    * while the model is busy; they are queued behind the active operation.
@@ -62,8 +64,19 @@ export interface TtsOptions {
   topK?: number;
   topP?: number;
   repetitionPenalty?: number;
-  /** Per-segment generation limit in seconds (default 120); truncation reports `finishReason: 'length'`. */
+  /**
+   * Per-segment generation limit in seconds (default 2048 codec frames, 163.84 s for Qwen3-TTS);
+   * a string input is one segment.
+   * Truncation reports `finishReason: 'length'`.
+   */
   maxDurationSeconds?: number;
+  /**
+   * Streamed output drops the model's first codec frame from each segment when that frame is silent and the
+   * request is eligible (Qwen3-TTS: CustomVoice `ryan`, `language: 'english'`, no instructions, no sampling
+   * overrides other than `seed` and `maxDurationSeconds`). Default `true`, which does not force it;
+   * `false` keeps the frame. `synthesize` always keeps it.
+   */
+  suppressBootstrapSilence?: boolean;
   chunkDurationMs?: number;
   audioBufferSeconds?: number;
   maxSegmentGraphemes?: number;
@@ -93,7 +106,7 @@ export interface TtsAudio extends AudioData {
 }
 export interface TtsModel {
   readonly capabilities: TtsCapabilities;
-  prepareVoice(input: { audio: AudioData; transcript: string }): Promise<PreparedVoice>;
+  prepareVoice(input: { audio: AudioData; transcript: string; signal?: AbortSignal }): Promise<PreparedVoice>;
   synthesize(input: TtsInput, options: TtsOptions): Promise<TtsAudio>;
   synthesizeStream(input: TtsInput, options: TtsOptions): TtsStream;
   dispose(): Promise<void>;

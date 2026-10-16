@@ -288,9 +288,30 @@ describe('session lifecycle', () => {
     await model.synthesize('Again.', { voice: 'voice' });
     await model.dispose();
   });
+  it('synthesizes a string input as one sequence', async () => {
+    const { model, submitted } = fake();
+    const text = '你好。再见。 It costs 12.50 dollars, then more; and that is all. ';
+    const stream = model.synthesizeStream(text, { voice: 'voice', maxSegmentGraphemes: 4 });
+    const segments = [];
+    for await (const c of stream) segments.push(c.segmentIndex);
+    expect(submitted).toEqual([text]);
+    expect(segments).toEqual([0, 0]);
+    expect(await stream.completed).toMatchObject({ segments: 1, audioSeconds: 0.4 });
+    const blank = await model.synthesize(' \n ', { voice: 'voice' });
+    expect(blank.samples.length).toBe(0);
+    expect(blank.stats.segments).toBe(0);
+    expect(submitted).toEqual([text]);
+    await model.dispose();
+  });
   it('maintains sample positions across segments and awaits completion', async () => {
     const { model } = fake();
-    const stream = model.synthesizeStream('你好。再见。', { voice: 'voice' });
+    const stream = model.synthesizeStream(
+      (async function* () {
+        yield '你好。';
+        yield '再见。';
+      })(),
+      { voice: 'voice' },
+    );
     const positions = [];
     for await (const c of stream) positions.push([c.startSample, c.segmentIndex]);
     expect(positions).toEqual([
@@ -395,6 +416,67 @@ describe('session lifecycle', () => {
     await model.dispose();
     await Promise.all([voice.dispose(), other.dispose()]);
     expect(backend.releaseVoice).toHaveBeenCalledTimes(2);
+  });
+  it('reports native eviction, explicit release and model disposal without trusting JS ownership', async () => {
+    const { model, backend } = fake();
+    const reference = { audio: { samples: new Float32Array([0, 1]), sampleRate: 10 }, transcript: 'Hello' };
+    backend.hasVoice = vi.fn(async () => true);
+    const voice = await model.prepareVoice(reference);
+    expect(await voice.status()).toBe('active');
+    vi.mocked(backend.hasVoice).mockResolvedValue(false);
+    expect(await voice.status()).toBe('evicted');
+    expect(() => model.synthesizeStream('Stale.', { voice })).toThrow('does not belong');
+    await voice.dispose();
+    expect(await voice.status()).toBe('released');
+    const other = await model.prepareVoice(reference);
+    await model.dispose();
+    expect(await other.status()).toBe('evicted');
+  });
+  it('does not dispatch an already cancelled preparation', async () => {
+    const { model, backend } = fake();
+    const controller = new AbortController();
+    controller.abort();
+    expect(() =>
+      model.prepareVoice({
+        audio: { samples: new Float32Array([0]), sampleRate: 10 },
+        transcript: 'Hi',
+        signal: controller.signal,
+      }),
+    ).toThrow();
+    expect(backend.prepareVoice).not.toHaveBeenCalled();
+    await model.dispose();
+  });
+  it('holds the busy slot through native cancellation acknowledgement and cleans up a late success', async () => {
+    const { model, backend } = fake();
+    const preparation = deferred<string>();
+    const reference = { audio: { samples: new Float32Array([0, 1]), sampleRate: 10 }, transcript: 'Hello' };
+    vi.spyOn(backend, 'prepareVoice').mockImplementationOnce(() => preparation.promise);
+    backend.cancelVoicePreparation = vi.fn();
+    const controller = new AbortController();
+    const pending = model.prepareVoice({ ...reference, signal: controller.signal });
+    const reason = new Error('Stop');
+    const failed = expect(pending).rejects.toBe(reason);
+    controller.abort(reason);
+    expect(backend.cancelVoicePreparation).toHaveBeenCalledTimes(1);
+    expect(() => model.prepareVoice(reference)).toThrow('busy');
+    preparation.resolve('late-success');
+    await failed;
+    expect(backend.releaseVoice).toHaveBeenCalledExactlyOnceWith('late-success');
+    await model.prepareVoice(reference);
+    await model.dispose();
+  });
+  it('returns evicted if disposal races an outstanding native status query', async () => {
+    const { model, backend } = fake();
+    const lookup = deferred<boolean>();
+    backend.hasVoice = () => lookup.promise;
+    const voice = await model.prepareVoice({
+      audio: { samples: new Float32Array([0]), sampleRate: 10 },
+      transcript: 'Hi',
+    });
+    const status = voice.status();
+    await model.dispose();
+    lookup.reject(new Error('worker exited'));
+    expect(await status).toBe('evicted');
   });
   it('starts backend shutdown before waiting for an outstanding voice preparation', async () => {
     const { model, backend } = fake();
@@ -604,6 +686,59 @@ describe('instruction commits', () => {
       await expect(model.synthesize(input, { voice: 'voice' })).rejects.toThrow('Invalid TTS input event');
     }
     await model.synthesize('Again.', { voice: 'voice' });
+    await model.dispose();
+  });
+});
+
+describe('bootstrap silence', () => {
+  async function* events(values: import('../src/types.js').TtsInputEvent[]) {
+    yield* values;
+  }
+  it('offers the drop to every streamed segment, each with its own instruction', async () => {
+    const { model, backend } = fake();
+    const start = vi.spyOn(backend, 'start');
+    const stream = model.synthesizeStream(
+      events(['一。', '二。', { type: 'instruct', value: 'x' }, '三。', { type: 'instruct', value: null }, '四。']),
+      { voice: 'voice', language: 'english' },
+    );
+    for await (const _ of stream);
+    // Eligibility, including the instruction, is decided per segment by the backend.
+    expect(start.mock.calls.map(([text, o]) => [text, o.suppressBootstrapSilence, o.instruct])).toEqual([
+      ['一。', true, undefined],
+      ['二。', true, undefined],
+      ['三。', true, 'x'],
+      ['四。', true, undefined],
+    ]);
+    await model.dispose();
+  });
+  it('offers it once for a string, never to synthesize, and not when the caller opts out', async () => {
+    const { model, backend } = fake();
+    const start = vi.spyOn(backend, 'start');
+    for await (const _ of model.synthesizeStream('一。二。', { voice: 'voice' }));
+    await model.synthesize('一。二。', { voice: 'voice' });
+    await model.synthesize('一。二。', { voice: 'voice', suppressBootstrapSilence: true });
+    for await (const _ of model.synthesizeStream(events(['一。', '二。']), {
+      voice: 'voice',
+      suppressBootstrapSilence: false,
+    }));
+    for await (const _ of model.synthesizeStream('一。', { voice: 'voice', suppressBootstrapSilence: true }));
+    expect(start.mock.calls.map(([text, o]) => [text, o.suppressBootstrapSilence])).toEqual([
+      ['一。二。', true],
+      ['一。二。', false],
+      ['一。二。', false],
+      ['一。', false],
+      ['二。', false],
+      ['一。', true],
+    ]);
+    await model.dispose();
+  });
+  it('rejects a non-boolean opt-out before starting the backend', async () => {
+    const { model, submitted } = fake();
+    for (const value of ['false', 0, null])
+      expect(() =>
+        model.synthesizeStream('Hello.', { voice: 'voice', suppressBootstrapSilence: value as unknown as boolean }),
+      ).toThrow(TypeError);
+    expect(submitted).toEqual([]);
     await model.dispose();
   });
 });

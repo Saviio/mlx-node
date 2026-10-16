@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ResponseStore } from '@mlx-node/core';
 
+import type { AudioService } from './audio-service.js';
 import { handleCountMessageTokens } from './endpoints/messages-count-tokens.js';
 import { handleCreateMessage } from './endpoints/messages.js';
 import { handleListModels } from './endpoints/models.js';
@@ -87,6 +88,7 @@ export interface RouteExtras {
    * configured at all, so an unprotected server keeps serving the full body.
    */
   authenticated?: boolean;
+  audio?: AudioService;
 }
 
 export async function routeRequest(
@@ -102,6 +104,34 @@ export async function routeRequest(
   extras?: RouteExtras,
 ): Promise<void> {
   const path = requestPathname(req);
+  const rejectAudio = (body: unknown): boolean => {
+    const name = body && typeof body === 'object' && 'model' in body ? body.model : undefined;
+    if (
+      typeof name !== 'string' ||
+      !(registry.audio.get(name) || listModels?.().some((e) => e.id === name && e.modality === 'audio'))
+    )
+      return false;
+    if (path.startsWith('/v1/messages')) sendAnthropicBadRequest(res, 'Audio models require an audio endpoint');
+    else {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: {
+            type: 'invalid_request_error',
+            code: 'model_capability_mismatch',
+            param: 'model',
+            message: 'Audio models require an audio endpoint',
+          },
+        }),
+      );
+    }
+    return true;
+  };
+
+  if (path.startsWith('/v1/audio/') && extras?.audio) {
+    await extras.audio.handle(req, res, path);
+    return;
+  }
 
   if (path === '/v1/systemone') {
     if (req.method !== 'POST') {
@@ -114,6 +144,11 @@ export async function routeRequest(
     } catch (error) {
       sendBadRequest(res, error instanceof Error ? error.message : 'Invalid request body');
       return;
+    }
+    try {
+      if (rejectAudio(JSON.parse(raw))) return;
+    } catch {
+      /* The endpoint reports malformed JSON. */
     }
     await handleSystemOne(req, res, raw, registry, idleSweeper, resolveModel, modelWorkCoordinator);
     return;
@@ -145,6 +180,7 @@ export async function routeRequest(
       return;
     }
 
+    if (rejectAudio(body)) return;
     await handleCreateResponse(
       res,
       body,
@@ -176,6 +212,7 @@ export async function routeRequest(
       return;
     }
 
+    if (rejectAudio(body)) return;
     await handleCountMessageTokens(res, body, registry, idleSweeper, resolveModel, modelWorkCoordinator);
     return;
   }
@@ -197,6 +234,7 @@ export async function routeRequest(
       return;
     }
 
+    if (rejectAudio(body)) return;
     await handleCreateMessage(res, body, registry, req, idleSweeper, resolveModel, modelWorkCoordinator);
     return;
   }

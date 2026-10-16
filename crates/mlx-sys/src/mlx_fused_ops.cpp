@@ -379,7 +379,8 @@ mlx_array* mlx_fused_attention_output(
     int n_heads,
     int head_dim,
     float attn_scale,
-    bool use_causal
+    bool use_causal,
+    bool eval_attention
 ) {
     try {
         auto queries = reinterpret_cast<array*>(q_handle);
@@ -396,7 +397,9 @@ mlx_array* mlx_fused_attention_output(
         auto attn_output = mlx::core::fast::scaled_dot_product_attention(
             *queries, *keys, *values, attn_scale, mask_mode
         );
-        attn_output.eval();  // Force GPU sync after expensive SDPA to prevent timeout
+        if (eval_attention) {
+            attn_output.eval();  // Force GPU sync after expensive SDPA to prevent timeout
+        }
 
         // Transpose back: (B, n_heads, L, head_dim) -> (B, L, n_heads, head_dim)
         attn_output = transpose(attn_output, {0, 2, 1, 3});

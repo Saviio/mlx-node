@@ -241,7 +241,7 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     // still allocated, but the endpoint must not call the public full
     // native reset because that clears MoE GDN prefix checkpoints between
     // otherwise cacheable stateless turns.
-    expect(mockModel.resetCaches).not.toHaveBeenCalled();
+    expect(vi.mocked(mockModel).resetCaches.mock.calls).toHaveLength(0);
     const releaseCacheOwner = Reflect.get(mockModel, 'releaseCacheOwner') as ReturnType<typeof vi.fn>;
     expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
     expect(releaseCacheOwner).toHaveBeenCalledWith(
@@ -394,7 +394,7 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     expect(sessionReg.size).toBe(1);
     // Non-paged MISS still takes the public full reset branch. Its only
     // authorized native-cache-preserving path is a warm-slot HIT.
-    expect(mockModel.resetCaches).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mockModel).resetCaches.mock.calls).toHaveLength(1);
   });
 
   it('two parallel paged-active requests with the same system both get fresh sessions and BOTH commit (no warm-slot serialization)', async () => {

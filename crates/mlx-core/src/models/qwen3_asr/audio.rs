@@ -23,8 +23,33 @@ pub(crate) struct FeatureExtractor {
     num_mels: usize,
     n_window: usize,
     window: Vec<f32>,
-    mel_filters: Vec<f32>, // frequency-major [n_freqs, num_mels]
+    /// One contiguous non-zero span per Slaney filter. Summing only that span
+    /// in ascending frequency order gives the dense result bit for bit while
+    /// skipping the ~95% of the bank that is zero.
+    mel_spans: Vec<MelSpan>,
     fft: Arc<dyn Fft<f32>>,
+}
+
+struct MelSpan {
+    first_freq: usize,
+    weights: Vec<f32>,
+}
+
+fn mel_spans(mel_filters: &[f32], n_freqs: usize, num_mels: usize) -> Vec<MelSpan> {
+    (0..num_mels)
+        .map(|mel| {
+            let column = (0..n_freqs).map(|freq| mel_filters[freq * num_mels + mel]);
+            let first_freq = column.clone().position(|w| w != 0.0).unwrap_or(0);
+            let last_freq = column.clone().rposition(|w| w != 0.0).unwrap_or(0);
+            MelSpan {
+                first_freq,
+                weights: column
+                    .skip(first_freq)
+                    .take(last_freq + 1 - first_freq)
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 impl FeatureExtractor {
@@ -65,8 +90,9 @@ impl FeatureExtractor {
                 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / config.n_fft as f32).cos()
             })
             .collect();
+        let n_freqs = config.n_fft / 2 + 1;
         let mel_filters = mel_filter_bank(
-            config.n_fft / 2 + 1,
+            n_freqs,
             num_mels,
             0.0,
             config.sampling_rate as f32 / 2.0,
@@ -78,7 +104,7 @@ impl FeatureExtractor {
             num_mels,
             n_window,
             window,
-            mel_filters,
+            mel_spans: mel_spans(&mel_filters, n_freqs, num_mels),
             fft,
         })
     }
@@ -89,6 +115,10 @@ impl FeatureExtractor {
 
     pub(crate) fn hop_length(&self) -> usize {
         self.config.hop_length
+    }
+
+    pub(crate) fn output_frames(&self, samples: usize) -> usize {
+        samples.max(self.config.min_length) / self.config.hop_length
     }
 
     pub(crate) fn extract(&self, audio: &[f32]) -> Result<AudioFeatures, String> {
@@ -118,19 +148,30 @@ impl FeatureExtractor {
         // its final frame. The remaining count is floor(samples / hop).
         for frame in 0..valid_frames {
             let start = frame as isize * self.config.hop_length as isize - center as isize;
-            for (i, slot) in fft_buf.iter_mut().enumerate() {
-                let source = reflect_index(start + i as isize, signal_len);
-                *slot = Complex32::new(signal[source] * self.window[i], 0.0);
+            if start >= 0 && start as usize + self.config.n_fft <= signal_len {
+                // Interior frame: no reflection, one contiguous read.
+                let source = &signal[start as usize..start as usize + self.config.n_fft];
+                for ((slot, sample), weight) in fft_buf.iter_mut().zip(source).zip(&self.window) {
+                    *slot = Complex32::new(sample * weight, 0.0);
+                }
+            } else {
+                for (i, slot) in fft_buf.iter_mut().enumerate() {
+                    let source = reflect_index(start + i as isize, signal_len);
+                    *slot = Complex32::new(signal[source] * self.window[i], 0.0);
+                }
             }
             self.fft.process(&mut fft_buf);
-            for freq in 0..n_freqs {
-                power[freq] = fft_buf[freq].norm_sqr();
+            for (power_value, bin) in power.iter_mut().zip(&fft_buf) {
+                *power_value = bin.norm_sqr();
             }
-            for mel_idx in 0..self.num_mels {
-                let mut value = 0.0f32;
-                for (freq, power_value) in power.iter().enumerate().take(n_freqs) {
-                    value += self.mel_filters[freq * self.num_mels + mel_idx] * *power_value;
-                }
+            for (mel_idx, span) in self.mel_spans.iter().enumerate() {
+                let value = span
+                    .weights
+                    .iter()
+                    .zip(&power[span.first_freq..])
+                    .fold(0.0f32, |acc, (weight, power_value)| {
+                        acc + weight * power_value
+                    });
                 mel[mel_idx * padded_frames + frame] = value.max(1e-10).log10();
             }
         }

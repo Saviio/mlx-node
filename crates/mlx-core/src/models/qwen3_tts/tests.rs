@@ -412,3 +412,66 @@ fn qwen3_tts_teacher_parity() {
         assert!(max < 0.003 && rms < 0.001);
     }
 }
+
+#[test]
+#[ignore = "Requires a Qwen3-TTS 1.7B CustomVoice checkpoint (preset ryan) in TTS_TEST_MODEL"]
+fn qwen3_tts_bootstrap_silence_schedule() {
+    use super::{
+        model::{NativeModel, Options},
+        prefix::{CachePolicy, PrefixCache},
+    };
+    let root = std::env::var("TTS_TEST_MODEL").unwrap();
+    let (model, _) = NativeModel::load(Path::new(&root)).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&model.metadata()).unwrap();
+    let frame = metadata["samplesPerFrame"].as_u64().unwrap() as usize;
+    let mut cache = PrefixCache::new(CachePolicy::default());
+    let mut chunks = |chunk_frames: usize, max_frames: usize, suppress: bool| {
+        let mut sizes = Vec::new();
+        model
+            .generate(
+                "Get the trust fund to the bank early. Then call me when it is done.",
+                Options {
+                    voice: Some("ryan".into()),
+                    language: Some("english".into()),
+                    seed: Some(42),
+                    chunk_frames: Some(chunk_frames),
+                    max_frames: Some(max_frames),
+                    suppress_bootstrap_silence: suppress,
+                    ..Default::default()
+                },
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut cache,
+                |pcm| {
+                    sizes.push(pcm.len());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        sizes
+    };
+    // Ryan/English opens with a silent frame 0 under checkpoint sampling, and
+    // the codes do not depend on the codec schedule.
+    for chunk_frames in [1, 2, 8] {
+        let kept = chunks(chunk_frames, 2048, false);
+        let dropped = chunks(chunk_frames, 2048, true);
+        assert_eq!(
+            kept[0], frame,
+            "kept first chunk, chunk_frames {chunk_frames}"
+        );
+        assert_eq!(
+            dropped[..2],
+            [frame, chunk_frames * frame],
+            "chunk_frames {chunk_frames}"
+        );
+        assert_eq!(
+            kept.iter().sum::<usize>(),
+            dropped.iter().sum::<usize>() + frame,
+            "chunk_frames {chunk_frames}"
+        );
+        // A one-frame first chunk is sent unchanged.
+        assert_eq!(chunks(chunk_frames, 1, true), [frame]);
+        // [f0 f1] completes on the tail path; frame 0 is still dropped there.
+        assert_eq!(chunks(chunk_frames, 2, true), [frame]);
+        assert_eq!(chunks(chunk_frames, 2, false), [frame, frame]);
+    }
+}

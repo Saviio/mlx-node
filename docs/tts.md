@@ -3,7 +3,8 @@
 `@mlx-node/tts` runs Qwen3-TTS in Node → Rust → MLX. It supports CustomVoice
 presets, Base reference cloning, and 1.7B VoiceDesign descriptions. Instructions
 are supported for the released 1.7B CustomVoice and VoiceDesign profiles.
-HTTP serving and batching are outside this version.
+HTTP synthesis, SSE output and incremental text input are available through
+[`mlx serve`](serve-audio.md). Native batching is outside this version.
 
 ```ts
 import { loadTtsModel, createAudioPlayer, WavWriter } from '@mlx-node/tts';
@@ -42,12 +43,29 @@ valid while the model is busy and run after the active synthesis or
 preparation finishes. A released handle
 cannot be used for synthesis. A model retains at most eight prepared voices;
 preparing beyond that evicts the oldest, and an evicted or released handle
-fails on its next use. Model disposal releases all remaining references.
+fails on its next use. Preparation is keyed by the reference samples, sample
+rate and transcript: preparing the same reference again returns a new handle
+without recomputing it. Disposal releases the handle only; its prepared state
+stays in a least-recently-used cache (256 entries, 64 MiB of retained state
+per model) until evicted. Model disposal releases all remaining references.
+`await voice.status()` reports `active`, `evicted`, or `released`, querying the
+native cache instead of assuming a live JavaScript object still owns a voice.
+Status reads use the native cache's committed membership snapshot and can be
+awaited during stream consumption without waiting for synthesis to finish.
+Preparation also accepts `signal`; abort requests cooperative cancellation and
+the returned promise settles only after native completion (including releasing
+a result that finished just as cancellation arrived). Handles and prepared
+state are in-memory resources, not serializable voice assets. For the HTTP
+resource lifecycle, see [temporary reference voices](serve-audio.md#temporary-reference-voices).
+Checkpoint reference validation failures, such as audio too short for the
+speaker frontend, reject with `InvalidReferenceAudioError`.
 Reference length is validated against the encoder's configured context capacity
 before resampling or inference; it is not silently truncated.
 
 `synthesize` collects the same stream into one `Float32Array`. Use streaming for
-long output. PCM is interleaved, `startSample` counts audio frames across all text
+long output. A string input is synthesized as one sequence, in one segment; its
+sentences are not restarted. Incremental input (below) commits one segment per
+sentence. PCM is interleaved, `startSample` counts audio frames across all text
 segments, and `segmentIndex` identifies the committed text segment.
 
 ## Incremental text and lifecycle
@@ -61,10 +79,29 @@ punctuation can commit immediately. Each segment has fresh generator state and i
 own codec state (initialized from the prepared reference prefix for Base), and
 reuses the voice condition. Natural pauses between segments are expected.
 
-The default output target is 160 ms, rounded up to whole codec frames. Native
+The default output target is 160 ms for `synthesizeStream` and 640 ms
+(`NON_STREAMING_CHUNK_DURATION_MS`) for `synthesize`, rounded up to whole codec
+frames. The first chunk of each segment is one codec frame (80 ms), so first PCM
+waits on one generated frame only; a segment that may drop its bootstrap frame
+(below) waits on two. Wider codec steps cost less per frame; their PCM
+is not bit-identical to 160 ms chunks. Native
 PCM buffering is bounded to about one second and text buffering to two segments.
 `chunkDurationMs`, `audioBufferSeconds`, `queuedSegments` and
-`maxSegmentGraphemes` configure these policies. Slow consumers apply backpressure.
+`maxSegmentGraphemes` configure these policies; the last two apply to incremental
+input only. Slow consumers apply backpressure.
+
+`synthesizeStream` drops the model's silent bootstrap frame, as sglang-omni does
+for streamed output. A segment is eligible with the CustomVoice preset `ryan`,
+`language: 'english'`, no instruction and no `temperature`, `topK`, `topP` or
+`repetitionPenalty` (`seed` and `maxDurationSeconds` are allowed). It decodes
+its first two codec frames as one chunk. When the first frame is silent (RMS at
+most 0.001 and peak at most 0.0032), its 80 ms are removed and the chunk
+carries the second frame only; otherwise both frames are sent. The frame stays
+in the codec state. A first chunk of one frame is sent unchanged, and a frame
+with a NaN sample is kept. Every segment of incremental input is checked, and an
+`instruct` event changes eligibility for the segments after it.
+`suppressBootstrapSilence: false` keeps the frame; `true` is the default and
+does not force the drop. `synthesize` always keeps it.
 
 One model accepts one active synthesis or voice preparation. A concurrent request
 fails with a busy error; a concurrent voice release is queued instead and
@@ -78,10 +115,10 @@ An upstream iterator blocked on external I/O is not awaited during cancellation.
 Model disposal also cancels voice preparation at computation-stage boundaries;
 an already running MLX evaluation completes before its resources are released.
 
-`maxDurationSeconds` is a per-segment limit; reaching it reports `finishReason:
-'length'`. The SDK and CLI default it to 120 seconds (1,500 codec frames); that
-ceiling also bounds the talker KV reservation to ~160 MiB per segment instead of
-the checkpoint generation limit (~0.9 GiB at 8,192 frames). Direct native callers
+`maxDurationSeconds` is a per-segment limit, so it bounds a whole string input;
+reaching it reports `finishReason: 'length'`. When it is unset the SDK and CLI
+use 2,048 codec frames (163.84 seconds). Native code reserves talker KV for at
+most 2,048 frames (~224 MiB) and grows past that in slabs. Direct native callers
 that omit `max_frames` still use the checkpoint generation configuration.
 Sampling options preserve the checkpoint defaults unless explicitly overridden.
 

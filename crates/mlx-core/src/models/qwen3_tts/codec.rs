@@ -250,6 +250,11 @@ impl CodecState {
         arrays
     }
 
+    /// Allocated bytes of the retained state, including unused KV rows.
+    pub fn nbytes(&self) -> u64 {
+        self.retained().iter().map(|x| x.nbytes() as u64).sum()
+    }
+
     /// Materialize every retained tail, including histories not needed by the
     /// most recent PCM output, so a prepared prefix retains no growing graph.
     fn eval(&self) -> Result<()> {
@@ -366,6 +371,17 @@ impl CodecDecoder {
     }
     /// Codes use [batch, frames, codebooks]; the count is independent of code values.
     pub fn step(&self, codes: &MxArray, state: &mut CodecState) -> Result<MxArray> {
+        let frames = self.frames(codes, state)?;
+        let x = self.conv_stack(&frames, state)?;
+        if x.shape()?[1] != codes.shape_at(1)? * self.config.decode_upsample_rate as i64 {
+            return Err(Error::from_reason(
+                "Codec output length differs from configured upsample rate",
+            ));
+        }
+        x.astype(DType::Float32)?.reshape(&[-1])
+    }
+    /// Quantizer, pre-conv and transformer: one latent frame per code frame.
+    fn frames(&self, codes: &MxArray, state: &mut CodecState) -> Result<MxArray> {
         let shape = codes.shape()?;
         if shape.len() != 3
             || shape[2] != self.config.decoder_config.num_quantizers as i64
@@ -382,7 +398,10 @@ impl CodecDecoder {
         let x = self
             .transformer
             .forward(&self.input.forward(&x)?, &mut state.transformer)?;
-        let mut x = self.output.forward(&x)?;
+        self.output.forward(&x)
+    }
+    fn conv_stack(&self, frames: &MxArray, state: &mut CodecState) -> Result<MxArray> {
+        let mut x = frames.clone();
         for ((up, next), (up_state, next_state)) in self.upsample.iter().zip(&mut state.upsample) {
             x = next.step(&up.step(&x, up_state)?, next_state)?;
         }
@@ -390,16 +409,25 @@ impl CodecDecoder {
         for (block, state) in self.blocks.iter().zip(&mut state.blocks) {
             x = block.step(&x, state)?;
         }
-        let x = self
-            .final_conv
+        self.final_conv
             .step(&self.final_act.forward(&x)?, &mut state.final_conv)?
-            .clip(Some(-1.), Some(1.))?;
-        if x.shape()?[1] != shape[1] * self.config.decode_upsample_rate as i64 {
-            return Err(Error::from_reason(
-                "Codec output length differs from configured upsample rate",
-            ));
+            .clip(Some(-1.), Some(1.))
+    }
+    /// Trailing latent frames that fix every conv-stack history bit for bit,
+    /// walked back from the final convolution through each layer's geometry.
+    fn conv_stack_frames(&self) -> i64 {
+        let mut n = self.final_conv.inputs_for(0);
+        for block in self.blocks.iter().rev() {
+            for residual in block.residuals.iter().rev() {
+                n = residual.conv1.inputs_for(residual.conv2.inputs_for(n));
+            }
+            n = block.up.inputs_for(n);
         }
-        x.astype(DType::Float32)?.reshape(&[-1])
+        n = self.initial.inputs_for(n);
+        for (up, next) in self.upsample.iter().rev() {
+            n = up.inputs_for(next.depthwise.inputs_for(n));
+        }
+        n
     }
     #[cfg(test)]
     pub fn decode(&self, codes: &MxArray) -> Result<MxArray> {
@@ -410,15 +438,23 @@ impl CodecDecoder {
     /// reference-length decoder graph. One codec frame bounds temporary memory.
     /// `step` must stay per-frame: multi-frame shapes change conv/GEMM tiling
     /// and are not bit-identical to the 1-frame loop (chunked runs verified
-    /// against this loop diverge in sample 0). The history materialization is
-    /// submitted asynchronously so each frame's graph build overlaps the GPU
-    /// eval of the previous one, then the final `eval` performs the one
-    /// synchronous wait that bounds retained state and surfaces eval errors.
+    /// against this loop diverge in sample 0). Frames before the last
+    /// `conv_stack_frames` skip the conv stack, which then starts from an
+    /// empty state and still ends with the same bits. The history
+    /// materialization is submitted asynchronously so each frame's graph build
+    /// overlaps the GPU eval of the previous one, then the final `eval`
+    /// performs the one synchronous wait that bounds retained state and
+    /// surfaces eval errors.
     pub fn prepare_prefix(&self, codes: &MxArray, cancelled: &AtomicBool) -> Result<CodecState> {
         let mut state = self.state();
-        for frame in 0..codes.shape_at(1)? {
+        let count = codes.shape_at(1)?;
+        let tail = count - self.conv_stack_frames();
+        for frame in 0..count {
             super::check_cancelled(cancelled)?;
-            let _ = self.step(&codes.slice_axis(1, frame, frame + 1)?, &mut state)?;
+            let frames = self.frames(&codes.slice_axis(1, frame, frame + 1)?, &mut state)?;
+            if frame >= tail {
+                let _ = self.conv_stack(&frames, &mut state)?;
+            }
             state.eval_async();
         }
         super::check_cancelled(cancelled)?;
@@ -462,7 +498,8 @@ mod tests {
     }
 
     /// `prepare_prefix` must retain bit-identical state: async-evaluating the
-    /// histories between frames cannot change the continuation's PCM bits.
+    /// histories between frames and skipping the conv stack before its tail
+    /// cannot change the continuation's PCM bits.
     #[test]
     #[ignore = "Requires a Qwen3-TTS checkpoint in TTS_TEST_MODEL"]
     fn prepare_prefix_matches_per_frame() {
@@ -483,6 +520,7 @@ mod tests {
         let codes = MxArray::from_int32(&values, &[1, 23, groups]).unwrap();
         let prefix = codes.slice_axis(1, 0, 19).unwrap();
         let continuation = codes.slice_axis(1, 19, 23).unwrap();
+        assert!(codec.conv_stack_frames() < 19);
         let prepared = codec
             .prepare_prefix(&prefix, &AtomicBool::new(false))
             .unwrap();

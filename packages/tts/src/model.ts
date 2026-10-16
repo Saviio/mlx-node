@@ -38,15 +38,22 @@ export interface BackendOptions {
   chunkDurationMs: number;
   audioBufferSeconds: number;
   maxDurationSeconds?: number;
+  /** The backend may drop a silent bootstrap frame from the first chunk of this segment. */
+  suppressBootstrapSilence: boolean;
 }
 /** Internal adapter boundary. Future model families can produce PCM directly. */
 export interface TtsBackend {
   readonly capabilities: TtsCapabilities;
   start(text: string, options: BackendOptions): BackendStream;
   prepareVoice(this: void, audio: Float32Array, sampleRate: number, transcript: string): Promise<string>;
+  /** Backends with an evicting cache must implement this authoritative lookup. */
+  hasVoice?(this: void, id: string): Promise<boolean>;
+  cancelVoicePreparation?(this: void): void;
   releaseVoice(this: void, id: string): Promise<void>;
   dispose(this: void): Promise<void>;
 }
+
+export const NON_STREAMING_CHUNK_DURATION_MS = 640;
 
 function positive(value: number, name: string): number {
   if (!Number.isFinite(value) || value <= 0) throw new RangeError(`${name} must be positive and finite`);
@@ -79,8 +86,9 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
   }
   const model: TtsModel = {
     capabilities,
-    prepareVoice({ audio, transcript }) {
+    prepareVoice({ audio, transcript, signal }) {
       available();
+      signal?.throwIfAborted();
       if (!capabilities.voiceCloning) throw new Error('This model does not support voice cloning');
       const channels = audio.channels ?? 1;
       if (!Number.isSafeInteger(channels) || channels < 1 || audio.samples.length % channels)
@@ -94,12 +102,33 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
         if (!Number.isFinite(sample)) throw new Error('Reference audio contains non-finite samples');
         mono[Math.floor(i / channels)] += sample / channels;
       }
-      preparing = backend
-        .prepareVoice(mono, audio.sampleRate, transcript)
-        .then((id) => {
+      const pending = backend.prepareVoice(mono, audio.sampleRate, transcript);
+      const abort = () => backend.cancelVoicePreparation?.();
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+      preparing = pending
+        .then(async (id) => {
+          if (signal?.aborted) {
+            await backend.releaseVoice(id);
+            throw signal.reason;
+          }
           let release: Promise<void> | undefined;
+          let evicted = false;
           const voice: PreparedVoice = Object.freeze({
             id,
+            async status() {
+              if (release) return 'released';
+              if (disposed || evicted) return 'evicted';
+              try {
+                if (backend.hasVoice && !(await backend.hasVoice(id))) {
+                  evicted = true;
+                  voices.delete(voice);
+                }
+              } catch (error) {
+                if (!disposed) throw error;
+              }
+              return disposed || evicted ? 'evicted' : release ? 'released' : 'active';
+            },
             dispose() {
               if (disposed) return Promise.resolve();
               if (release) return release;
@@ -127,6 +156,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
           return voice;
         })
         .finally(() => {
+          signal?.removeEventListener('abort', abort);
           preparing = undefined;
         });
       return preparing;
@@ -190,6 +220,8 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
         (!Number.isSafeInteger(options.topK) || options.topK < 0 || options.topK > 0x7fffffff)
       )
         throw new RangeError('Invalid topK');
+      if (options.suppressBootstrapSilence !== undefined && typeof options.suppressBootstrapSilence !== 'boolean')
+        throw new TypeError('suppressBootstrapSilence must be a boolean');
       const backendOptions: BackendOptions = {
         voice: typeof options.voice === 'string' ? options.voice.toLowerCase() : undefined,
         preparedVoiceId,
@@ -206,6 +238,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
           options.maxDurationSeconds === undefined
             ? undefined
             : positive(options.maxDurationSeconds, 'maxDurationSeconds'),
+        suppressBootstrapSilence: options.suppressBootstrapSilence !== false,
       };
       const signal = options.signal;
       const controller = new AbortController();
@@ -266,7 +299,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
         }
         try {
           if (typeof input === 'string') {
-            await submit(input, true);
+            if (input.trim()) await queue.push(Object.freeze({ text: input, instruct: currentInstruction }));
           } else {
             source = input[Symbol.asyncIterator]();
             while (!controller.signal.aborted) {
@@ -413,7 +446,11 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
       return stream;
     },
     async synthesize(input, options): Promise<TtsAudio> {
-      const stream = model.synthesizeStream(input, options);
+      const stream = model.synthesizeStream(input, {
+        ...options,
+        chunkDurationMs: options.chunkDurationMs ?? NON_STREAMING_CHUNK_DURATION_MS,
+        suppressBootstrapSilence: false,
+      });
       const chunks: Float32Array[] = [];
       let length = 0;
       for await (const chunk of stream) {

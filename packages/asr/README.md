@@ -4,6 +4,10 @@ Local Qwen3-ASR transcription and realtime meeting capture on Apple Silicon.
 
 ## Convert the Hugging Face checkpoint
 
+Use [Qwen/Qwen3-ASR-1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf),
+which has the Transformers layout required by this loader. The older
+`Qwen/Qwen3-ASR-1.7B` repository has a different `thinker_config` layout.
+
 For the fastest tested decoder path, pack the Qwen text model as MXFP4. The
 audio encoder and multimodal projector deliberately remain BF16 so speech
 features are not quantized:
@@ -48,6 +52,17 @@ console.log(result.text, result.realTimeFactor);
 
 `transcribe()` accepts mono floating-point PCM at any positive sample rate and
 resamples it to the model's native 16 kHz input.
+
+For cancellation, use `const task = model.startTranscription(pcm, options)` and
+await `task.result()`. Call `task.cancel()` on disconnect, then still await the
+result (which rejects on cancellation) before releasing any inference lock.
+`model.dispose()` waits for native shutdown and releases its weights explicitly.
+Rolling streams provide `cancel()` and an awaitable `dispose()` as well. Metal
+work stops cooperatively at the next safe checkpoint, not instantaneously.
+
+The existing `transcribe()` API remains available. Input, prompt and requested
+output tokens must fit the checkpoint context. For WAV upload, streaming revision
+events and shared HTTP authentication, see [audio serving](../../docs/serve-audio.md).
 
 ## Streaming manually supplied audio
 

@@ -210,6 +210,7 @@ unsafe extern "C-unwind" {
         head_dim: i32,
         attn_scale: f32,
         use_causal: bool,
+        eval_attention: bool,
     ) -> *mut mlx_array;
 
     pub fn mlx_array_transpose(
@@ -324,6 +325,14 @@ unsafe extern "C-unwind" {
         uniforms: *mut mlx_array,
     ) -> *mut mlx_array;
     pub fn mlx_array_sample_probabilities(handle: *mut mlx_array, seed: u64) -> *mut mlx_array;
+    /// Lazy keyed draw from a [1, V] logits row (temperature, top-k, softmax,
+    /// then the draw above); int32 [1, 1], -1 means no valid mass.
+    pub fn mlx_array_sample_logits(
+        handle: *mut mlx_array,
+        temperature: f32,
+        top_k: i32,
+        seed: u64,
+    ) -> *mut mlx_array;
     /// macOS shared-memory draft sampling; both functions validate rank/dtype
     /// and wait for completion before reading. No pointer escapes the call.
     pub fn mlx_array_positive_probability_mass(handle: *mut mlx_array, out: *mut f64) -> bool;
@@ -554,6 +563,8 @@ unsafe extern "C-unwind" {
 
     // Compiled GELU approximate (fused kernel, matches Python nn.gelu_approx)
     pub fn mlx_gelu_approx(handle: *mut mlx_array) -> *mut mlx_array;
+    // Compiled GELU exact: x * (1 + erf(x / sqrt(2))) * 0.5 (fused kernel)
+    pub fn mlx_gelu_exact(handle: *mut mlx_array) -> *mut mlx_array;
     // Compiled GeGLU: gelu_approx(gate) * up (fused kernel)
     pub fn mlx_geglu(gate: *mut mlx_array, up: *mut mlx_array) -> *mut mlx_array;
     // Compiled logit softcap: tanh(x / softcap) * softcap (fused kernel)
@@ -1065,7 +1076,7 @@ unsafe extern "C-unwind" {
         cache_idx_in: i32,                   // Shared cache write position
         // Array offsets for batched generation
         rope_offsets: *mut mlx_array, // [batch] - per-sequence RoPE offsets
-        left_padding: *mut mlx_array, // [batch] - left padding amounts
+        left_padding: *mut mlx_array, // [batch] left padding; null = no row padded, one-token step unmasked
         // Outputs
         out_logits: *mut *mut mlx_array,    // [batch, seq_len, vocab]
         out_kv_keys: *mut *mut mlx_array,   // [num_layers]

@@ -1,12 +1,8 @@
+import { InvalidReferenceAudioError } from './errors.js';
 import type { TtsBackend } from './model.js';
 import type { TtsCapabilities, TtsLoadOptions } from './types.js';
 
-// Per-segment generation ceiling when the caller does not set one. The talker
-// KV reservation is sized to max_frames (~110 KiB/frame), so falling back to
-// the checkpoint's 8192-frame generation limit would pre-reserve ~0.9 GiB per
-// segment; 120 s bounds it to ~160 MiB and is surfaced as finishReason
-// 'length' rather than an error.
-const DEFAULT_MAX_DURATION_SECONDS = 120;
+const DEFAULT_MAX_FRAMES = 2048;
 
 /** Codec frame scheduling belongs to this adapter, outside generic text sessions. */
 export async function loadQwen3Backend(path: string, options: TtsLoadOptions = {}): Promise<TtsBackend> {
@@ -55,11 +51,25 @@ export async function loadQwen3Backend(path: string, options: TtsLoadOptions = {
           seed: options.seed,
           chunk_frames: chunkFrames,
           buffer_chunks: bufferChunks,
-          max_frames: Math.ceil(((options.maxDurationSeconds ?? DEFAULT_MAX_DURATION_SECONDS) * 1000) / frameMs),
+          max_frames:
+            options.maxDurationSeconds === undefined
+              ? DEFAULT_MAX_FRAMES
+              : Math.ceil((options.maxDurationSeconds * 1000) / frameMs),
+          suppress_bootstrap_silence: options.suppressBootstrapSilence,
         }),
       );
     },
-    prepareVoice: (audio, sampleRate, transcript) => native.prepareVoice(audio, sampleRate, transcript),
+    async prepareVoice(audio, sampleRate, transcript) {
+      try {
+        return await native.prepareVoice(audio, sampleRate, transcript);
+      } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'InvalidArg')
+          throw new InvalidReferenceAudioError(error.message, { cause: error });
+        throw error;
+      }
+    },
+    hasVoice: (id) => native.hasVoice(id),
+    cancelVoicePreparation: () => native.cancelVoicePreparation(),
     releaseVoice: (id) => native.releaseVoice(id),
     dispose: () => native.dispose(),
   };

@@ -24,6 +24,25 @@ impl Norm {
             Self::Layer(n) => n.forward(x),
         }
     }
+    /// `h = x + res`, `normed = norm(h)`. RMS layers take the fused
+    /// add_rmsnorm dispatch, which is bit-identical to the separate pair; the
+    /// Mimi encoder's LayerNorm keeps the two ops.
+    fn forward_residual(&self, x: &MxArray, res: &MxArray) -> Result<(MxArray, MxArray)> {
+        if let Self::Rms(n) = self
+            && let Some(pair) = n.forward_residual_add(x, res)
+        {
+            return Ok(pair);
+        }
+        let h = x.add(res)?;
+        Ok((h.clone(), self.forward(&h)?))
+    }
+}
+
+/// A layer output left as `(stream, delta)` so the consumer's norm can fuse
+/// the residual add into its own dispatch.
+struct Residual {
+    stream: MxArray,
+    delta: MxArray,
 }
 
 pub struct DecoderLayer {
@@ -38,6 +57,12 @@ pub struct DecoderLayer {
     gate: Option<Linear>,
     up: Linear,
     down: Linear,
+    /// Dense checkpoints only: `[q; k; v]` and `[gate; up]` stacked along the
+    /// output axis so a decode step issues one GEMV per group instead of
+    /// three and two. Each output row is the same dot product over the same
+    /// K, so the slices are bit-identical to the separate projections.
+    qkv: Option<Linear>,
+    gate_up: Option<Linear>,
     attn_scale: Option<MxArray>,
     mlp_scale: Option<MxArray>,
     config: TransformerConfig,
@@ -85,10 +110,17 @@ impl DecoderLayer {
             c.hidden_size,
             c.intermediate_size,
         )?;
+        let q = w.linear(&format!("{attn}.q_proj"))?;
+        let k = w.linear(&format!("{attn}.k_proj"))?;
+        let v = w.linear(&format!("{attn}.v_proj"))?;
+        let gate = w.linear(&format!("{prefix}.mlp.gate_proj"))?;
+        let up = w.linear(&format!("{prefix}.mlp.up_proj"))?;
+        let qkv = stack_dense_linears(&[&q, &k, &v])?;
+        let gate_up = stack_dense_linears(&[&gate, &up])?;
         Ok(Self {
-            q: w.linear(&format!("{attn}.q_proj"))?,
-            k: w.linear(&format!("{attn}.k_proj"))?,
-            v: w.linear(&format!("{attn}.v_proj"))?,
+            q,
+            k,
+            v,
             o: w.linear(&format!("{attn}.o_proj"))?,
             q_norm: if qk_norm {
                 Some(w.rms(&format!("{attn}.q_norm"), c.rms_norm_eps)?)
@@ -105,9 +137,11 @@ impl DecoderLayer {
                 &format!("{prefix}.post_attention_layernorm"),
                 c.rms_norm_eps,
             )?),
-            gate: Some(w.linear(&format!("{prefix}.mlp.gate_proj"))?),
-            up: w.linear(&format!("{prefix}.mlp.up_proj"))?,
+            gate: Some(gate),
+            up,
             down: w.linear(&format!("{prefix}.mlp.down_proj"))?,
+            qkv,
+            gate_up,
             attn_scale: if layer_scale {
                 Some(w.get(&format!("{prefix}.self_attn_layer_scale.scale"))?)
             } else {
@@ -174,22 +208,48 @@ impl DecoderLayer {
         ))
     }
 
+    #[cfg(test)]
     pub fn forward(&self, x: &MxArray, state: &mut AttentionState) -> Result<MxArray> {
+        let out = self.forward_residual(x, None, state)?;
+        out.stream.add(&out.delta)
+    }
+
+    /// One layer on a residual stream. `pending` is the previous layer's
+    /// unapplied delta: adding it here lets norm1 fuse the add.
+    fn forward_residual(
+        &self,
+        x: &MxArray,
+        pending: Option<&MxArray>,
+        state: &mut AttentionState,
+    ) -> Result<Residual> {
         let c = &self.config;
         let shape = x.shape()?;
         let (b, n) = (shape[0], shape[1]);
-        let h = self.norm1.forward(x)?;
-        let q = self
-            .q
-            .forward(&h)?
-            .reshape(&[b, n, c.num_attention_heads, c.head_dim])?;
-        let k = self
-            .k
-            .forward(&h)?
-            .reshape(&[b, n, c.num_key_value_heads, c.head_dim])?;
-        let v = self
-            .v
-            .forward(&h)?
+        let (x, h) = match pending {
+            Some(delta) => self.norm1.forward_residual(x, delta)?,
+            None => (x.clone(), self.norm1.forward(x)?),
+        };
+        let x = &x;
+        let (q, k, v) = match &self.qkv {
+            Some(qkv) => {
+                let q_width = c.num_attention_heads * c.head_dim;
+                let kv_width = c.num_key_value_heads * c.head_dim;
+                let joined = qkv.forward(&h)?;
+                (
+                    joined.slice_axis(2, 0, q_width)?,
+                    joined.slice_axis(2, q_width, q_width + kv_width)?,
+                    joined.slice_axis(2, q_width + kv_width, q_width + 2 * kv_width)?,
+                )
+            }
+            None => (
+                self.q.forward(&h)?,
+                self.k.forward(&h)?,
+                self.v.forward(&h)?,
+            ),
+        };
+        let q = q.reshape(&[b, n, c.num_attention_heads, c.head_dim])?;
+        let k = k.reshape(&[b, n, c.num_key_value_heads, c.head_dim])?;
+        let v = v
             .reshape(&[b, n, c.num_key_value_heads, c.head_dim])?
             .transpose(Some(&[0, 2, 1, 3]))?;
         // TTS uses identical temporal/height/width positions; interleaved MRoPE
@@ -270,13 +330,22 @@ impl DecoderLayer {
         if let Some(scale) = &self.attn_scale {
             h = h.mul(scale)?;
         }
-        let x = x.add(&h)?;
-        let h = self.norm2.forward(&x)?;
-        let h = match &self.gate {
-            Some(gate) => Activations::swiglu_compiled(&gate.forward(&h)?, &self.up.forward(&h)?)?,
+        let (x, h) = self.norm2.forward_residual(x, &h)?;
+        let h = match (&self.gate, &self.gate_up) {
+            (Some(_), Some(gate_up)) => {
+                let joined = gate_up.forward(&h)?;
+                let width = c.intermediate_size;
+                Activations::swiglu_compiled(
+                    &joined.slice_axis(2, 0, width)?,
+                    &joined.slice_axis(2, width, 2 * width)?,
+                )?
+            }
+            (Some(gate), None) => {
+                Activations::swiglu_compiled(&gate.forward(&h)?, &self.up.forward(&h)?)?
+            }
             // Mimi's hidden_act="gelu" uses erf GELU (Transformers 4.57.3),
             // unlike the tanh approximation used by some other model families.
-            None => Activations::gelu_exact(&self.up.forward(&h)?)?,
+            (None, _) => Activations::gelu_exact(&self.up.forward(&h)?)?,
         };
         let mut h = self.down.forward(&h)?;
         if let Some(scale) = &self.mlp_scale {
@@ -286,8 +355,26 @@ impl DecoderLayer {
         if let Some(window) = self.attention_window {
             state.kv.retain_recent(window.saturating_sub(1))?;
         }
-        x.add(&h)
+        Ok(Residual {
+            stream: x,
+            delta: h,
+        })
     }
+}
+
+/// Stack dense, bias-free projections along their output axis. Quantized or
+/// biased projections keep their separate GEMVs (`None`).
+fn stack_dense_linears(parts: &[&Linear]) -> Result<Option<Linear>> {
+    if parts
+        .iter()
+        .any(|linear| linear.is_quantized() || linear.get_bias().is_some())
+    {
+        return Ok(None);
+    }
+    let weights: Vec<MxArray> = parts.iter().map(|linear| linear.get_weight()).collect();
+    let stacked = MxArray::concatenate_many(weights.iter().collect(), Some(0))?;
+    stacked.eval();
+    Ok(Some(Linear::from_weights(&stacked, None)?))
 }
 
 pub struct Decoder {
@@ -337,6 +424,8 @@ impl Decoder {
                     gate: None,
                     up: w.linear(&format!("{p}.mlp.fc1"))?,
                     down: w.linear(&format!("{p}.mlp.fc2"))?,
+                    qkv: None,
+                    gate_up: None,
                     attn_scale: Some(w.get(&format!("{p}.self_attn_layer_scale.scale"))?),
                     mlp_scale: Some(w.get(&format!("{p}.mlp_layer_scale.scale"))?),
                     config: c.clone(),
@@ -363,12 +452,22 @@ impl Decoder {
     }
     pub fn forward(&self, input: &MxArray, states: &mut [AttentionState]) -> Result<MxArray> {
         let mut x = input.astype(self.dtype)?;
+        let mut pending: Option<MxArray> = None;
         for (layer, state) in self.layers.iter().zip(states) {
-            x = layer.forward(&x, state)?;
+            let out = layer.forward_residual(&x, pending.as_ref(), state)?;
+            x = out.stream;
+            pending = Some(out.delta);
         }
-        match &self.norm {
-            Some(norm) => norm.forward(&x),
-            None => Ok(x),
+        match (&self.norm, pending) {
+            (Some(norm), Some(delta)) => {
+                if let Some((_, normed)) = norm.forward_residual_add(&x, &delta) {
+                    return Ok(normed);
+                }
+                norm.forward(&x.add(&delta)?)
+            }
+            (Some(norm), None) => norm.forward(&x),
+            (None, Some(delta)) => x.add(&delta),
+            (None, None) => Ok(x),
         }
     }
 }
@@ -410,6 +509,8 @@ mod tests {
             gate: None,
             up: linear(&identity),
             down: linear(&identity),
+            qkv: None,
+            gate_up: None,
             attn_scale: None,
             mlp_scale: None,
             config,
@@ -463,6 +564,8 @@ mod tests {
             gate: None,
             up: linear(&zeros),
             down: linear(&zeros),
+            qkv: None,
+            gate_up: None,
             attn_scale: None,
             mlp_scale: None,
             config: c.clone(),
@@ -761,6 +864,8 @@ mod tests {
             gate: Some(Linear::from_weights(&rand(&[16, 16]), None)?),
             up: Linear::from_weights(&rand(&[16, 16]), None)?,
             down: Linear::from_weights(&rand(&[16, 16]), None)?,
+            qkv: None,
+            gate_up: None,
             attn_scale: None,
             mlp_scale: None,
             config: c,

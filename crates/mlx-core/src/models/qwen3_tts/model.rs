@@ -3,19 +3,20 @@ use super::{
     config::{CodecConfig, ModelConfig, TransformerConfig, read_json},
     tokenizer::TextTokenizer,
     transformer::Decoder,
+    voices::{Limits, VoiceKey, VoiceStore},
     weights::Weights,
 };
 use crate::{
     array::{DType, MxArray},
     nn::{Activations, Embedding, Linear},
-    sampling::{apply_top_k, apply_top_p, sample_dense_distribution_array},
+    sampling::{apply_top_k, apply_top_p, sample_logits_array},
     transformer::KVCache,
 };
 use napi::{Error, Result};
 use rand::{SeedableRng, rngs::StdRng};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
@@ -36,6 +37,8 @@ pub struct Options {
     pub max_frames: Option<usize>,
     pub chunk_frames: Option<usize>,
     pub buffer_chunks: Option<usize>,
+    #[serde(default)]
+    pub suppress_bootstrap_silence: bool,
 }
 #[derive(Clone, Deserialize)]
 struct GenerationConfig {
@@ -79,9 +82,35 @@ pub struct VoiceCondition {
     text: Vec<i32>,
     codec_prefix: CodecState,
 }
+impl VoiceCondition {
+    fn nbytes(&self) -> u64 {
+        (self.speaker.nbytes() + self.codes.nbytes() + std::mem::size_of_val(&self.text[..])) as u64
+            + self.codec_prefix.nbytes()
+    }
+}
 // Each prepared voice retains a speaker embedding, codec codes and a
-// materialized codec prefix, so retained voices are bounded FIFO.
-const MAX_PREPARED_VOICES: usize = 8;
+// materialized codec prefix, so voice ids are bounded FIFO and the content
+// cache is bounded by entries and allocated bytes.
+const VOICE_LIMITS: Limits = Limits {
+    ids: 8,
+    entries: 256,
+    bytes: 64 * 1024 * 1024,
+};
+/// Every input that changes a prepared condition; model and its config are
+/// instance scoped.
+fn voice_key(audio: &[f32], sample_rate: u32, transcript: &str) -> VoiceKey {
+    let mut hasher = Sha256::new();
+    hasher.update(sample_rate.to_le_bytes());
+    hasher.update((transcript.len() as u64).to_le_bytes());
+    hasher.update(transcript.as_bytes());
+    let mut bytes = Vec::with_capacity(4096 * 4);
+    for chunk in audio.chunks(4096) {
+        bytes.clear();
+        bytes.extend(chunk.iter().flat_map(|x| x.to_le_bytes()));
+        hasher.update(&bytes);
+    }
+    hasher.finalize().into()
+}
 /// Up-front talker KV reservation and growth-slab granularity (~160 s of
 /// audio, ~215 MiB of KV): generation longer than the horizon grows the cache
 /// at this step instead of holding the full bound turn-long.
@@ -90,8 +119,7 @@ const RESERVE_HORIZON_FRAMES: usize = 2048;
 pub struct NativeModel {
     speaker: Option<super::speaker::SpeakerEncoder>,
     encoder: Option<super::encoder::CodecEncoder>,
-    voices: HashMap<String, VoiceCondition>,
-    voice_order: VecDeque<String>,
+    voices: VoiceStore<VoiceCondition>,
     pub config: ModelConfig,
     pub codec: CodecDecoder,
     tokenizer: TextTokenizer,
@@ -205,8 +233,7 @@ impl NativeModel {
             } else {
                 None
             },
-            voices: HashMap::new(),
-            voice_order: VecDeque::new(),
+            voices: VoiceStore::new(VOICE_LIMITS),
             tokenizer: TextTokenizer::load(path)?,
             talker: Decoder::load(&w, "talker.model", &c.transformer, true, false)?,
             predictor: Decoder::load(
@@ -296,9 +323,7 @@ impl NativeModel {
     fn instruction_tokens(&self, options: &Options) -> Result<Vec<i32>> {
         super::conditioning::Profile::resolve(&self.config).validate(options)?;
         match super::conditioning::instruction(options) {
-            Some(instruct) => self
-                .tokenizer
-                .encode(&format!("<|im_start|>user\n{instruct}<|im_end|>\n")),
+            Some(instruct) => self.tokenizer.encode_instruction(&instruct),
             None => Ok(vec![]),
         }
     }
@@ -357,7 +382,7 @@ impl NativeModel {
         let bos = self.text_embed(&[self.config.tts_bos_token_id])?;
         let eos = self.text_embed(&[self.config.tts_eos_token_id])?;
         let role = self.text_embed(&self.tokenizer.encode("<|im_start|>assistant\n")?)?;
-        let body = self.tokenizer.encode(text)?;
+        let body = self.tokenizer.encode_text(text)?;
         if body.is_empty() {
             return Err(Error::from_reason("Cannot synthesize empty text"));
         }
@@ -390,7 +415,8 @@ impl NativeModel {
             || audio.iter().any(|x| !x.is_finite())
             || transcript.trim().is_empty()
         {
-            return Err(Error::from_reason(
+            return Err(Error::new(
+                napi::Status::InvalidArg,
                 "Reference audio, sample rate and transcript must be valid and nonempty",
             ));
         }
@@ -407,6 +433,10 @@ impl NativeModel {
             sample_rate,
             self.codec.config.input_sample_rate,
         )?;
+        let key = voice_key(&audio, sample_rate, &transcript);
+        if let Some(id) = self.voices.reuse(key) {
+            return Ok(id);
+        }
         let speaker_audio =
             crate::audio::dsp::resample_mono(&audio, sample_rate, speaker.config.sample_rate);
         super::check_cancelled(cancelled)?;
@@ -426,26 +456,17 @@ impl NativeModel {
             speaker,
             codec_prefix: self.codec.prepare_prefix(&codes, cancelled)?,
             codes,
-            text: self.tokenizer.encode(&transcript)?,
+            text: self.tokenizer.encode_text(&transcript)?,
         };
         super::check_cancelled(cancelled)?;
-        let id = uuid::Uuid::new_v4().to_string();
-        self.voices.insert(id.clone(), condition);
-        self.voice_order.push_back(id.clone());
-        while self.voice_order.len() > MAX_PREPARED_VOICES {
-            if let Some(evicted) = self.voice_order.pop_front() {
-                self.voices.remove(&evicted);
-            } else {
-                break;
-            }
-        }
-        Ok(id)
+        let bytes = condition.nbytes();
+        Ok(self.voices.insert(key, condition, bytes))
+    }
+    pub fn voice_ids(&self) -> impl Iterator<Item = String> + '_ {
+        self.voices.ids()
     }
     pub fn release_voice(&mut self, id: &str) {
-        self.voices.remove(id);
-        if let Some(index) = self.voice_order.iter().position(|v| v == id) {
-            self.voice_order.remove(index);
-        }
+        self.voices.release(id);
     }
     fn condition(&self, options: &Options) -> Result<&VoiceCondition> {
         let id = options
@@ -459,7 +480,7 @@ impl NativeModel {
     fn prepare_icl(&self, text: &str, options: &Options) -> Result<(MxArray, MxArray, MxArray)> {
         let condition = self.condition(options)?;
         let c = &self.config.talker_config;
-        let target = self.tokenizer.encode(text)?;
+        let target = self.tokenizer.encode_text(text)?;
         if target.is_empty() {
             return Err(Error::from_reason("Cannot synthesize empty text"));
         }
@@ -636,17 +657,35 @@ impl NativeModel {
             .collect();
         let mask = MxArray::from_float32(&mask, &[1, c.vocab_size as i64])?;
         // The reference penalizes only the last 64 group-0 tokens; a monotonic
-        // history progressively over-penalizes long utterances.
+        // history progressively over-penalizes long utterances. The history
+        // lives on the device so frame t+1's graph can be built before frame
+        // t's token is read back: empty slots point at an extra padding
+        // column that the slice below drops, so an all-padding history yields
+        // multipliers of exactly one.
         const REPETITION_CONTEXT_SIZE: usize = 64;
-        let mut recent: VecDeque<i32> = VecDeque::with_capacity(REPETITION_CONTEXT_SIZE);
+        let penalty_columns = c.vocab_size as i64 + 1;
+        let mut history = MxArray::from_int32(
+            &vec![c.vocab_size as i32; REPETITION_CONTEXT_SIZE],
+            &[1, REPETITION_CONTEXT_SIZE as i64],
+        )?;
+        let penalty_values = MxArray::from_float32(
+            &vec![penalty as f32; REPETITION_CONTEXT_SIZE],
+            &[1, REPETITION_CONTEXT_SIZE as i64],
+        )?;
+        let penalty_ones = MxArray::ones(&[1, penalty_columns], Some(DType::Float32))?;
+        let zero = MxArray::scalar_float(0.)?;
         let mut pending = Vec::new();
-        // The previous chunk's codec output is submitted without waiting and
-        // read back only after the next frame's eval_arrays commits, so its
-        // GPU work overlaps that frame's host-side graph build.
+        // Chunk PCM is submitted without waiting and read back one frame
+        // later, so its GPU work overlaps that frame's host-side graph build.
         let mut deferred_pcm: Option<MxArray> = None;
         let mut first_pcm_ms = None;
         let mut blocked = 0.;
         let mut reason = "length";
+        let bootstrap_frame =
+            bootstrap_silence_eligible(&options).then_some(self.codec.config.decode_upsample_rate);
+        // A droppable frame 0 is decoded together with frame 1, so frame 1
+        // still leaves in the first chunk.
+        let lead = if bootstrap_frame.is_some() { 2 } else { 1 };
         // Decode-phase allocator ceiling: scoped to the frame loop only
         // (dflash2_decode.rs:1113 discipline) so prompt prefills above stay
         // under the load-time safety cap; a decode step only needs room to
@@ -662,12 +701,73 @@ impl NativeModel {
             crate::cache_limit::decode_cache_limit(tts_step_transient(
                 &self.config,
                 &self.codec.config,
-                chunk_frames,
+                chunk_frames.max(lead),
             )),
         );
+        // Frame t+1's graph is built and submitted before frame t's group-0
+        // token is read, so the host-side build of ~100 layer forwards
+        // overlaps the GPU. The in-flight frame is retired one iteration
+        // later; an EOS there discards the speculative successor, whose only
+        // side effects are KV rows this turn never reads again.
+        let mut in_flight: Option<(MxArray, MxArray)> = None;
+        let mut width = lead;
+        let mut retire = |all: MxArray, token: MxArray, emit_now: bool| -> Result<bool> {
+            // item_at waits for this frame's eval only; the successor is
+            // already queued behind it, so its PCM readback below is cheap.
+            let first = token.item_at_int32(0)?;
+            if let Some(pcm) = deferred_pcm.take() {
+                emit_pcm(
+                    pcm.to_float32()?.to_vec(),
+                    bootstrap_frame,
+                    &started,
+                    &mut first_pcm_ms,
+                    &mut blocked,
+                    &mut emit,
+                )?;
+            }
+            if first == c.codec_eos_token_id {
+                return Ok(false);
+            }
+            if first < 0 || first as usize >= valid {
+                return Err(Error::from_reason("Invalid generated codec ID"));
+            }
+            pending.push(all);
+            if pending.len() >= width {
+                let pcm = self.codec.step(
+                    &cat(&pending.iter().collect::<Vec<_>>(), 1)?,
+                    &mut codec_state,
+                )?;
+                pending.clear();
+                width = chunk_frames;
+                if emit_now {
+                    emit_pcm(
+                        pcm.to_float32()?.to_vec(),
+                        bootstrap_frame,
+                        &started,
+                        &mut first_pcm_ms,
+                        &mut blocked,
+                        &mut emit,
+                    )?;
+                } else {
+                    MxArray::async_eval_arrays(&[&pcm]);
+                    deferred_pcm = Some(pcm);
+                }
+            }
+            Ok(true)
+        };
         for step in 0..max_frames {
             if cancelled.load(Ordering::Acquire) {
                 reason = "cancelled";
+                break;
+            }
+            // The first chunk is retired before the next frame is built so
+            // its PCM is not queued behind another frame: one frame of lost
+            // overlap per segment buys the lowest first-PCM latency.
+            if step == lead
+                && let Some((prev_all, prev_token)) = in_flight.take()
+                && !retire(prev_all, prev_token, true)?
+            {
+                reason = "eos";
                 break;
             }
             let hidden = last(&self.talker.forward(&input, &mut talker_state)?)?;
@@ -677,14 +777,12 @@ impl NativeModel {
                 .reshape(&[1, c.vocab_size as i64])?
                 .astype(DType::Float32)?
                 .add(&mask)?;
-            if penalty != 1. && !recent.is_empty() {
-                let mut multipliers = vec![1f32; c.vocab_size];
-                for &token in &recent {
-                    multipliers[token as usize] = penalty as f32;
-                }
-                let mult = MxArray::from_float32(&multipliers, &[1, c.vocab_size as i64])?;
+            if penalty != 1. {
+                let mult = penalty_ones
+                    .put_along_axis(&history, &penalty_values, 1)?
+                    .slice_axis(1, 0, c.vocab_size as i64)?;
                 logits = logits
-                    .less(&MxArray::scalar_float(0.)?)?
+                    .less(&zero)?
                     .where_(&logits.mul(&mult)?, &logits.div(&mult)?)?;
             }
             let token = draw(&logits, temperature, top_k, top_p, &mut rng)?;
@@ -693,11 +791,16 @@ impl NativeModel {
                 state.kv.reset_keep_capacity();
                 state.position = 0;
             }
+            // The predictor consumes each code's embedding before projection;
+            // the same gathers summed below form the next talker input.
+            let mut embed = self.codec_embedding.forward(&tokens[0])?;
             for i in 0..c.num_code_groups - 1 {
                 let mut x = if i == 0 {
-                    cat(&[&hidden, &self.codec_embedding.forward(&tokens[0])?], 1)?
+                    cat(&[&hidden, &embed], 1)?
                 } else {
-                    self.residual_embeddings[i - 1].forward(&tokens[i])?
+                    let residual = self.residual_embeddings[i - 1].forward(&tokens[i])?;
+                    embed = embed.add(&residual)?;
+                    residual
                 };
                 if let Some(projection) = &self.predictor_projection {
                     x = projection.forward(&x)?;
@@ -708,66 +811,49 @@ impl NativeModel {
                     .reshape(&[1, valid as i64])?;
                 tokens.push(draw(&logits, temperature, top_k, top_p, &mut rng)?);
             }
+            let last_residual = self.residual_embeddings[c.num_code_groups - 2]
+                .forward(&tokens[c.num_code_groups - 1])?;
+            embed = embed.add(&last_residual)?;
             let all = cat(&tokens.iter().collect::<Vec<_>>(), 1)?.reshape(&[
                 1,
                 1,
                 c.num_code_groups as i64,
             ])?;
-            let mut embed = self.codec_embedding.forward(&tokens[0])?;
-            for (layer, token) in self.residual_embeddings.iter().zip(tokens.iter().skip(1)) {
-                embed = embed.add(&layer.forward(token)?)?;
-            }
             let t = if (step as i64) < trailing.shape()?[1] {
                 trailing.slice_axis(1, step as i64, step as i64 + 1)?
             } else {
                 pad.clone()
             };
             input = embed.add(&t)?;
-            MxArray::eval_arrays(&[&all, &input])?;
-            // eval_arrays just waited on the GPU timeline, which already
-            // contains the deferred chunk's commands, so this readback is a
-            // small copy rather than a codec-decode wait.
-            if let Some(pcm) = deferred_pcm.take() {
-                emit_pcm(
-                    pcm.to_float32()?.to_vec(),
-                    &started,
-                    &mut first_pcm_ms,
-                    &mut blocked,
-                    &mut emit,
+            if penalty != 1. {
+                history = cat(
+                    &[
+                        &history.slice_axis(1, 1, REPETITION_CONTEXT_SIZE as i64)?,
+                        &tokens[0].reshape(&[1, 1])?,
+                    ],
+                    1,
                 )?;
             }
-            let first = tokens[0].item_at_int32(0)?;
-            if first == c.codec_eos_token_id {
+            MxArray::async_eval_arrays(&[&all, &input, &history]);
+            if let Some((prev_all, prev_token)) = in_flight.take()
+                && !retire(prev_all, prev_token, false)?
+            {
                 reason = "eos";
                 break;
             }
-            if first < 0 || first as usize >= valid {
-                return Err(Error::from_reason("Invalid generated codec ID"));
-            }
-            if recent.len() == REPETITION_CONTEXT_SIZE {
-                recent.pop_front();
-            }
-            recent.push_back(first);
-            pending.push(all);
-            if pending.len() >= chunk_frames {
-                let pcm = self.codec.step(
-                    &cat(&pending.iter().collect::<Vec<_>>(), 1)?,
-                    &mut codec_state,
-                )?;
-                // Submit without waiting: the readback lands after the next
-                // frame's eval_arrays, overlapping codec decode with that
-                // frame's tape build. A cancel/error drops the lazy array
-                // un-evaluated, matching the old blocking site's drop.
-                MxArray::async_eval_arrays(&[&pcm]);
-                deferred_pcm = Some(pcm);
-                pending.clear();
-            }
+            in_flight = Some((all, tokens.swap_remove(0)));
         }
         if !cancelled.load(Ordering::Acquire) {
+            if let Some((all, token)) = in_flight.take()
+                && !retire(all, token, false)?
+            {
+                reason = "eos";
+            }
             // The deferred chunk (produced first) drains before the tail.
             if let Some(pcm) = deferred_pcm.take() {
                 emit_pcm(
                     pcm.to_float32()?.to_vec(),
+                    bootstrap_frame,
                     &started,
                     &mut first_pcm_ms,
                     &mut blocked,
@@ -783,6 +869,7 @@ impl NativeModel {
                         )?
                         .to_float32()?
                         .to_vec(),
+                    bootstrap_frame,
                     &started,
                     &mut first_pcm_ms,
                     &mut blocked,
@@ -802,20 +889,240 @@ impl NativeModel {
 /// chunk, and charge only the consumer-send wait to `blocked` so backpressure
 /// stays excluded from `synthesis_ms`. The deferred chunk's fp32 readback
 /// happens here; `codec.step` already produces float32 output.
+///
+/// Every chunk goes through here, so the first chunk is checked on every path
+/// that completes it. With `bootstrap_frame` (samples per codec frame), a
+/// silent frame 0 is dropped from a first chunk longer than one frame; frame 0
+/// stays in the codec state.
 fn emit_pcm(
-    audio: Vec<f32>,
+    mut audio: Vec<f32>,
+    bootstrap_frame: Option<usize>,
     started: &Instant,
     first_pcm_ms: &mut Option<f64>,
     blocked: &mut f64,
     emit: &mut impl FnMut(Vec<f32>) -> Result<()>,
 ) -> Result<()> {
     if first_pcm_ms.is_none() {
+        if let Some(frame) = bootstrap_frame
+            && audio.len() > frame
+            && silent_frame(&audio[..frame])
+        {
+            audio.drain(..frame);
+        }
         *first_pcm_ms = Some(started.elapsed().as_secs_f64() * 1000.);
     }
     let wait = Instant::now();
     emit(audio)?;
     *blocked += wait.elapsed().as_secs_f64() * 1000.;
     Ok(())
+}
+
+/// Only voice/language pairs measured to open with a silent bootstrap frame
+/// under checkpoint sampling; widening needs the same corpus measurement.
+fn bootstrap_silence_eligible(options: &Options) -> bool {
+    options.suppress_bootstrap_silence
+        && options.prepared_voice_id.is_none()
+        && super::conditioning::instruction(options).is_none()
+        && options
+            .voice
+            .as_deref()
+            .is_some_and(|voice| voice.eq_ignore_ascii_case("ryan"))
+        && options
+            .language
+            .as_deref()
+            .is_some_and(|language| language.eq_ignore_ascii_case("english"))
+        && options.temperature.is_none()
+        && options.top_k.is_none()
+        && options.top_p.is_none()
+        && options.repetition_penalty.is_none()
+}
+
+/// A NaN sample makes the RMS NaN, so the frame is not silent and is kept.
+fn silent_frame(frame: &[f32]) -> bool {
+    const MAX_RMS: f64 = 0.001;
+    const MAX_PEAK: f64 = 0.0032;
+    let (squares, peak) = frame.iter().fold((0., 0f64), |(squares, peak), &x| {
+        let x = f64::from(x);
+        (squares + x * x, peak.max(x.abs()))
+    });
+    (squares / frame.len() as f64).sqrt() <= MAX_RMS && peak <= MAX_PEAK
+}
+
+#[cfg(test)]
+mod bootstrap_silence_tests {
+    use super::*;
+
+    const FRAME: usize = 1920;
+
+    #[test]
+    fn qwen3_tts_silent_frame_rule() {
+        assert!(silent_frame(&[0.; FRAME]));
+        assert!(silent_frame(&[1.68e-5; FRAME]));
+        assert!(!silent_frame(&[0.05; FRAME]));
+        let mut nan = [0.; FRAME];
+        nan[7] = f32::NAN;
+        assert!(!silent_frame(&nan));
+    }
+
+    #[test]
+    fn qwen3_tts_silent_frame_boundaries() {
+        assert!(silent_frame(&[0.000999; FRAME]));
+        assert!(!silent_frame(&[0.001001; FRAME]));
+        let spike = |value: f32| {
+            let mut frame = [0.; FRAME];
+            frame[FRAME / 2] = value;
+            frame
+        };
+        assert!(silent_frame(&spike(0.0031999)));
+        assert!(silent_frame(&spike(-0.0031999)));
+        assert!(!silent_frame(&spike(0.0032001)));
+        assert!(!silent_frame(&spike(-0.0032001)));
+    }
+
+    #[test]
+    fn qwen3_tts_bootstrap_silence_eligibility() {
+        let parsed: Options = serde_json::from_str("{}").unwrap();
+        assert!(!parsed.suppress_bootstrap_silence);
+        let parsed: Options =
+            serde_json::from_str(r#"{"suppress_bootstrap_silence":true}"#).unwrap();
+        assert!(parsed.suppress_bootstrap_silence);
+        let eligible = Options {
+            voice: Some("ryan".into()),
+            language: Some("english".into()),
+            seed: Some(42),
+            max_frames: Some(512),
+            suppress_bootstrap_silence: true,
+            ..Default::default()
+        };
+        assert!(bootstrap_silence_eligible(&eligible));
+        assert!(bootstrap_silence_eligible(&Options {
+            voice: Some("Ryan".into()),
+            language: Some("English".into()),
+            instruct: Some("  ".into()),
+            ..eligible.clone()
+        }));
+        for ineligible in [
+            Options {
+                suppress_bootstrap_silence: false,
+                ..eligible.clone()
+            },
+            Options {
+                voice: Some("vivian".into()),
+                ..eligible.clone()
+            },
+            Options {
+                voice: None,
+                ..eligible.clone()
+            },
+            Options {
+                language: Some("auto".into()),
+                ..eligible.clone()
+            },
+            Options {
+                language: None,
+                ..eligible.clone()
+            },
+            Options {
+                language: Some("chinese".into()),
+                ..eligible.clone()
+            },
+            Options {
+                instruct: Some("Whisper softly.".into()),
+                ..eligible.clone()
+            },
+            Options {
+                voice_description: Some("A warm voice.".into()),
+                ..eligible.clone()
+            },
+            Options {
+                prepared_voice_id: Some("voice-1".into()),
+                ..eligible.clone()
+            },
+            Options {
+                temperature: Some(0.9),
+                ..eligible.clone()
+            },
+            Options {
+                top_k: Some(50),
+                ..eligible.clone()
+            },
+            Options {
+                top_p: Some(1.),
+                ..eligible.clone()
+            },
+            Options {
+                repetition_penalty: Some(1.05),
+                ..eligible.clone()
+            },
+        ] {
+            assert!(!bootstrap_silence_eligible(&ineligible));
+        }
+    }
+
+    /// Runs `emit_pcm` over `chunks` in order and returns what was sent.
+    fn sent(bootstrap_frame: Option<usize>, chunks: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let mut out = Vec::new();
+        let mut first_pcm_ms = None;
+        let mut blocked = 0.;
+        let started = Instant::now();
+        for chunk in chunks {
+            emit_pcm(
+                chunk.clone(),
+                bootstrap_frame,
+                &started,
+                &mut first_pcm_ms,
+                &mut blocked,
+                &mut |audio| {
+                    out.push(audio);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(first_pcm_ms.is_some(), !chunks.is_empty());
+        out
+    }
+
+    fn frames(values: &[f32]) -> Vec<f32> {
+        values
+            .iter()
+            .flat_map(|&value| [value; FRAME])
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn qwen3_tts_bootstrap_frame_dropped_only_from_a_silent_two_frame_first_chunk() {
+        let silent = frames(&[0., 0.25]);
+        let loud = frames(&[0.25, 0.25]);
+        // [f0 f1] with a silent f0: only f1 is sent.
+        assert_eq!(
+            sent(Some(FRAME), std::slice::from_ref(&silent)),
+            vec![frames(&[0.25])]
+        );
+        // A loud f0 is sent with f1.
+        assert_eq!(
+            sent(Some(FRAME), std::slice::from_ref(&loud)),
+            vec![loud.clone()]
+        );
+        // A first chunk of one frame (f1 = EOS, max_frames 1) is sent unchanged.
+        assert_eq!(sent(Some(FRAME), &[frames(&[0.])]), vec![frames(&[0.])]);
+        // Only the first chunk is checked.
+        assert_eq!(
+            sent(Some(FRAME), &[loud.clone(), silent.clone()]),
+            vec![loud.clone(), silent.clone()]
+        );
+        // Not eligible: nothing is dropped.
+        assert_eq!(
+            sent(None, std::slice::from_ref(&silent)),
+            vec![silent.clone()]
+        );
+        // A NaN in f0 keeps it.
+        let mut nan = silent.clone();
+        nan[3] = f32::NAN;
+        let kept = sent(Some(FRAME), &[nan]);
+        assert_eq!(kept[0].len(), 2 * FRAME);
+        assert!(kept[0][3].is_nan());
+    }
 }
 
 fn draw(
@@ -825,21 +1132,22 @@ fn draw(
     top_p: f64,
     rng: &mut StdRng,
 ) -> Result<MxArray> {
-    let mut x = logits.astype(DType::Float32)?;
     if temperature <= 1e-6 {
-        return x.argmax(-1, Some(true))?.astype(DType::Int32);
+        return logits
+            .astype(DType::Float32)?
+            .argmax(-1, Some(true))?
+            .astype(DType::Int32);
     }
     // Reference order: temperature first, then filters on tempered logits;
     // EOS receives no protection from top_k/top_p.
-    x = x.div_scalar(temperature)?;
-    if top_k > 0 && i64::from(top_k) < x.shape()?[1] {
-        x = apply_top_k(&x, top_k)?;
-    }
     if top_p > 0. && top_p < 1. {
-        x = apply_top_p(&x, top_p)?;
+        let mut x = logits.astype(DType::Float32)?.div_scalar(temperature)?;
+        if top_k > 0 && i64::from(top_k) < x.shape()?[1] {
+            x = apply_top_k(&x, top_k)?;
+        }
+        return sample_logits_array(&apply_top_p(&x, top_p)?, 1., 0, rng);
     }
-    let probabilities = Activations::softmax(&x, Some(-1))?.reshape(&[-1])?;
-    sample_dense_distribution_array(&probabilities, rng)?.reshape(&[1, 1])
+    sample_logits_array(logits, temperature, top_k, rng)
 }
 
 /// First-order estimate of the short-lived bytes one decode step allocates

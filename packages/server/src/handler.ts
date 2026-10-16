@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ResponseStore } from '@mlx-node/core';
 
+import { AudioService, AUDIO_EXPOSE_HEADERS, type AudioServiceOptions } from './audio-service.js';
 import { hasCredential, isAuthorized, sendUnauthorized } from './auth.js';
 import { sendInternalError } from './errors.js';
 import { createHealthReporter, type ServerHealth } from './health.js';
@@ -53,9 +54,14 @@ export interface PublicModelEntry {
   api_backend?: 'messages' | 'responses';
   model_family?: string;
   supports_images?: boolean;
+  modality?: 'audio';
+  task?: 'asr' | 'tts';
+  capabilities?: Record<string, unknown>;
 }
 
 export interface HandlerOptions {
+  audio?: AudioService;
+  audioOptions?: AudioServiceOptions;
   /**
    * Enable CORS headers.
    *
@@ -132,11 +138,17 @@ export function createHandler(
   const responseRetentionSec = options?.responseRetentionSec;
   const idleSweeper = options?.idleSweeper ?? null;
   const resolveModel = options?.resolveModel;
-  const modelWorkCoordinator =
-    options?.modelWorkCoordinator ?? (resolveModel ? new ModelWorkCoordinator(registry.queueDepthLimit) : undefined);
+  const modelWorkCoordinator = options?.modelWorkCoordinator ?? new ModelWorkCoordinator(registry.queueDepthLimit);
   const listModels = options?.listModels;
   const health =
     options?.health ?? createHealthReporter({ registry, idleSweeper, modelWorkCoordinator: modelWorkCoordinator });
+
+  const audio =
+    options?.audio ??
+    new AudioService(
+      { registry, coordinator: modelWorkCoordinator, idleSweeper, resolveModel, listModels },
+      options?.audioOptions,
+    );
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // The guard spans the WHOLE listener, not just `routeRequest`. `http.createServer`
@@ -147,7 +159,8 @@ export function createHandler(
     try {
       if (cors) {
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Expose-Headers', AUDIO_EXPOSE_HEADERS);
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version');
 
         if (req.method === 'OPTIONS') {
@@ -194,7 +207,7 @@ export function createHandler(
         resolveModel,
         listModels,
         modelWorkCoordinator,
-        { health, authenticated },
+        { health, authenticated, audio },
       );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';

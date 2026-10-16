@@ -52,6 +52,11 @@ function listenersOf(signal: NodeJS.Signals): NodeJS.SignalsListener[] {
 }
 
 describe('parseServeArgs', () => {
+  it('validates the global residency policy', () => {
+    expect(parseServeArgs(['--model-residency', 'single']).modelResidency).toBe('single');
+    expect(parseServeArgs(['--model-residency', 'capability']).modelResidency).toBe('capability');
+    expect(() => parseServeArgs(['--model-residency', 'invalid'])).toThrow(/model-residency/);
+  });
   it('defaults every optional flag to undefined so the host applies its own defaults', () => {
     const args = parseServeArgs([]);
     expect(args).toEqual({

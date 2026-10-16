@@ -112,3 +112,7 @@ export type {
 } from './types-anthropic.js';
 
 export { writeSSEEvent, beginSSE, endSSE, activeSSEStreamCount } from './streaming.js';
+
+export { AudioRegistry } from './audio-registry.js';
+export type { AudioModel, AsrModel, AsrStream } from './audio-registry.js';
+export type { AudioServiceOptions } from './audio-service.js';

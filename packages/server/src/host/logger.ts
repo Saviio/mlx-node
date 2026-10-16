@@ -16,6 +16,9 @@ import { createWriteStream, mkdirSync } from 'node:fs';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { join } from 'node:path';
 
+import { audioMetrics, type AudioRequestMetrics } from '../audio-metrics.js';
+import { requestPathname } from '../router.js';
+
 export interface Logger {
   /** Absolute log directory in use. */
   readonly logDir: string;
@@ -209,6 +212,40 @@ function buildTimingSummary(reqBody: string, resBody: string): string {
   return parts.length > 0 ? ` ${parts.join(' ')}` : '';
 }
 
+function buildAudioSummary(metrics: Partial<AudioRequestMetrics>): string {
+  const parts: string[] = [];
+  if (metrics.model) parts.push(`model=${metrics.model}`);
+  if (metrics.task) parts.push(`task=${metrics.task}`);
+  const group = (label: string, fields: [string, string | undefined][]) => {
+    const present = fields.filter((field): field is [string, string] => field[1] !== undefined);
+    if (present.length > 0) parts.push(`${label}(${present.map(([key, value]) => `${key}=${value}`).join(' ')})`);
+  };
+  group('server', [
+    ['upload', fmtMs(metrics.uploadMs)],
+    ['load', fmtMs(metrics.modelLoadMs)],
+    ['queue', fmtMs(metrics.queueWaitMs)],
+    ['wav', fmtMs(metrics.wavReadMs)],
+    ['total', fmtMs(metrics.totalMs)],
+  ]);
+  group('perf', [
+    ['feature', fmtMs(metrics.featureMs)],
+    ['prefill', fmtMs(metrics.prefillMs)],
+    ['decode', fmtMs(metrics.decodeMs)],
+    ['compute', fmtMs(metrics.computeMs)],
+    ['first_pcm', fmtMs(metrics.firstPcmMs)],
+  ]);
+  group('audio', [
+    ['sec', typeof metrics.audioSeconds === 'number' ? metrics.audioSeconds.toFixed(2) : undefined],
+    ['out', typeof metrics.outputTokens === 'number' ? String(metrics.outputTokens) : undefined],
+    ['frames', typeof metrics.pcmFrames === 'number' ? String(metrics.pcmFrames) : undefined],
+    ['rtf', typeof metrics.realtimeFactor === 'number' ? metrics.realtimeFactor.toFixed(3) : undefined],
+  ]);
+  if (metrics.finishReason) parts.push(`stop=${metrics.finishReason}`);
+  if (metrics.state && metrics.state !== 'completed') parts.push(`state=${metrics.state}`);
+  if (metrics.errorCode) parts.push(`error=${metrics.errorCode}`);
+  return parts.length > 0 ? ` ${parts.join(' ')}` : '';
+}
+
 function buildRequestBodySummary(reqBody: string): string {
   const request = parseJsonObject(reqBody);
   if (!request) return '';
@@ -283,12 +320,28 @@ export function attachLogger(server: Server, logDir: string): Logger {
     const start = Date.now();
     const rid = `${start.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
-    writePretty(`[req ${rid}] ${req.method ?? '?'} ${req.url ?? '?'}`);
-
+    const pathname = requestPathname(req);
+    const audio = pathname.startsWith('/v1/audio/');
+    // Raw WAV requests carry prompt text in their query. Audio logs retain
+    // only the route; validated model/phase metadata comes from audioMetrics.
+    const loggedPath = audio ? pathname : req.url;
+    writePretty(`[req ${rid}] ${req.method ?? '?'} ${loggedPath ?? '?'}`);
     let reqBody = '';
-    req.on('data', (chunk: Buffer) => {
-      reqBody += chunk.toString('utf8');
-    });
+    let reqBytes = 0;
+    let resBytes = 0;
+    if (audio) {
+      // Observing read() does not switch a paused upload into flowing mode.
+      // A data listener here would defeat the audio handler's backpressure.
+      const read = req.read.bind(req);
+      req.read = (size?: number) => {
+        const chunk = read(size);
+        if (chunk != null) reqBytes += Buffer.byteLength(chunk);
+        return chunk;
+      };
+    } else
+      req.on('data', (chunk: Buffer) => {
+        reqBody += chunk.toString('utf8');
+      });
 
     // Wrap res.write / res.end to capture streamed chunks (SSE + regular).
     // Preserve original method semantics — we only observe, never transform.
@@ -300,7 +353,9 @@ export function attachLogger(server: Server, logDir: string): Logger {
     (res as any).write = (chunk: unknown, ...rest: unknown[]): boolean => {
       if (chunk != null) {
         try {
-          chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
+          resBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : (chunk as Uint8Array).byteLength;
+          if (!audio)
+            chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
         } catch {
           /* ignore */
         }
@@ -312,7 +367,9 @@ export function attachLogger(server: Server, logDir: string): Logger {
     (res as any).end = (chunk: unknown, ...rest: unknown[]): ServerResponse => {
       if (chunk != null) {
         try {
-          chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
+          resBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : (chunk as Uint8Array).byteLength;
+          if (!audio)
+            chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
         } catch {
           /* ignore */
         }
@@ -341,16 +398,28 @@ export function attachLogger(server: Server, logDir: string): Logger {
       if (emitted || !reqDone || !resDone) return;
       emitted = true;
       const resBody = chunks.join('');
+      const metrics = audio
+        ? {
+            ...audioMetrics(res),
+            state:
+              audioMetrics(res)?.state === 'running'
+                ? res.writableFinished
+                  ? 'completed'
+                  : 'cancelled'
+                : audioMetrics(res)?.state,
+          }
+        : undefined;
       const entry = {
         rid,
         t: new Date(start).toISOString(),
         method: req.method,
-        path: req.url,
+        path: loggedPath,
         reqHeaders: redactRequestHeaders(req.headers),
         reqBody: reqBody || null,
         status: res.statusCode,
         resHeaders: res.getHeaders(),
         resBody,
+        ...(metrics ? { reqBytes, resBytes, audio: true, audioMetrics: metrics } : {}),
         elapsedMs: Date.now() - start,
       };
       try {
@@ -358,9 +427,9 @@ export function attachLogger(server: Server, logDir: string): Logger {
       } catch {
         /* never block the response */
       }
-      const timingSummary = buildTimingSummary(reqBody, resBody);
+      const timingSummary = metrics ? buildAudioSummary(metrics) : buildTimingSummary(reqBody, resBody);
       writePretty(
-        `[req ${rid}] ${res.statusCode} ${req.method ?? '?'} ${req.url ?? '?'} ${entry.elapsedMs}ms ${resBody.length}B${timingSummary}`,
+        `[req ${rid}] ${res.statusCode} ${req.method ?? '?'} ${loggedPath ?? '?'} ${entry.elapsedMs}ms ${resBody.length}B${timingSummary}`,
       );
     };
     req.on('end', () => {

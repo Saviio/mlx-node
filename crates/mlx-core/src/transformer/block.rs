@@ -124,7 +124,7 @@ impl TransformerBlock {
         // For cached inference, use component-based forward (cache handling is complex)
         // For non-cached (training/prefill), use fused C++ implementation
         if cache.is_some() {
-            return self.forward_with_cache(x, mask, cache);
+            return self.forward_with_cache(x, mask, cache, true);
         }
 
         // Use fused C++ implementation for non-cached forward
@@ -174,16 +174,30 @@ impl TransformerBlock {
         MxArray::from_handle(handle, "fused_transformer_block_forward")
     }
 
+    /// Cached `forward` that never evaluates inside the block, so a caller
+    /// can build many layers as one lazy graph.
+    pub(crate) fn forward_cached_without_attention_eval(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: &mut KVCache,
+    ) -> Result<MxArray> {
+        self.forward_with_cache(x, mask, Some(cache), false)
+    }
+
     /// Forward pass with KV cache (component-based for complex cache handling)
     fn forward_with_cache(
         &self,
         x: &MxArray,
         mask: Option<&MxArray>,
         cache: Option<&mut KVCache>,
+        eval_attention: bool,
     ) -> Result<MxArray> {
         // 1. Self-attention with pre-norm and residual
         let normed = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward(&normed, mask, cache)?;
+        let attn_out =
+            self.self_attn
+                .forward_with_attention_eval(&normed, mask, cache, eval_attention)?;
         let h = x.add(&attn_out)?; // Residual connection
 
         // 2. MLP with pre-norm and residual (uses fused MLP internally)
