@@ -219,7 +219,10 @@ Model controls remain in extension objects:
 defaults to 640 ms (the SDK's non-streaming default); `pcm` keeps 160 ms. Each
 segment's first chunk is one 80 ms codec frame.
 
-`max_duration_seconds` limits **each generated segment**, not the whole request.
+A JSON `input` is synthesized as one sequence, so `max_duration_seconds`
+(0.1..163.84, default 163.84 = 2,048 codec frames) limits the whole request. On
+the NDJSON text-stream route it limits **each committed segment** (one per
+sentence), and `max_segment_graphemes` and `queued_segments` apply only there.
 Truncation is reported as `finish_reason:length` (normal TTS completion is `eos`).
 Defaults otherwise follow the SDK. Unknown nested controls are rejected.
 

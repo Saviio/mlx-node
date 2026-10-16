@@ -69,7 +69,7 @@ export function speechRequest(body: Record<string, unknown>, inputStream: boolea
     [sampling, 'top_k', 'topK', 0, 0x7fffffff, true],
     [sampling, 'top_p', 'topP', 0, 1],
     [sampling, 'repetition_penalty', 'repetitionPenalty', 0.001, 100],
-    [sampling, 'max_duration_seconds', 'maxDurationSeconds', 0.1, 120],
+    [sampling, 'max_duration_seconds', 'maxDurationSeconds', 0.1, 163.84],
     [stream, 'chunk_duration_ms', 'chunkDurationMs', 1, 10000],
     [stream, 'audio_buffer_seconds', 'audioBufferSeconds', 0.01, 10],
     [stream, 'max_segment_graphemes', 'maxSegmentGraphemes', 1, 4096, true],

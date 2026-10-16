@@ -123,7 +123,7 @@ describe('Qwen3 backend adapter', () => {
         seed: 534,
         chunk_frames: 2, // 160 ms / 80 ms frames
         buffer_chunks: 6, // 1 s buffer / 160 ms chunks
-        max_frames: 1500, // default 120 s / 80 ms frames
+        max_frames: 2048, // default when maxDurationSeconds is unset
       },
     ]);
   });

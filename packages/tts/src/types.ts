@@ -64,7 +64,11 @@ export interface TtsOptions {
   topK?: number;
   topP?: number;
   repetitionPenalty?: number;
-  /** Per-segment generation limit in seconds (default 120); truncation reports `finishReason: 'length'`. */
+  /**
+   * Per-segment generation limit in seconds (default 2048 codec frames, 163.84 s for Qwen3-TTS);
+   * a string input is one segment.
+   * Truncation reports `finishReason: 'length'`.
+   */
   maxDurationSeconds?: number;
   chunkDurationMs?: number;
   audioBufferSeconds?: number;

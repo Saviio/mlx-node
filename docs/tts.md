@@ -63,7 +63,9 @@ Reference length is validated against the encoder's configured context capacity
 before resampling or inference; it is not silently truncated.
 
 `synthesize` collects the same stream into one `Float32Array`. Use streaming for
-long output. PCM is interleaved, `startSample` counts audio frames across all text
+long output. A string input is synthesized as one sequence, in one segment; its
+sentences are not restarted. Incremental input (below) commits one segment per
+sentence. PCM is interleaved, `startSample` counts audio frames across all text
 segments, and `segmentIndex` identifies the committed text segment.
 
 ## Incremental text and lifecycle
@@ -84,7 +86,8 @@ waits on one generated frame only. Wider codec steps cost less per frame; their 
 is not bit-identical to 160 ms chunks. Native
 PCM buffering is bounded to about one second and text buffering to two segments.
 `chunkDurationMs`, `audioBufferSeconds`, `queuedSegments` and
-`maxSegmentGraphemes` configure these policies. Slow consumers apply backpressure.
+`maxSegmentGraphemes` configure these policies; the last two apply to incremental
+input only. Slow consumers apply backpressure.
 
 One model accepts one active synthesis or voice preparation. A concurrent request
 fails with a busy error; a concurrent voice release is queued instead and
@@ -98,10 +101,10 @@ An upstream iterator blocked on external I/O is not awaited during cancellation.
 Model disposal also cancels voice preparation at computation-stage boundaries;
 an already running MLX evaluation completes before its resources are released.
 
-`maxDurationSeconds` is a per-segment limit; reaching it reports `finishReason:
-'length'`. The SDK and CLI default it to 120 seconds (1,500 codec frames); that
-ceiling also bounds the talker KV reservation to ~160 MiB per segment instead of
-the checkpoint generation limit (~0.9 GiB at 8,192 frames). Direct native callers
+`maxDurationSeconds` is a per-segment limit, so it bounds a whole string input;
+reaching it reports `finishReason: 'length'`. When it is unset the SDK and CLI
+use 2,048 codec frames (163.84 seconds). Native code reserves talker KV for at
+most 2,048 frames (~224 MiB) and grows past that in slabs. Direct native callers
 that omit `max_frames` still use the checkpoint generation configuration.
 Sampling options preserve the checkpoint defaults unless explicitly overridden.
 

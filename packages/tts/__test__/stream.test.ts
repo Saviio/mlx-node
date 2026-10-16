@@ -288,9 +288,30 @@ describe('session lifecycle', () => {
     await model.synthesize('Again.', { voice: 'voice' });
     await model.dispose();
   });
+  it('synthesizes a string input as one sequence', async () => {
+    const { model, submitted } = fake();
+    const text = '你好。再见。 It costs 12.50 dollars, then more; and that is all. ';
+    const stream = model.synthesizeStream(text, { voice: 'voice', maxSegmentGraphemes: 4 });
+    const segments = [];
+    for await (const c of stream) segments.push(c.segmentIndex);
+    expect(submitted).toEqual([text]);
+    expect(segments).toEqual([0, 0]);
+    expect(await stream.completed).toMatchObject({ segments: 1, audioSeconds: 0.4 });
+    const blank = await model.synthesize(' \n ', { voice: 'voice' });
+    expect(blank.samples.length).toBe(0);
+    expect(blank.stats.segments).toBe(0);
+    expect(submitted).toEqual([text]);
+    await model.dispose();
+  });
   it('maintains sample positions across segments and awaits completion', async () => {
     const { model } = fake();
-    const stream = model.synthesizeStream('你好。再见。', { voice: 'voice' });
+    const stream = model.synthesizeStream(
+      (async function* () {
+        yield '你好。';
+        yield '再见。';
+      })(),
+      { voice: 'voice' },
+    );
     const positions = [];
     for await (const c of stream) positions.push([c.startSample, c.segmentIndex]);
     expect(positions).toEqual([

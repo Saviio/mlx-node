@@ -294,7 +294,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
         }
         try {
           if (typeof input === 'string') {
-            await submit(input, true);
+            if (input.trim()) await queue.push(Object.freeze({ text: input, instruct: currentInstruction }));
           } else {
             source = input[Symbol.asyncIterator]();
             while (!controller.signal.aborted) {
