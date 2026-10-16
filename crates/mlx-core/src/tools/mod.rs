@@ -20,11 +20,11 @@ use chatml::classify_and_parse_tool_call;
 pub(crate) use chatml::parse_json_tool_call;
 #[cfg(test)]
 use lfm2::MAX_PY_LITERAL_DEPTH;
-use lfm2::{LFM2_TOOL_CALL_START, parse_lfm2_tool_calls};
+use lfm2::parse_lfm2_tool_calls;
 pub(crate) use markup::{CHATML_MARKUP, MarkupSpec, extract_tag_blocks, strip_tag_blocks};
 pub use reasoning::{
-    count_reasoning_tokens, has_think_end_token, has_thinking, parse_generation_output,
-    parse_thinking, split_at_think_end, strip_reasoning_preserving_tools,
+    count_reasoning_tokens, has_think_end_token, parse_generation_output, parse_thinking,
+    split_at_think_end, strip_reasoning_preserving_tools,
 };
 pub(crate) use reasoning::{split_at_think_end_with, strip_reasoning_preserving_tools_with};
 
@@ -172,25 +172,6 @@ pub(crate) fn parse_tool_calls_with(
     (cleaned_text, tool_calls)
 }
 
-/// Check if text contains any tool call tags
-pub fn has_tool_calls(text: &str) -> bool {
-    has_tool_calls_with(text, CHATML_MARKUP) || text.contains(LFM2_TOOL_CALL_START)
-}
-
-/// [`has_tool_calls`] parameterized by the family's tool-tag pair.
-pub(crate) fn has_tool_calls_with(text: &str, spec: MarkupSpec) -> bool {
-    text.contains(spec.tool_open)
-}
-
-/// Result of parsing tool calls from text
-#[napi(object)]
-pub struct ParseToolCallsResult {
-    /// Cleaned text with tool_call tags removed
-    pub text: String,
-    /// Parsed tool calls
-    pub tool_calls: Vec<ToolCallResult>,
-}
-
 /// Structured completion information aligned with ChatResult.
 /// Contains pre-parsed tool calls, thinking, and clean text.
 #[napi(object)]
@@ -220,16 +201,6 @@ pub struct RewardOutput {
     pub prompt: String,
     /// Structured completion data aligned with ChatResult
     pub completion: CompletionInfo,
-}
-
-/// Parse tool calls from text (NAPI export)
-#[napi]
-pub fn parse_tool_calls_from_text(text: String) -> ParseToolCallsResult {
-    let (cleaned_text, tool_calls) = parse_tool_calls(&text);
-    ParseToolCallsResult {
-        text: cleaned_text,
-        tool_calls,
-    }
 }
 
 /// Build RewardOutput array from generation results.

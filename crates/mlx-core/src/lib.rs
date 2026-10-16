@@ -11,7 +11,8 @@
 pub mod array;
 pub mod audio;
 pub mod autograd;
-pub mod benchmarks;
+#[cfg(test)]
+mod benchmarks;
 pub mod cache_limit;
 pub mod calibration;
 pub mod cold_tier;
@@ -21,7 +22,6 @@ pub mod convert_gemma_import;
 pub mod dataset;
 pub mod decode_profiler;
 pub mod engine;
-pub mod gradients;
 pub mod grpo;
 pub(crate) mod inference_trace;
 pub mod model_thread;
@@ -38,7 +38,6 @@ pub mod response_store;
 pub mod sampling;
 pub mod sft;
 pub mod stream;
-pub mod tensor;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tokenizer;

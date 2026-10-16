@@ -1053,8 +1053,8 @@ impl LayerKVPool {
     /// The returned `Buffer` is a clone of the pool's handle (a Metal
     /// retain): it stays valid even if a later [`Self::grow_to`] swaps the
     /// pool's buffers, but it then addresses the *old*, smaller allocation.
-    #[cfg(target_os = "macos")]
-    pub fn key_cache(&self, layer_idx: u32) -> Option<Buffer> {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn key_cache(&self, layer_idx: u32) -> Option<Buffer> {
         self.inner_read()
             .layers
             .get(layer_idx as usize)
@@ -1063,8 +1063,8 @@ impl LayerKVPool {
 
     /// Get the value cache buffer for a layer. `None` if `layer_idx` is
     /// out of range. Same retain semantics as [`Self::key_cache`].
-    #[cfg(target_os = "macos")]
-    pub fn value_cache(&self, layer_idx: u32) -> Option<Buffer> {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn value_cache(&self, layer_idx: u32) -> Option<Buffer> {
         self.inner_read()
             .layers
             .get(layer_idx as usize)
@@ -1643,10 +1643,8 @@ impl LayerKVPool {
             q_stride,
             kv_block_stride,
             kv_head_stride,
-            // Per-layer FP8 K/V scales threaded from `KvScaleManager` via
-            // `PagedKVCacheAdapter::read_layer_scales`, mirroring the write
-            // path in `LayerKVPool::write_kv`. Caller passes 1.0 when no
-            // manager is configured (non-FP8 path).
+            // Per-layer FP8 K/V scales, mirroring the write path in
+            // `LayerKVPool::write_kv`. `PagedKVCacheAdapter` passes 1.0.
             k_scale,
             v_scale,
             // 0 means full context; positive values mask K/V older than

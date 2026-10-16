@@ -768,7 +768,6 @@ export declare class MuseGlimmerModel {
   /** Resolved tokenizer/config directory, including the native cache after a GGUF load. */
   modelAssetsPath(): string;
   hasMtpWeights(): boolean;
-  autoEnablesMtp(): boolean;
   hasBlockPagedCache(): boolean;
   maxConcurrentSequences(): number;
   /**
@@ -901,7 +900,6 @@ export declare class MxArray {
    */
   copy(): MxArray;
   eval(): void;
-  evalAsync(): Promise<undefined>;
   size(): bigint;
   ndim(): number;
   shape(): BigInt64Array;
@@ -912,16 +910,6 @@ export declare class MxArray {
    * Note: axis is u32 because NAPI doesn't support usize, but internally converted to usize
    */
   shapeAt(axis: number): number;
-  /**
-   * Get batch and sequence length for 2D arrays (common pattern in transformers)
-   * More efficient than calling shape() and extracting dimensions
-   */
-  getBatchSeqLen(): Array<number>;
-  /**
-   * Get batch, sequence length, and hidden size for 3D arrays (common pattern in transformers)
-   * More efficient than calling shape() and extracting dimensions
-   */
-  getBatchSeqHidden(): Array<number>;
   dtype(): DType;
   /**
    * Copy entire array from GPU to CPU as Float32Array
@@ -1001,9 +989,6 @@ export declare class MxArray {
   power(other: MxArray): MxArray;
   sin(): MxArray;
   cos(): MxArray;
-  tan(): MxArray;
-  sinh(): MxArray;
-  cosh(): MxArray;
   tanh(): MxArray;
   /** Error function: erf(x) = (2/sqrt(pi)) * integral(0..x, exp(-t^2) dt) */
   erf(): MxArray;
@@ -1013,9 +998,6 @@ export declare class MxArray {
   floorDivide(other: MxArray): MxArray;
   remainder(other: MxArray): MxArray;
   reciprocal(): MxArray;
-  arcsin(): MxArray;
-  arccos(): MxArray;
-  arctan(): MxArray;
   log10(): MxArray;
   log2(): MxArray;
   log1p(): MxArray;
@@ -1042,7 +1024,6 @@ export declare class MxArray {
   isfinite(): MxArray;
   static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray;
   static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray;
-  static randomBernoulli(shape: BigInt64Array, prob: number): MxArray;
   static randint(shape: BigInt64Array, low: number, high: number): MxArray;
   /**
    * Sample from categorical distribution
@@ -1297,12 +1278,6 @@ export declare class OutputStore {
    * Returns pre-computed aggregates for restoring TUI state on resume.
    */
   getRunAggregates(runId: string): Promise<RunAggregates>;
-  /**
-   * Get recent generations for sample panel restoration
-   *
-   * Returns generations ordered by step DESC, reward DESC (most recent high-reward first).
-   */
-  getRecentGenerations(runId: string, limit: number): Promise<Array<GenerationRecord>>;
   /** Get store configuration */
   get config(): OutputStoreConfig;
   /** Record from RewardOutput JSON (direct integration with training engine) */
@@ -1337,19 +1312,6 @@ export declare class OutputStore {
   ): Promise<Array<StepSummary>>;
   /** Get all generations for a step */
   getGenerations(runId: string, step: number): Promise<Array<GenerationWithToolCalls>>;
-  /** Get top/bottom generations by reward */
-  getGenerationsByReward(
-    runId: string,
-    topN?: number | undefined | null,
-    bottomN?: number | undefined | null,
-    stepRange?: Array<number> | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Get generations with specific finish reason */
-  getGenerationsByFinishReason(
-    runId: string,
-    finishReason: string,
-    limit?: number | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
   /** Get generations containing tool calls */
   getGenerationsWithToolCalls(
     runId: string,
@@ -1366,10 +1328,6 @@ export declare class OutputStore {
   ): Promise<Array<GenerationWithToolCalls>>;
   /** Get reward distribution statistics */
   getRewardStats(runId: string, stepRange?: Array<number> | undefined | null): Promise<RewardStats>;
-  /** Export to JSONL file */
-  exportJsonl(runId: string, outputPath: string, includeToolCalls?: boolean | undefined | null): Promise<number>;
-  /** Execute raw SQL query (for advanced users) */
-  queryRaw(sql: string): Promise<string>;
 }
 
 export declare class PcmPlayer {
@@ -2152,20 +2110,6 @@ export declare class Qwen3Model {
    * * `save_path` - Directory to save the model
    */
   saveModel(savePath: string): Promise<undefined>;
-  /**
-   * Validate that a set of parameters has all required weights with correct shapes
-   *
-   * This is useful for validating parameters before loading them into a model,
-   * or for checking that saved weights are valid before training.
-   *
-   * # Arguments
-   * * `params` - HashMap of parameter names to MxArray values
-   *
-   * # Returns
-   * * Ok(()) if all validations pass
-   * * Err with descriptive message if validation fails
-   */
-  validateParameters(params: Record<string, MxArray>): void;
 }
 
 /** Qwen3 Tokenizer class with NAPI bindings */
@@ -2497,89 +2441,6 @@ export declare class SftTrainingEngine {
    * correction step separately.
    */
   restoreState(step: number, epoch: number): void;
-  /**
-   * Get the underlying Qwen3 model for checkpointing
-   *
-   * NOTE: With the model thread architecture, direct model access is no longer
-   * supported. Use save_checkpoint() on the model directly instead.
-   */
-  getModel(): Qwen3Model;
-  /**
-   * Get the underlying Qwen3.5 dense model for checkpointing
-   *
-   * NOTE: With the model thread architecture, direct model access is no longer
-   * supported. Use save_checkpoint() on the model directly instead.
-   */
-  getQwen35Model(): Qwen35Model;
-  /**
-   * Get the underlying Qwen3.5 MoE model for checkpointing
-   *
-   * NOTE: With the model thread architecture, direct model access is no longer
-   * supported. Use save_checkpoint() on the model directly instead.
-   */
-  getQwen35MoeModel(): Qwen35MoeModel;
-}
-
-/**
- * A tensor that tracks gradients for automatic differentiation
- *
- * This is a wrapper around MxArray that provides:
- * - Gradient tracking
- * - Automatic gradient accumulation
- * - Integration with manual backward passes
- */
-export declare class Tensor {
-  /** Create a tensor from float32 data */
-  static fromFloat32(data: Float32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor;
-  /** Create a tensor from int32 data */
-  static fromInt32(data: Int32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor;
-  /** Get the shape of the underlying data */
-  dataShape(): BigInt64Array;
-  /** Get the shape of the gradient (if it exists) */
-  gradShape(): BigInt64Array | null;
-  /** Check if gradient exists */
-  hasGrad(): boolean;
-  /** Check if this tensor requires gradients */
-  get requiresGrad(): boolean;
-  /** Set whether this tensor requires gradients */
-  set requiresGrad(requiresGrad: boolean);
-  /** Zero out the gradient */
-  zeroGrad(): void;
-  /**
-   * Accumulate gradient
-   *
-   * If gradient already exists, add to it. Otherwise, set it.
-   * Note: This takes ownership of the gradient array.
-   */
-  accumulateGrad(grad: MxArray): void;
-  /** Get the shape of the tensor */
-  shape(): BigInt64Array;
-  /** Convert data to Float32 array */
-  toFloat32(): Float32Array;
-  /** Convert gradient to Float32 array (if it exists) */
-  gradToFloat32(): Float32Array | null;
-  /** Convert to Int32 array */
-  toInt32(): Int32Array;
-  /**
-   * Detach this tensor from the computation graph
-   *
-   * Returns a new tensor with the same data but no gradient tracking
-   */
-  detach(): Tensor;
-  /** Create a tensor of zeros */
-  static zeros(
-    shape: BigInt64Array,
-    dtype?: DType | undefined | null,
-    requiresGrad?: boolean | undefined | null,
-  ): Tensor;
-  /** Create a tensor of ones */
-  static ones(
-    shape: BigInt64Array,
-    dtype?: DType | undefined | null,
-    requiresGrad?: boolean | undefined | null,
-  ): Tensor;
-  /** Evaluate the underlying array */
-  eval(): void;
 }
 
 /**
@@ -2606,19 +2467,6 @@ export declare class TextDetModel {
    * * Vec of TextBox with bounding boxes and confidence scores
    */
   detect(imageData: Buffer, threshold?: number | undefined | null): Array<TextBox>;
-  /**
-   * Detect text lines from raw RGB pixel data.
-   *
-   * # Arguments
-   * * `rgb_data` - Raw RGB pixel data
-   * * `width` - Image width
-   * * `height` - Image height
-   * * `threshold` - Optional detection threshold (default from config)
-   *
-   * # Returns
-   * * Vec of TextBox with bounding boxes and confidence scores
-   */
-  detectCrop(rgbData: Uint8Array, width: number, height: number, threshold?: number | undefined | null): Array<TextBox>;
 }
 
 /**
@@ -2655,18 +2503,6 @@ export declare class TextRecModel {
    * * Vec of RecResult with recognized text and confidence scores
    */
   recognizeBatch(images: Array<Buffer>): Array<RecResult>;
-  /**
-   * Recognize text from raw RGB crop data.
-   *
-   * # Arguments
-   * * `rgb_data` - Raw RGB pixel data of a cropped text line
-   * * `width` - Image width
-   * * `height` - Image height
-   *
-   * # Returns
-   * * RecResult with recognized text and confidence score
-   */
-  recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
 }
 
 export declare class TtsNativeModel {
@@ -3404,13 +3240,6 @@ export interface ColdSidecarStats {
    * satisfied by the replay.
    */
   installed: number;
-  /**
-   * Restores a family THREW AWAY after the walk served them, restarting the
-   * turn cold. Unlike `ColdCacheStats.restoreDeclines` this one comes AFTER
-   * real `coldHits` and `coldBytesRestored`, so the turn looks like it
-   * reused a prefix right up to the point where it recomputed all of it.
-   */
-  restoreSuppressed: number;
 }
 
 /**
@@ -3758,26 +3587,6 @@ export interface FunctionParameters {
   /** List of required parameter names */
   required?: Array<string>;
 }
-
-/**
- * How many GDN prefix checkpoints the native store holds across all owners
- * ([`GDN_PREFIX_CHECKPOINT_LIMIT`]), exposed for the same reason
- * [`cold_restore_families`] is: it is one half of a cross-language invariant
- * and nothing else carries it over the boundary.
- *
- * The other half is `MAX_CONCURRENCY` in
- * `packages/agent/src/extensions/subagent.ts`. The store's demand is
- * `MAX_CONCURRENCY + 1` — one owner per concurrent child loop plus the root
- * session — and the cliff sits exactly one owner past the cap, where every
- * owner holds a single entry and the store is still over it, so each publish
- * takes somebody's last checkpoint. `retention_sim` measures that as 0 blind
- * turns at five owners and 28 of 40 at six.
- *
- * No Rust gate can see a TypeScript-only edit, so raising the fleet alone
- * would land in that regime with every Rust gate still green.
- * `packages/agent/__test__/gdn-checkpoint-capacity.test.ts` is what stops it.
- */
-export declare function gdnPrefixCheckpointLimit(): number;
 
 /**
  * Gemma 4 model configuration (dense variant).
@@ -4898,17 +4707,6 @@ export interface ParserConfig {
   collapseEmptyRows?: boolean;
 }
 
-/** Parse tool calls from text (NAPI export) */
-export declare function parseToolCallsFromText(text: string): ParseToolCallsResult;
-
-/** Result of parsing tool calls from text */
-export interface ParseToolCallsResult {
-  /** Cleaned text with tool_call tags removed */
-  text: string;
-  /** Parsed tool calls */
-  toolCalls: Array<ToolCallResult>;
-}
-
 /** Parse VLM output into structured document */
 export declare function parseVlmOutput(text: string): ParsedDocument;
 
@@ -5124,32 +4922,6 @@ export interface QianfanOcrConfig {
   maxDynamicPatch: number;
   minDynamicPatch: number;
 }
-
-/** Microbench result for the production quantized qmv dispatch path. */
-export interface QmvQuantizedMicrobenchResult {
-  /** Median `quantized_matmul` wall-clock per call, in nanoseconds. */
-  medianNs: number;
-  /** A tiny materialized checksum of the final output, used to keep the call live. */
-  checksum: number;
-}
-
-/**
- * Run the production quantized-qmv microbench in the current process.
- *
- * To compare `MLX_MTP_SMALL_M_QMV=0` versus `1`, call this from separate
- * processes. MLX caches the env-backed dispatch predicate statically.
- */
-export declare function quantizedQmvMicrobench(
-  k: number,
-  n: number,
-  m: number,
-  groupSize: number,
-  bits: number,
-  mode: string,
-  dtype: DType,
-  warmup?: number | undefined | null,
-  iters?: number | undefined | null,
-): QmvQuantizedMicrobenchResult;
 
 /**
  * Qwen3.5 model configuration (dense variant).

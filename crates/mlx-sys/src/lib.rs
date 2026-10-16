@@ -102,14 +102,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_sub_scalar(handle: *mut mlx_array, value: f64) -> *mut mlx_array;
     pub fn mlx_array_div_scalar(handle: *mut mlx_array, value: f64) -> *mut mlx_array;
     pub fn mlx_array_matmul(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
-    // Fused addmm: D = beta * C + alpha * (A @ B)
-    pub fn mlx_array_addmm(
-        c: *mut mlx_array,
-        a: *mut mlx_array,
-        b: *mut mlx_array,
-        alpha: f32,
-        beta: f32,
-    ) -> *mut mlx_array;
 
     // Shape-independent activation fusion; projection formats remain independent.
     pub fn mlx_swiglu_compiled(gate: *mut mlx_array, up: *mut mlx_array) -> *mut mlx_array;
@@ -250,13 +242,6 @@ unsafe extern "C-unwind" {
         ndim: usize,
     ) -> *mut mlx_array;
     // Optimized slice assignment functions - no shape allocation
-    pub fn mlx_array_slice_assign_axis(
-        src_handle: *mut mlx_array,
-        update_handle: *mut mlx_array,
-        axis: usize,
-        start: i64,
-        end: i64,
-    ) -> *mut mlx_array;
     pub fn mlx_array_slice_assign_axis_inplace(
         src_handle: *mut mlx_array,
         update_handle: *mut mlx_array,
@@ -305,17 +290,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_ndim(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_shape(handle: *mut mlx_array, out: *mut i64);
     pub fn mlx_array_shape_at(handle: *mut mlx_array, axis: usize) -> i64;
-    pub fn mlx_array_get_batch_seq_len(
-        handle: *mut mlx_array,
-        batch: *mut i64,
-        seq_len: *mut i64,
-    ) -> bool;
-    pub fn mlx_array_get_batch_seq_hidden(
-        handle: *mut mlx_array,
-        batch: *mut i64,
-        seq_len: *mut i64,
-        hidden: *mut i64,
-    ) -> bool;
     pub fn mlx_array_item_at_int32(handle: *mut mlx_array, index: usize, out: *mut i32) -> bool;
     pub fn mlx_array_item_at_uint32(handle: *mut mlx_array, index: usize, out: *mut u32) -> bool;
     pub fn mlx_array_item_at_float32(handle: *mut mlx_array, index: usize, out: *mut f32) -> bool;
@@ -384,7 +358,6 @@ unsafe extern "C-unwind" {
         std: f32,
         dtype: i32,
     ) -> *mut mlx_array;
-    pub fn mlx_array_random_bernoulli(shape: *const i64, ndim: usize, prob: f32) -> *mut mlx_array;
     pub fn mlx_array_randint(shape: *const i64, ndim: usize, low: i32, high: i32)
     -> *mut mlx_array;
     pub fn mlx_array_categorical(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
@@ -395,14 +368,6 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
 
     // Gradient computation (callback-based - this is the MLX-native approach)
-    pub fn mlx_compute_gradients(
-        loss_fn: LossFunctionPtr,
-        context: *mut std::os::raw::c_void,
-        input_handles: *const *mut mlx_array,
-        input_count: usize,
-        output_handles: *mut *mut mlx_array,
-    ) -> usize;
-
     pub fn mlx_value_and_gradients(
         loss_fn: LossFunctionPtr,
         context: *mut std::os::raw::c_void,
@@ -486,11 +451,6 @@ unsafe extern "C-unwind" {
         constant_value: f32,
     ) -> *mut mlx_array;
     pub fn mlx_array_roll(handle: *mut mlx_array, shift: i32, axis: i32) -> *mut mlx_array;
-    pub fn mlx_array_split(
-        handle: *mut mlx_array,
-        indices_or_sections: i32,
-        axis: i32,
-    ) -> *mut mlx_array;
     pub fn mlx_array_split_multi(
         handle: *mut mlx_array,
         indices_or_sections: i32,
@@ -535,9 +495,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_power(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_sin(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_cos(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_tan(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_sinh(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_cosh(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_tanh(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_erf(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_floor(handle: *mut mlx_array) -> *mut mlx_array;
@@ -546,9 +503,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_floor_divide(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_remainder(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_reciprocal(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_arcsin(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_arccos(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_arctan(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log10(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log2(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log1p(handle: *mut mlx_array) -> *mut mlx_array;
@@ -697,7 +651,6 @@ unsafe extern "C-unwind" {
         has_array_mask: bool,
         out_would_use: *mut bool,
     ) -> i32;
-    pub fn mlx_metal_device_info() -> *const std::os::raw::c_char;
     pub fn mlx_set_wired_limit(limit: u64, out_old_limit: *mut u64) -> i32;
     pub fn mlx_get_peak_memory(out_value: *mut u64) -> i32;
     pub fn mlx_get_active_memory(out_value: *mut u64) -> i32;
@@ -1156,32 +1109,6 @@ unsafe extern "C-unwind" {
         num_kv_heads: i32,
         head_size: i32,
         kv_dtype: u8,
-    ) -> *mut mlx_array;
-
-    /// Route-hinted sibling of `mlx_paged_attention_forward`. Route 0 keeps
-    /// automatic selection, 1 requests the validated grouped D512 kernel,
-    /// 2 forces generic V1/V2, and 3 requests grouped BF16 D128 decode.
-    /// Route 1 retains its legacy "staged" identifier but selects the
-    /// canonical direct-read pipeline.
-    /// The cache layout is unchanged for every route.
-    #[allow(clippy::too_many_arguments)]
-    pub fn mlx_paged_attention_forward_with_route(
-        q: *mut mlx_array,
-        k_pool: *mut mlx_array,
-        v_pool: *mut mlx_array,
-        block_table: *mut mlx_array,
-        seq_lens: *mut mlx_array,
-        k_scale: *mut mlx_array,
-        v_scale: *mut mlx_array,
-        scale: f32,
-        softcap: f32,
-        sliding_window: i32,
-        block_size: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_size: i32,
-        kv_dtype: u8,
-        route_hint: u8,
     ) -> *mut mlx_array;
 
     /// Per-call grouped partition count, captured in the lazy primitive.
@@ -1693,11 +1620,6 @@ unsafe extern "C-unwind" {
     /// - `-4` — run matched no-write baseline (write didn't land)
     pub fn mlx_paged_phase2_stress_mixed_graph_v(iterations: i32, seq_len: i32) -> i32;
 
-    /// Backward-compatible default-V1 wrapper around
-    /// `mlx_paged_phase2_stress_mixed_graph_v` with `seq_len=8`. Same
-    /// return-code contract.
-    pub fn mlx_paged_phase2_stress_mixed_graph(iterations: i32) -> i32;
-
     /// Compare two `PagedAttentionVarlen` primitives via `is_equivalent`.
     /// Returns 1 iff equivalent, 0 otherwise.
     #[allow(clippy::too_many_arguments)]
@@ -1776,19 +1698,9 @@ unsafe extern "C-unwind" {
         max_context_len: i32,
     ) -> i32;
 
-    /// Reset/read the environment-gated experimental Gemma 4 grouped-route
-    /// test probe.
-    pub fn mlx_paged_grouped_gemma4_test_probe_reset();
-    pub fn mlx_paged_grouped_gemma4_test_probe_count() -> u64;
-
     /// Reset/read the geometry-based grouped D512 route probe.
     pub fn mlx_paged_grouped_d512_test_probe_reset();
     pub fn mlx_paged_grouped_d512_test_probe_count() -> u64;
-
-    /// Reset/read the route-hint grouped D128 probe (requires
-    /// `MLX_PAGED_GROUPED_D128_TEST_PROBE=1` in the environment).
-    pub fn mlx_paged_grouped_d128_test_probe_reset();
-    pub fn mlx_paged_grouped_d128_test_probe_count() -> u64;
 
     /// Maximum legal D128 partitions under live pipeline, storage and context limits.
     pub fn mlx_paged_grouped_d128_max_stripes(context: u32, attention_layers: u32) -> u32;
@@ -1831,10 +1743,6 @@ unsafe extern "C-unwind" {
         context_len: i32,
         grouped_stripes: u32,
     ) -> i32;
-
-    /// Compatibility graph-parity probe for Gemma 4's 16Q/1KV layout.
-    /// Returns 1 on success and -3 without Metal.
-    pub fn mlx_paged_grouped_gemma4_graph_parity(context_len: i32, grouped_stripes: u32) -> i32;
 }
 
 // ================================================================================
