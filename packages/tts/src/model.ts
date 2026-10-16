@@ -38,6 +38,8 @@ export interface BackendOptions {
   chunkDurationMs: number;
   audioBufferSeconds: number;
   maxDurationSeconds?: number;
+  /** The backend may drop a silent bootstrap frame from the first chunk of this segment. */
+  suppressBootstrapSilence: boolean;
 }
 /** Internal adapter boundary. Future model families can produce PCM directly. */
 export interface TtsBackend {
@@ -218,6 +220,8 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
         (!Number.isSafeInteger(options.topK) || options.topK < 0 || options.topK > 0x7fffffff)
       )
         throw new RangeError('Invalid topK');
+      if (options.suppressBootstrapSilence !== undefined && typeof options.suppressBootstrapSilence !== 'boolean')
+        throw new TypeError('suppressBootstrapSilence must be a boolean');
       const backendOptions: BackendOptions = {
         voice: typeof options.voice === 'string' ? options.voice.toLowerCase() : undefined,
         preparedVoiceId,
@@ -234,6 +238,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
           options.maxDurationSeconds === undefined
             ? undefined
             : positive(options.maxDurationSeconds, 'maxDurationSeconds'),
+        suppressBootstrapSilence: options.suppressBootstrapSilence !== false,
       };
       const signal = options.signal;
       const controller = new AbortController();
@@ -444,6 +449,7 @@ export function createTtsModel(backend: TtsBackend): TtsModel {
       const stream = model.synthesizeStream(input, {
         ...options,
         chunkDurationMs: options.chunkDurationMs ?? NON_STREAMING_CHUNK_DURATION_MS,
+        suppressBootstrapSilence: false,
       });
       const chunks: Float32Array[] = [];
       let length = 0;

@@ -217,7 +217,21 @@ Model controls remain in extension objects:
 
 `response_format: wav` is sent after synthesis finishes, so its `chunk_duration_ms`
 defaults to 640 ms (the SDK's non-streaming default); `pcm` keeps 160 ms. Each
-segment's first chunk is one 80 ms codec frame.
+segment's first chunk is one 80 ms codec frame, or two when the bootstrap frame
+may be dropped.
+
+`pcm` and SSE output drop the model's silent bootstrap frame (80 ms) from each
+segment, as sglang-omni does for streamed requests. Only voice `ryan` with
+`language` `english`, no `instructions` and no `sampling` field other than `seed`
+and `max_duration_seconds` is eligible. The first frame is dropped when its RMS
+is at most 0.001 and its peak at most 0.0032; a NaN sample keeps it. `wav`
+always keeps the frame. The top-level boolean `suppress_bootstrap_silence`
+(also in the NDJSON config record) set to `false` keeps it in `pcm`; `true` is
+the default and does not force the drop; another type is a 400. `pcm` here is
+always streamed, while sglang-omni keeps the frame for `pcm` without
+`stream:true`. sglang-omni also keeps it above 24 live streams, for
+`initial_codec_chunk_frames` 0 or 16 and up, and for `stream_codec_output:false`;
+this server runs one synthesis per model and has neither field.
 
 A JSON `input` is synthesized as one sequence, so `max_duration_seconds`
 (0.1..163.84, default 163.84 = 2,048 codec frames) limits the whole request. On

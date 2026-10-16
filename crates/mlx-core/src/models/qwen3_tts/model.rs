@@ -37,6 +37,8 @@ pub struct Options {
     pub max_frames: Option<usize>,
     pub chunk_frames: Option<usize>,
     pub buffer_chunks: Option<usize>,
+    #[serde(default)]
+    pub suppress_bootstrap_silence: bool,
 }
 #[derive(Clone, Deserialize)]
 struct GenerationConfig {
@@ -679,6 +681,11 @@ impl NativeModel {
         let mut first_pcm_ms = None;
         let mut blocked = 0.;
         let mut reason = "length";
+        let bootstrap_frame =
+            bootstrap_silence_eligible(&options).then_some(self.codec.config.decode_upsample_rate);
+        // A droppable frame 0 is decoded together with frame 1, so frame 1
+        // still leaves in the first chunk.
+        let lead = if bootstrap_frame.is_some() { 2 } else { 1 };
         // Decode-phase allocator ceiling: scoped to the frame loop only
         // (dflash2_decode.rs:1113 discipline) so prompt prefills above stay
         // under the load-time safety cap; a decode step only needs room to
@@ -694,7 +701,7 @@ impl NativeModel {
             crate::cache_limit::decode_cache_limit(tts_step_transient(
                 &self.config,
                 &self.codec.config,
-                chunk_frames,
+                chunk_frames.max(lead),
             )),
         );
         // Frame t+1's graph is built and submitted before frame t's group-0
@@ -703,7 +710,7 @@ impl NativeModel {
         // later; an EOS there discards the speculative successor, whose only
         // side effects are KV rows this turn never reads again.
         let mut in_flight: Option<(MxArray, MxArray)> = None;
-        let mut width = 1;
+        let mut width = lead;
         let mut retire = |all: MxArray, token: MxArray, emit_now: bool| -> Result<bool> {
             // item_at waits for this frame's eval only; the successor is
             // already queued behind it, so its PCM readback below is cheap.
@@ -711,6 +718,7 @@ impl NativeModel {
             if let Some(pcm) = deferred_pcm.take() {
                 emit_pcm(
                     pcm.to_float32()?.to_vec(),
+                    bootstrap_frame,
                     &started,
                     &mut first_pcm_ms,
                     &mut blocked,
@@ -734,6 +742,7 @@ impl NativeModel {
                 if emit_now {
                     emit_pcm(
                         pcm.to_float32()?.to_vec(),
+                        bootstrap_frame,
                         &started,
                         &mut first_pcm_ms,
                         &mut blocked,
@@ -751,10 +760,10 @@ impl NativeModel {
                 reason = "cancelled";
                 break;
             }
-            // The one-frame first chunk is retired before the next frame is
-            // built so its PCM is not queued behind another frame: one frame
-            // of lost overlap per segment buys the lowest first-PCM latency.
-            if step == 1
+            // The first chunk is retired before the next frame is built so
+            // its PCM is not queued behind another frame: one frame of lost
+            // overlap per segment buys the lowest first-PCM latency.
+            if step == lead
                 && let Some((prev_all, prev_token)) = in_flight.take()
                 && !retire(prev_all, prev_token, true)?
             {
@@ -844,6 +853,7 @@ impl NativeModel {
             if let Some(pcm) = deferred_pcm.take() {
                 emit_pcm(
                     pcm.to_float32()?.to_vec(),
+                    bootstrap_frame,
                     &started,
                     &mut first_pcm_ms,
                     &mut blocked,
@@ -859,6 +869,7 @@ impl NativeModel {
                         )?
                         .to_float32()?
                         .to_vec(),
+                    bootstrap_frame,
                     &started,
                     &mut first_pcm_ms,
                     &mut blocked,
@@ -878,20 +889,240 @@ impl NativeModel {
 /// chunk, and charge only the consumer-send wait to `blocked` so backpressure
 /// stays excluded from `synthesis_ms`. The deferred chunk's fp32 readback
 /// happens here; `codec.step` already produces float32 output.
+///
+/// Every chunk goes through here, so the first chunk is checked on every path
+/// that completes it. With `bootstrap_frame` (samples per codec frame), a
+/// silent frame 0 is dropped from a first chunk longer than one frame; frame 0
+/// stays in the codec state.
 fn emit_pcm(
-    audio: Vec<f32>,
+    mut audio: Vec<f32>,
+    bootstrap_frame: Option<usize>,
     started: &Instant,
     first_pcm_ms: &mut Option<f64>,
     blocked: &mut f64,
     emit: &mut impl FnMut(Vec<f32>) -> Result<()>,
 ) -> Result<()> {
     if first_pcm_ms.is_none() {
+        if let Some(frame) = bootstrap_frame
+            && audio.len() > frame
+            && silent_frame(&audio[..frame])
+        {
+            audio.drain(..frame);
+        }
         *first_pcm_ms = Some(started.elapsed().as_secs_f64() * 1000.);
     }
     let wait = Instant::now();
     emit(audio)?;
     *blocked += wait.elapsed().as_secs_f64() * 1000.;
     Ok(())
+}
+
+/// Only voice/language pairs measured to open with a silent bootstrap frame
+/// under checkpoint sampling; widening needs the same corpus measurement.
+fn bootstrap_silence_eligible(options: &Options) -> bool {
+    options.suppress_bootstrap_silence
+        && options.prepared_voice_id.is_none()
+        && super::conditioning::instruction(options).is_none()
+        && options
+            .voice
+            .as_deref()
+            .is_some_and(|voice| voice.eq_ignore_ascii_case("ryan"))
+        && options
+            .language
+            .as_deref()
+            .is_some_and(|language| language.eq_ignore_ascii_case("english"))
+        && options.temperature.is_none()
+        && options.top_k.is_none()
+        && options.top_p.is_none()
+        && options.repetition_penalty.is_none()
+}
+
+/// A NaN sample makes the RMS NaN, so the frame is not silent and is kept.
+fn silent_frame(frame: &[f32]) -> bool {
+    const MAX_RMS: f64 = 0.001;
+    const MAX_PEAK: f64 = 0.0032;
+    let (squares, peak) = frame.iter().fold((0., 0f64), |(squares, peak), &x| {
+        let x = f64::from(x);
+        (squares + x * x, peak.max(x.abs()))
+    });
+    (squares / frame.len() as f64).sqrt() <= MAX_RMS && peak <= MAX_PEAK
+}
+
+#[cfg(test)]
+mod bootstrap_silence_tests {
+    use super::*;
+
+    const FRAME: usize = 1920;
+
+    #[test]
+    fn qwen3_tts_silent_frame_rule() {
+        assert!(silent_frame(&[0.; FRAME]));
+        assert!(silent_frame(&[1.68e-5; FRAME]));
+        assert!(!silent_frame(&[0.05; FRAME]));
+        let mut nan = [0.; FRAME];
+        nan[7] = f32::NAN;
+        assert!(!silent_frame(&nan));
+    }
+
+    #[test]
+    fn qwen3_tts_silent_frame_boundaries() {
+        assert!(silent_frame(&[0.000999; FRAME]));
+        assert!(!silent_frame(&[0.001001; FRAME]));
+        let spike = |value: f32| {
+            let mut frame = [0.; FRAME];
+            frame[FRAME / 2] = value;
+            frame
+        };
+        assert!(silent_frame(&spike(0.0031999)));
+        assert!(silent_frame(&spike(-0.0031999)));
+        assert!(!silent_frame(&spike(0.0032001)));
+        assert!(!silent_frame(&spike(-0.0032001)));
+    }
+
+    #[test]
+    fn qwen3_tts_bootstrap_silence_eligibility() {
+        let parsed: Options = serde_json::from_str("{}").unwrap();
+        assert!(!parsed.suppress_bootstrap_silence);
+        let parsed: Options =
+            serde_json::from_str(r#"{"suppress_bootstrap_silence":true}"#).unwrap();
+        assert!(parsed.suppress_bootstrap_silence);
+        let eligible = Options {
+            voice: Some("ryan".into()),
+            language: Some("english".into()),
+            seed: Some(42),
+            max_frames: Some(512),
+            suppress_bootstrap_silence: true,
+            ..Default::default()
+        };
+        assert!(bootstrap_silence_eligible(&eligible));
+        assert!(bootstrap_silence_eligible(&Options {
+            voice: Some("Ryan".into()),
+            language: Some("English".into()),
+            instruct: Some("  ".into()),
+            ..eligible.clone()
+        }));
+        for ineligible in [
+            Options {
+                suppress_bootstrap_silence: false,
+                ..eligible.clone()
+            },
+            Options {
+                voice: Some("vivian".into()),
+                ..eligible.clone()
+            },
+            Options {
+                voice: None,
+                ..eligible.clone()
+            },
+            Options {
+                language: Some("auto".into()),
+                ..eligible.clone()
+            },
+            Options {
+                language: None,
+                ..eligible.clone()
+            },
+            Options {
+                language: Some("chinese".into()),
+                ..eligible.clone()
+            },
+            Options {
+                instruct: Some("Whisper softly.".into()),
+                ..eligible.clone()
+            },
+            Options {
+                voice_description: Some("A warm voice.".into()),
+                ..eligible.clone()
+            },
+            Options {
+                prepared_voice_id: Some("voice-1".into()),
+                ..eligible.clone()
+            },
+            Options {
+                temperature: Some(0.9),
+                ..eligible.clone()
+            },
+            Options {
+                top_k: Some(50),
+                ..eligible.clone()
+            },
+            Options {
+                top_p: Some(1.),
+                ..eligible.clone()
+            },
+            Options {
+                repetition_penalty: Some(1.05),
+                ..eligible.clone()
+            },
+        ] {
+            assert!(!bootstrap_silence_eligible(&ineligible));
+        }
+    }
+
+    /// Runs `emit_pcm` over `chunks` in order and returns what was sent.
+    fn sent(bootstrap_frame: Option<usize>, chunks: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let mut out = Vec::new();
+        let mut first_pcm_ms = None;
+        let mut blocked = 0.;
+        let started = Instant::now();
+        for chunk in chunks {
+            emit_pcm(
+                chunk.clone(),
+                bootstrap_frame,
+                &started,
+                &mut first_pcm_ms,
+                &mut blocked,
+                &mut |audio| {
+                    out.push(audio);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(first_pcm_ms.is_some(), !chunks.is_empty());
+        out
+    }
+
+    fn frames(values: &[f32]) -> Vec<f32> {
+        values
+            .iter()
+            .flat_map(|&value| [value; FRAME])
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn qwen3_tts_bootstrap_frame_dropped_only_from_a_silent_two_frame_first_chunk() {
+        let silent = frames(&[0., 0.25]);
+        let loud = frames(&[0.25, 0.25]);
+        // [f0 f1] with a silent f0: only f1 is sent.
+        assert_eq!(
+            sent(Some(FRAME), std::slice::from_ref(&silent)),
+            vec![frames(&[0.25])]
+        );
+        // A loud f0 is sent with f1.
+        assert_eq!(
+            sent(Some(FRAME), std::slice::from_ref(&loud)),
+            vec![loud.clone()]
+        );
+        // A first chunk of one frame (f1 = EOS, max_frames 1) is sent unchanged.
+        assert_eq!(sent(Some(FRAME), &[frames(&[0.])]), vec![frames(&[0.])]);
+        // Only the first chunk is checked.
+        assert_eq!(
+            sent(Some(FRAME), &[loud.clone(), silent.clone()]),
+            vec![loud.clone(), silent.clone()]
+        );
+        // Not eligible: nothing is dropped.
+        assert_eq!(
+            sent(None, std::slice::from_ref(&silent)),
+            vec![silent.clone()]
+        );
+        // A NaN in f0 keeps it.
+        let mut nan = silent.clone();
+        nan[3] = f32::NAN;
+        let kept = sent(Some(FRAME), &[nan]);
+        assert_eq!(kept[0].len(), 2 * FRAME);
+        assert!(kept[0][3].is_nan());
+    }
 }
 
 fn draw(

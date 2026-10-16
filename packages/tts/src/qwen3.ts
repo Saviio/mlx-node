@@ -55,6 +55,7 @@ export async function loadQwen3Backend(path: string, options: TtsLoadOptions = {
             options.maxDurationSeconds === undefined
               ? DEFAULT_MAX_FRAMES
               : Math.ceil((options.maxDurationSeconds * 1000) / frameMs),
+          suppress_bootstrap_silence: options.suppressBootstrapSilence,
         }),
       );
     },

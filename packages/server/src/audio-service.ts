@@ -669,7 +669,13 @@ export class AudioService {
           const input = records ? textEvents(records, binding.model, options) : request.input!;
           onDispatch();
           const chunkDurationMs = options.chunkDurationMs ?? (file ? NON_STREAMING_CHUNK_DURATION_MS : undefined);
-          const source = binding.model.synthesizeStream(input, { ...options, chunkDurationMs, signal });
+          const suppressBootstrapSilence = file ? false : options.suppressBootstrapSilence;
+          const source = binding.model.synthesizeStream(input, {
+            ...options,
+            chunkDurationMs,
+            suppressBootstrapSilence,
+            signal,
+          });
           void source.completed.catch(() => {});
           const processed = changeAudioSpeed(source, request.speed);
           let writer: WavWriter | undefined;

@@ -689,3 +689,56 @@ describe('instruction commits', () => {
     await model.dispose();
   });
 });
+
+describe('bootstrap silence', () => {
+  async function* events(values: import('../src/types.js').TtsInputEvent[]) {
+    yield* values;
+  }
+  it('offers the drop to every streamed segment, each with its own instruction', async () => {
+    const { model, backend } = fake();
+    const start = vi.spyOn(backend, 'start');
+    const stream = model.synthesizeStream(
+      events(['一。', '二。', { type: 'instruct', value: 'x' }, '三。', { type: 'instruct', value: null }, '四。']),
+      { voice: 'voice', language: 'english' },
+    );
+    for await (const _ of stream);
+    // Eligibility, including the instruction, is decided per segment by the backend.
+    expect(start.mock.calls.map(([text, o]) => [text, o.suppressBootstrapSilence, o.instruct])).toEqual([
+      ['一。', true, undefined],
+      ['二。', true, undefined],
+      ['三。', true, 'x'],
+      ['四。', true, undefined],
+    ]);
+    await model.dispose();
+  });
+  it('offers it once for a string, never to synthesize, and not when the caller opts out', async () => {
+    const { model, backend } = fake();
+    const start = vi.spyOn(backend, 'start');
+    for await (const _ of model.synthesizeStream('一。二。', { voice: 'voice' }));
+    await model.synthesize('一。二。', { voice: 'voice' });
+    await model.synthesize('一。二。', { voice: 'voice', suppressBootstrapSilence: true });
+    for await (const _ of model.synthesizeStream(events(['一。', '二。']), {
+      voice: 'voice',
+      suppressBootstrapSilence: false,
+    }));
+    for await (const _ of model.synthesizeStream('一。', { voice: 'voice', suppressBootstrapSilence: true }));
+    expect(start.mock.calls.map(([text, o]) => [text, o.suppressBootstrapSilence])).toEqual([
+      ['一。二。', true],
+      ['一。二。', false],
+      ['一。二。', false],
+      ['一。', false],
+      ['二。', false],
+      ['一。', true],
+    ]);
+    await model.dispose();
+  });
+  it('rejects a non-boolean opt-out before starting the backend', async () => {
+    const { model, submitted } = fake();
+    for (const value of ['false', 0, null])
+      expect(() =>
+        model.synthesizeStream('Hello.', { voice: 'voice', suppressBootstrapSilence: value as unknown as boolean }),
+      ).toThrow(TypeError);
+    expect(submitted).toEqual([]);
+    await model.dispose();
+  });
+});

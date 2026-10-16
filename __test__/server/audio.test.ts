@@ -199,6 +199,63 @@ describe('audio HTTP contract', () => {
     }
     expect(backendStart.mock.calls.map(([, options]) => options.chunkDurationMs)).toEqual([640, 160, 200]);
   });
+  it('offers the bootstrap-silence drop to PCM and SSE but never to WAV, with a per-request opt-out', async () => {
+    const { server, url } = await start();
+    const fake = tts();
+    const backendStart = vi.spyOn(fake.backend, 'start');
+    server.registry.audio.register('tts', { kind: 'tts', model: fake.model });
+    for (const extra of [
+      {},
+      { suppress_bootstrap_silence: true },
+      { response_format: 'pcm' },
+      { response_format: 'pcm', stream_format: 'sse' },
+      { response_format: 'pcm', suppress_bootstrap_silence: false },
+      { response_format: 'pcm', suppress_bootstrap_silence: true },
+    ]) {
+      const res = await speech(url, extra);
+      expect(res.status).toBe(200);
+      await res.arrayBuffer();
+    }
+    expect(backendStart.mock.calls.map(([, options]) => options.suppressBootstrapSilence)).toEqual([
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+    ]);
+    for (const value of ['false', 0, null, {}]) {
+      const res = await speech(url, { response_format: 'pcm', suppress_bootstrap_silence: value });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatchObject({ param: 'suppress_bootstrap_silence' });
+    }
+    expect(backendStart).toHaveBeenCalledTimes(6);
+  });
+  it('applies the NDJSON config opt-out to every segment', async () => {
+    const { server, url } = await start();
+    const fake = tts();
+    const backendStart = vi.spyOn(fake.backend, 'start');
+    server.registry.audio.register('tts', { kind: 'tts', model: fake.model });
+    for (const config of [{}, { suppress_bootstrap_silence: false }]) {
+      const records = [
+        { type: 'config', model: 'tts', voice: 'voice', ...config },
+        { type: 'text', text: '第一句。' },
+        { type: 'text', text: '第二句。' },
+      ];
+      const res = await binaryRequest(
+        `${url}/v1/audio/speech/stream`,
+        records.map((record) => JSON.stringify(record) + '\n').join(''),
+        'application/x-ndjson',
+      );
+      expect(res.trailers['x-finish-reason']).toBe('eos');
+    }
+    expect(backendStart.mock.calls.map(([text, options]) => [text, options.suppressBootstrapSilence])).toEqual([
+      ['第一句。', true],
+      ['第二句。', true],
+      ['第一句。', false],
+      ['第二句。', false],
+    ]);
+  });
   it.each([16000, 22050, 24000, 44100, 48000, 96000])(
     'passes %i Hz source metadata and downmixes without server resampling',
     async (rate) => {

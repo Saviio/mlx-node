@@ -136,6 +136,7 @@ fractional values are supported, and unset/0 uses the normal cache policy.`);
       chunkDurationMs: values['chunk-ms'] === undefined ? undefined : Number(values['chunk-ms']),
       maxDurationSeconds: values['max-duration'] === undefined ? undefined : Number(values['max-duration']),
       seed: values.seed === undefined ? undefined : Number(values.seed),
+      suppressBootstrapSilence: values.play === true && values.output === undefined,
     });
     const processed = changeAudioSpeed(stream, Number(values.speed));
     for await (const chunk of processed) {

@@ -61,6 +61,11 @@ export function speechRequest(body: Record<string, unknown>, inputStream: boolea
     options.instruct = body.instructions as string;
   }
   if (body.language !== undefined) options.language = string(body.language, 'language');
+  if (body.suppress_bootstrap_silence !== undefined) {
+    if (typeof body.suppress_bootstrap_silence !== 'boolean')
+      bad('suppress_bootstrap_silence must be a boolean', 'suppress_bootstrap_silence');
+    options.suppressBootstrapSilence = body.suppress_bootstrap_silence as boolean;
+  }
   const sampling = body.sampling === undefined ? {} : object(body.sampling, 'sampling');
   const stream = body.stream === undefined ? {} : object(body.stream, 'stream');
   const specs: [Record<string, unknown>, string, keyof TtsOptions, number, number, boolean?][] = [

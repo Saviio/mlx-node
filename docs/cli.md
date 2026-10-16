@@ -19,6 +19,9 @@ UTF-8 incrementally and commit complete sentences. For 1.7B CustomVoice,
 `--speed 1.15` applies the independent Rust speech tempo processor to both playback
 and WAV output; the default is 1 (unchanged PCM). `--buffer-seconds` controls playback
 capacity independently of `--prebuffer-seconds`, which controls startup buffering.
+`--play` alone streams, so it drops the silent bootstrap frame like `pcm` output.
+Any `-o` keeps it, like `synthesize`; with `--play -o` the player gets the same
+full PCM as the file.
 At least one of `--play` or `--output` is required. See [TTS](tts.md) for capabilities, conversion,
 buffer policies and benchmark results, or `mlx tts --help` for all flags.
 

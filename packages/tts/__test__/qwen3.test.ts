@@ -55,6 +55,7 @@ const options = (overrides: Partial<BackendOptions> = {}): BackendOptions => ({
   language: 'chinese',
   chunkDurationMs: 160,
   audioBufferSeconds: 1,
+  suppressBootstrapSilence: false,
   ...overrides,
 });
 
@@ -107,7 +108,10 @@ describe('Qwen3 backend adapter', () => {
   });
   it('maps SDK options to the native start JSON', async () => {
     const backend = await loadQwen3Backend('/model');
-    backend.start('你好。', options({ instruct: '慢速读。', seed: 534, topP: 0.9, repetitionPenalty: 1.1 }));
+    backend.start(
+      '你好。',
+      options({ instruct: '慢速读。', seed: 534, topP: 0.9, repetitionPenalty: 1.1, suppressBootstrapSilence: true }),
+    );
     expect(mock.startArgs.at(-1)).toEqual([
       '你好。',
       {
@@ -124,6 +128,7 @@ describe('Qwen3 backend adapter', () => {
         chunk_frames: 2, // 160 ms / 80 ms frames
         buffer_chunks: 6, // 1 s buffer / 160 ms chunks
         max_frames: 2048, // default when maxDurationSeconds is unset
+        suppress_bootstrap_silence: true,
       },
     ]);
   });

@@ -82,12 +82,26 @@ reuses the voice condition. Natural pauses between segments are expected.
 The default output target is 160 ms for `synthesizeStream` and 640 ms
 (`NON_STREAMING_CHUNK_DURATION_MS`) for `synthesize`, rounded up to whole codec
 frames. The first chunk of each segment is one codec frame (80 ms), so first PCM
-waits on one generated frame only. Wider codec steps cost less per frame; their PCM
+waits on one generated frame only; a segment that may drop its bootstrap frame
+(below) waits on two. Wider codec steps cost less per frame; their PCM
 is not bit-identical to 160 ms chunks. Native
 PCM buffering is bounded to about one second and text buffering to two segments.
 `chunkDurationMs`, `audioBufferSeconds`, `queuedSegments` and
 `maxSegmentGraphemes` configure these policies; the last two apply to incremental
 input only. Slow consumers apply backpressure.
+
+`synthesizeStream` drops the model's silent bootstrap frame, as sglang-omni does
+for streamed output. A segment is eligible with the CustomVoice preset `ryan`,
+`language: 'english'`, no instruction and no `temperature`, `topK`, `topP` or
+`repetitionPenalty` (`seed` and `maxDurationSeconds` are allowed). It decodes
+its first two codec frames as one chunk. When the first frame is silent (RMS at
+most 0.001 and peak at most 0.0032), its 80 ms are removed and the chunk
+carries the second frame only; otherwise both frames are sent. The frame stays
+in the codec state. A first chunk of one frame is sent unchanged, and a frame
+with a NaN sample is kept. Every segment of incremental input is checked, and an
+`instruct` event changes eligibility for the segments after it.
+`suppressBootstrapSilence: false` keeps the frame; `true` is the default and
+does not force the drop. `synthesize` always keeps it.
 
 One model accepts one active synthesis or voice preparation. A concurrent request
 fails with a busy error; a concurrent voice release is queued instead and

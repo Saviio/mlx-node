@@ -70,6 +70,13 @@ export interface TtsOptions {
    * Truncation reports `finishReason: 'length'`.
    */
   maxDurationSeconds?: number;
+  /**
+   * Streamed output drops the model's first codec frame from each segment when that frame is silent and the
+   * request is eligible (Qwen3-TTS: CustomVoice `ryan`, `language: 'english'`, no instructions, no sampling
+   * overrides other than `seed` and `maxDurationSeconds`). Default `true`, which does not force it;
+   * `false` keeps the frame. `synthesize` always keeps it.
+   */
+  suppressBootstrapSilence?: boolean;
   chunkDurationMs?: number;
   audioBufferSeconds?: number;
   maxSegmentGraphemes?: number;
