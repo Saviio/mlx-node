@@ -2640,6 +2640,18 @@ export declare class VLModel {
   static load(modelPath: string): Promise<VLModel>;
 }
 
+export declare class XlmRobertaRerankerModel {
+  static load(modelPath: string, optionsJson?: string | undefined | null): Promise<XlmRobertaRerankerModel>;
+  get infoJson(): string;
+  startRerank(requestJson: string): XlmRobertaRerankerTask;
+  dispose(): Promise<undefined>;
+}
+
+export declare class XlmRobertaRerankerTask {
+  cancel(): void;
+  result(): Promise<string>;
+}
+
 export declare function audioDecodeWavFrames(bytes: Buffer, format: AudioWavFormat, mono: boolean): Float32Array;
 
 export declare function audioEncodePcm16(samples: Float32Array): Buffer;
