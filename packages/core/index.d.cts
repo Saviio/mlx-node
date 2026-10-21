@@ -540,6 +540,18 @@ export declare class HarrierModel {
   static load(modelPath: string): Promise<HarrierModel>;
 }
 
+export declare class JinaRerankerModel {
+  static load(modelPath: string, optionsJson?: string | undefined | null): Promise<JinaRerankerModel>;
+  get infoJson(): string;
+  startRerank(requestJson: string): JinaRerankerTask;
+  dispose(): Promise<undefined>;
+}
+
+export declare class JinaRerankerTask {
+  cancel(): void;
+  result(): Promise<string>;
+}
+
 /**
  * K2-Horizon language model (IFM K2-Horizon-7B).
  *

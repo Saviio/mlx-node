@@ -2912,6 +2912,43 @@ pub(crate) mod recipe {
         }
     }
 
+    /// Ranking owns a separate projector and never emits an LM head.
+    pub(crate) struct JinaRerankerRecipe;
+    impl ConversionRecipe for JinaRerankerRecipe {
+        fn model_types(&self) -> &'static [&'static str] {
+            &["jina_reranker"]
+        }
+        fn embed_quantizable(&self) -> bool {
+            true
+        }
+        fn dense_prefixes(&self) -> &'static [&'static str] {
+            &["projector."]
+        }
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            config: &serde_json::Value,
+            _dtype: &str,
+            _tied: bool,
+            _verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            crate::models::jina_reranker::config::Config::parse(config)?;
+            let mut out = HashMap::new();
+            for (name, weight) in weights {
+                let key = crate::models::jina_reranker::weights::canonical_key(&name);
+                if key.starts_with("lm_head.") {
+                    continue;
+                }
+                if out.insert(key.clone(), weight).is_some() {
+                    return Err(Error::from_reason(format!(
+                        "Conflicting reranker tensor {key}"
+                    )));
+                }
+            }
+            Ok(out)
+        }
+    }
+
     type RecipeFactory = fn() -> Box<dyn ConversionRecipe>;
 
     /// One row per convertible family: the exact HuggingFace `model_type`
@@ -2919,6 +2956,7 @@ pub(crate) mod recipe {
     /// load-bearing: flattened it is [`convertible_model_types`], which the
     /// "unknown model type" error message joins verbatim.
     pub(crate) const RECIPE_REGISTRY: &[(&[&str], RecipeFactory)] = &[
+        (&["jina_reranker"], || Box::new(JinaRerankerRecipe)),
         (&["qwen3_asr"], || Box::new(Qwen3AsrRecipe)),
         (&["qwen3_tts"], || Box::new(Qwen3TtsRecipe)),
         (&["qwen3_5"], || Box::new(Qwen35Recipe { is_moe: false })),
@@ -3335,7 +3373,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }
     let target_dtype = options.dtype.unwrap_or_else(|| "float32".to_string());
     let verbose = options.verbose.unwrap_or(false);
-    let model_type = options.model_type;
+    let mut model_type = options.model_type;
     let do_quantize = options.quantize.unwrap_or(false);
     let quant_mode = options.quant_mode.unwrap_or_else(|| "affine".to_string());
     let quant_recipe = options.quant_recipe;
@@ -3608,6 +3646,47 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
+    let is_reranker = config["architectures"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "JinaForRanking"));
+    if is_reranker || model_type.as_deref() == Some("jina_reranker") {
+        crate::models::jina_reranker::config::Config::parse(&config)?;
+        if model_type.as_deref().is_some_and(|v| v != "jina_reranker") {
+            return Err(Error::from_reason(
+                "JinaForRanking requires the jina_reranker conversion recipe",
+            ));
+        }
+        model_type = Some("jina_reranker".into());
+        if quant_recipe.is_some()
+            || quant_mxfp
+            || imatrix_path.is_some()
+            || quant_mtp != "off"
+            || (do_quantize
+                && (quant_bits != 4 || !matches!(quant_mode.as_str(), "affine" | "mxfp4")))
+        {
+            return Err(Error::from_reason(
+                "Reranker conversion supports BF16, uniform affine 4-bit or MXFP4 only",
+            ));
+        }
+        if crate::models::quant_dispatch::select_quantization_block(&config)?.is_some() {
+            return Err(Error::from_reason(
+                "Convert rerankers from an unquantized source; packed checkpoints can be loaded directly",
+            ));
+        }
+        // Ranking conversion always writes a fresh checkpoint. Reusing a
+        // directory can leave an obsolete projector or shard beside new weights.
+        if output_dir.exists()
+            && fs::read_dir(&output_dir)
+                .map_err(|e| Error::from_reason(e.to_string()))?
+                .next()
+                .is_some()
+        {
+            return Err(Error::from_reason(
+                "Reranker conversion requires a new or empty output directory",
+            ));
+        }
+    }
+
     // A caller may omit `model_type` and rely on generic dtype conversion.
     // Fail closed from the source config before the converter mutex, MLX setup,
     // output creation, or tensor loading for families whose runtimes are dense-only.
@@ -3824,7 +3903,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let single_weights_path = input_dir.join("model.safetensors");
     let alt_weights_path = input_dir.join("weights.safetensors");
 
-    if single_weights_path.exists() {
+    if is_reranker {
+        tensors = crate::models::jina_reranker::weights::read_weights(&input_dir)?;
+        num_tensors = tensors.len();
+        num_parameters = tensors.values().try_fold(0usize, |n, tensor| {
+            Ok::<_, Error>(n + tensor.size()? as usize)
+        })?;
+    } else if single_weights_path.exists() {
         // Single file model — lazy load
         info!(
             "Loading SafeTensors file (lazy): {}",
@@ -4599,6 +4684,10 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Write config.json — clean and sort keys to match mlx-lm/mlx-vlm save_config
     let output_config_path = output_dir.join("config.json");
     let mut output_config = config.clone();
+    if is_reranker {
+        let (_, profile) = crate::models::jina_reranker::config::Config::parse(&config)?;
+        output_config["reranker"] = serde_json::json!({"version": 1, "profile": profile});
+    }
     if model_type.as_deref() == Some("qwen3_tts") {
         output_config["mlx_node_tts_format"] = serde_json::json!(1);
     }
@@ -4728,6 +4817,10 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
     // Copy tokenizer, model config, and Python model definition files
     let config_files = [
+        // Preserve model attribution independently of the runtime license.
+        "LICENSE",
+        "LICENSE.md",
+        "README.md",
         // Tokenizer files
         "tokenizer.json",
         "tokenizer_config.json",
@@ -12111,6 +12204,7 @@ mod tests {
         assert_eq!(
             known,
             [
+                "jina_reranker",
                 "qwen3_asr",
                 "qwen3_tts",
                 "qwen3_5",
@@ -12152,7 +12246,10 @@ mod tests {
             // embed_quantizable must match the packed-embedding allowlist.
             assert_eq!(
                 r.embed_quantizable(),
-                matches!(mt, "qwen3_asr" | "lfm2" | "lfm2_moe" | "k2_horizon"),
+                matches!(
+                    mt,
+                    "jina_reranker" | "qwen3_asr" | "lfm2" | "lfm2_moe" | "k2_horizon"
+                ),
                 "{mt}: embed_quantizable mismatch vs inline match"
             );
 

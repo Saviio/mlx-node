@@ -17,6 +17,7 @@ export interface ConvertDetectRow {
 }
 
 export const CONVERT_DETECT: readonly ConvertDetectRow[] = [
+  { architecture: 'JinaForRanking', rawModelTypes: ['jina_reranker'], out: 'jina_reranker' },
   // The Nemotron architecture is authoritative (native parser + runtime
   // registry probe): it is checked BEFORE every model_type row so a
   // stale-but-recognized model_type (e.g. qwen3_5) cannot route a Nemotron

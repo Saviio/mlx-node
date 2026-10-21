@@ -10,6 +10,7 @@ pub(crate) mod forward;
 pub mod gemma4;
 pub mod harrier;
 pub mod int8_gemm;
+pub mod jina_reranker;
 pub mod k2_horizon;
 pub mod lfm2;
 pub mod mtp_drafter;
