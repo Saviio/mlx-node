@@ -16,6 +16,37 @@ assert.equal(current.chatPath, baseline.chatPath);
 assert.equal(current.jinaPath, baseline.jinaPath);
 assert.deepEqual(current.hardware, baseline.hardware);
 for (const report of [baseline, current]) {
+  assert.ok(typeof report.identity.node === 'string' && report.identity.node.length > 0);
+  assert.ok(Array.isArray(report.identity.execArgv) && report.identity.execArgv.every((v) => typeof v === 'string'));
+  for (const key of ['executionEnvironmentSha256', 'scriptSha256', 'manifestSha256', 'chatSha256', 'jinaSha256'])
+    assert.match(report.identity[key], /^[a-f0-9]{64}$/);
+}
+assert.equal(baseline.identity.sourceRevision, manifest.baselineRevision);
+for (const key of [
+  'node',
+  'execArgv',
+  'executionEnvironmentSha256',
+  'scriptSha256',
+  'manifestSha256',
+  'chatSha256',
+  'jinaSha256',
+]) {
+  assert.deepEqual(current.identity[key], baseline.identity[key], `Regression identity mismatch: ${key}`);
+}
+for (const key of ['sourceRevision', 'sourceSha256', 'lockSha256', 'metalSha256']) {
+  for (const report of [baseline, current])
+    assert.match(report.identity[key], key === 'sourceRevision' ? /^[a-f0-9]{40}$/ : /^[a-f0-9]{64}$/);
+}
+for (let i = 0; i < 3; i++) {
+  assert.equal(baseline.rounds[i].chat.outputTokens.length, manifest.performance.iterations);
+  assert.ok(baseline.rounds[i].chat.outputTokens.every((v) => Number.isInteger(v) && v > 0));
+  assert.deepEqual(
+    current.rounds[i].chat.outputTokens,
+    baseline.rounds[i].chat.outputTokens,
+    'Chat output workload differs',
+  );
+}
+for (const report of [baseline, current]) {
   assert.match(report.addonSha256, /^[a-f0-9]{64}$/);
   assert.equal(report.rounds.length, 3);
   for (const round of report.rounds) {
@@ -38,6 +69,8 @@ const families = ['chat', 'jina'].map((family) => {
 const report = {
   baselinePath,
   currentPath,
+  baselineSource: baseline.identity,
+  currentSource: current.identity,
   baselineAddonSha256: baseline.addonSha256,
   currentAddonSha256: current.addonSha256,
   threshold,

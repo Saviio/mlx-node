@@ -21,6 +21,7 @@ for (const name of (await readdir(modelPath)).sort()) {
   if (name.endsWith('.json') || name.endsWith('.safetensors')) checksums[name] = await hashFile(join(modelPath, name));
 }
 const identity = {
+  schemaVersion: 2,
   model: resolve(modelPath),
   checksums,
   inputSha256: await hashFile(inputPath),
@@ -56,8 +57,9 @@ const dcg = (labels) => labels.reduce((sum, rel, i) => sum + rel / Math.log2(i +
 try {
   for (const dataset of input.datasets) {
     const rows = [];
-    for (const query of dataset.queries) {
-      const saved = completed.find((r) => r.repository === dataset.repository && r.sha256 === query.sha256);
+    for (const [queryIndex, query] of dataset.queries.entries()) {
+      const saved = completed.find((r) => r.repository === dataset.repository && r.queryIndex === queryIndex);
+      if (saved && saved.sha256 !== query.sha256) throw Error('Progress query identity differs');
       if (saved) {
         const { repository: _repository, ...row } = saved;
         rows.push(row);
@@ -71,6 +73,7 @@ try {
       const first = ranking.slice(0, 10).findIndex((i) => query.labels[i] > 0);
       const mrr10 = first < 0 ? 0 : 1 / (first + 1);
       const row = {
+        queryIndex,
         sha256: query.sha256,
         ranking,
         ndcg10,
@@ -94,7 +97,11 @@ try {
     };
     if (baseline) {
       const ref = baseline.datasets.find((d) => d.repository === dataset.repository);
-      if (!ref || ref.queries.length !== rows.length || ref.queries.some((r, i) => r.sha256 !== rows[i].sha256))
+      if (
+        !ref ||
+        ref.queries.length !== rows.length ||
+        ref.queries.some((r, i) => r.sha256 !== rows[i].sha256 || r.queryIndex !== i)
+      )
         throw Error('Quality subset mismatch');
       result.ndcg10Drop = ref.ndcg10 - result.ndcg10;
       result.mrr10Change = result.mrr10 - ref.mrr10;

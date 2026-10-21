@@ -72,7 +72,9 @@ by SHA-256, with original positive/negative candidates and recorded skips. Both
 quantized formats must meet the nDCG@10 drop gate separately on each dataset.
 Results describe this fixed subset, not a full MTEB benchmark. Per-query progress
 is persisted; the same command resumes only when input, model and addon hashes
-match. A changed artifact requires a new output path.
+match. The recovery key includes the dataset and original sample index, so
+repeated query text with different candidates remains distinct. A changed artifact
+requires a new output path.
 
 ## Performance and regression
 
@@ -95,9 +97,18 @@ unloaded/idle/concurrent measurements separate from numerical tests.
 
 Freeze a copy of the baseline native addon **before** building this branch, with
 its adjacent `mlx.metallib` and `paged_attn.metallib`. `NAPI_RS_NATIVE_LIBRARY_PATH`
-selects the exact binary for each run. Use the same checkpoint paths throughout:
+selects the exact binary for each run. Also prepare an independent archive of the
+frozen baseline commit, build its TypeScript packages, and write the full baseline
+SHA to `source-revision.txt` in that archive. Its workspace dependency links must
+resolve inside the archive; only third-party dependencies may be shared. Pass that
+root through `MLX_BGE_SOURCE_ROOT`. Switching the addon alone does not measure SDK
+or Server regressions. The sampler verifies package resolution and records source,
+built-code, lockfile, checkpoint, tokenizer and execution-environment fingerprints.
+Both runs use the same sampling script and compare actual chat output token counts.
+Use the same checkpoint paths throughout:
 
 ```sh
+MLX_BGE_SOURCE_ROOT=/absolute/baseline-source \
 NAPI_RS_NATIVE_LIBRARY_PATH=/absolute/baseline/mlx-core.darwin-arm64.node \
   yarn exec oxnode scripts/rerank/bge/regression.ts CHAT_MODEL JINA_MODEL baseline.json
 NAPI_RS_NATIVE_LIBRARY_PATH=/absolute/current/mlx-core.darwin-arm64.node \

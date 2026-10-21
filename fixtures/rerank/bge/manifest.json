@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
+  "baselineRevision": "1fc3baeef159ee02b5df14ca9a6a7de8b06a0dda",
   "model": {"repository": "BAAI/bge-reranker-v2-m3", "revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"},
   "reference": {"transformers": "4.38.1", "tokenizers": "0.15.2", "torch": "2.7.1", "mlx": "0.32.4", "numpy": "2.2.5", "safetensors": "0.7.0", "pyarrow": "20.0.0"},
   "thresholds": {
