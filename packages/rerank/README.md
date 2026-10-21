@@ -1,6 +1,6 @@
 # @mlx-node/rerank
 
-Native listwise text reranking on Apple Silicon. Supports Jina Reranker v3 and v3.5 with dense BF16, MLX affine 4-bit and MXFP4 weights, independently of chat, audio, or any retrieval application.
+Native text reranking on Apple Silicon, independently of chat, audio, or any retrieval application. Jina v3/v3.5 use listwise cosine scoring; BGE-v2-M3 uses a bidirectional XLM-R cross-encoder and automatically returns sigmoid scores. See the [BGE configuration and migration guide](../../docs/rerank-bge.md) for its precision formats and policy.
 
 ```ts
 import { loadReranker } from '@mlx-node/rerank';

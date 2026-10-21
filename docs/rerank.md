@@ -1,6 +1,8 @@
 # General-purpose reranking
 
-`@mlx-node/rerank` ranks retrieval candidates for any caller: RAG, search, memory services, or batch processing. It is independent of Hindsight. The model receives all candidates in each block, so its scores and document features depend on the query, candidate order and block budget. Internal document vectors are deliberately not exposed as reusable embeddings.
+`@mlx-node/rerank` ranks retrieval candidates for any caller: RAG, search, memory services, or batch processing. It is independent of Hindsight. Jina receives all candidates in each block, so its scores and document features depend on the query, candidate order and block budget. Internal document vectors are deliberately not exposed as reusable embeddings.
+
+BGE-v2-M3 uses an independent sentence-pair encoder with sigmoid scoring. See [BGE support and migration](rerank-bge.md). The following block and prompt rules describe Jina.
 
 ## Supported checkpoints
 
