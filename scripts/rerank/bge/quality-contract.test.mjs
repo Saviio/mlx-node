@@ -31,6 +31,11 @@ function fixture() {
   const baseline = {
     schemaVersion: 3,
     complete: true,
+    node: process.version,
+    execArgv: [],
+    scriptSha256: hash,
+    contractSha256: hash,
+    manifestSha256: hash,
     inputSha256: hash,
     addonSha256: hash,
     metalSha256: hash,
@@ -94,6 +99,12 @@ test('quantized self-reference and changed native execution cannot pass as FP32'
     },
     (b) => {
       b.executionEnvironmentSha256 = 'b'.repeat(64);
+    },
+    (b) => {
+      b.scriptSha256 = 'b'.repeat(64);
+    },
+    (b) => {
+      b.node = 'changed';
     },
     (b) => {
       delete b.executionEnvironmentSha256;

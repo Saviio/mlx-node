@@ -32,6 +32,9 @@ for (const dtype of ['fp32', 'affine', 'mxfp4']) {
     const input = await read(inputPath);
     assert.equal(report.schemaVersion, 3);
     assert.equal(report.complete, true);
+    assert.equal(report.scriptSha256, await hash(new URL('./quality.mjs', import.meta.url)));
+    assert.equal(report.contractSha256, await hash(new URL('./quality-contract.mjs', import.meta.url)));
+    assert.equal(report.manifestSha256, createHash('sha256').update(JSON.stringify(manifest)).digest('hex'));
     assert.equal(report.inputSha256, await hash(inputPath));
     assert.equal(report.model, resolve(root, dtype));
     const checksums = {};

@@ -38,6 +38,11 @@ for (const name of (await readdir(modelPath)).sort()) {
 const addonPath = process.env.NAPI_RS_NATIVE_LIBRARY_PATH ?? resolve('packages/core/mlx-core.darwin-arm64.node');
 const identity = {
   schemaVersion: 3,
+  node: process.version,
+  execArgv: process.execArgv,
+  scriptSha256: await hashFile(new URL(import.meta.url)),
+  contractSha256: await hashFile(new URL('./quality-contract.mjs', import.meta.url)),
+  manifestSha256: createHash('sha256').update(JSON.stringify(manifest)).digest('hex'),
   model: resolve(modelPath),
   checksums,
   inputSha256: await hashFile(inputPath),

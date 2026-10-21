@@ -89,10 +89,22 @@ export function validateQualityDatasets(report, input, manifest) {
 export function validateQualityBaseline(baseline, identity, input, manifest) {
   assert.equal(baseline.schemaVersion, 3, 'Quality baseline needs complete execution identity');
   assert.equal(baseline.complete, true, 'Quality baseline must be complete');
-  for (const key of ['inputSha256', 'addonSha256', 'metalSha256', 'executionEnvironmentSha256']) {
+  for (const key of [
+    'inputSha256',
+    'addonSha256',
+    'metalSha256',
+    'executionEnvironmentSha256',
+    'scriptSha256',
+    'contractSha256',
+    'manifestSha256',
+  ]) {
     assert.match(identity[key], /^[a-f0-9]{64}$/);
     assert.equal(baseline[key], identity[key], `Quality baseline ${key} differs`);
   }
+  assert.equal(typeof identity.node, 'string');
+  assert.equal(baseline.node, identity.node);
+  assert.ok(Array.isArray(identity.execArgv));
+  assert.deepEqual(baseline.execArgv, identity.execArgv);
   assert.equal(baseline.computeDtype, 'float32');
   assert.equal(baseline.info.family, 'xlm_roberta_reranker');
   assert.equal(baseline.info.profile, 'xlmr-cross-encoder-v1');
