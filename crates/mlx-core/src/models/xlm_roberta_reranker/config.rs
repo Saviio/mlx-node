@@ -151,12 +151,13 @@ impl Policy {
             ));
         }
         if p.max_pair_tokens > context
+            || o.max_document_tokens.is_some_and(|n| n > context)
             || p.max_pair_tokens <= PAIR_SPECIAL_TOKENS
             || p.max_query_tokens > p.max_pair_tokens - PAIR_SPECIAL_TOKENS
             || p.max_batch_tokens < p.max_pair_tokens
         {
             return Err(invalid_policy(
-                "pair/query/batch limits conflict with the model context or pair overhead",
+                "pair/query/document/batch limits conflict with the model context or pair overhead",
             ));
         }
         Ok(p)
@@ -165,6 +166,38 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_document_limit_respects_effective_context() {
+        assert_eq!(
+            Policy::resolve(Options::default(), 64)
+                .unwrap()
+                .max_document_tokens,
+            8192
+        );
+        assert_eq!(
+            Policy::resolve(
+                Options {
+                    max_document_tokens: Some(64),
+                    ..Default::default()
+                },
+                64
+            )
+            .unwrap()
+            .max_document_tokens,
+            64
+        );
+        assert!(
+            Policy::resolve(
+                Options {
+                    max_document_tokens: Some(65),
+                    ..Default::default()
+                },
+                64
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn policy_rejects_conflicting_or_foreign_fields() {
         assert!(
