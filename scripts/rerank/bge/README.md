@@ -1,15 +1,22 @@
-# Reproduce the BGE validation
+# BGE native validation
 
 Run from the repository root on Apple Silicon. The production addon needs no
-Python; this directory is an offline acceptance harness. The pinned model,
+Python; this directory contains the native acceptance harness. The pinned model,
 datasets, environment and thresholds live in `fixtures/rerank/bge/manifest.json`.
-`reference-lock.txt` records the full Python environment used for the report.
+`fixtures/rerank/bge/reference-lock.txt` preserves the historical Python environment used for the report.
 Never compare different quantized checkpoints to establish implementation parity.
 
+Python preparation, reference inference, mixed-fixture generation, dataset selection,
+and report aggregation have been removed from the current tree, together with their
+installation requirements. Their [archived tools and procedure](https://github.com/Saviio/mlx-node/blob/370a4a35ec75ea2bb7e28a4de7d14bd631a4712f/scripts/rerank/bge/README.md)
+remain available at commit `370a4a35ec75ea2bb7e28a4de7d14bd631a4712f`.
+Use that revision in a separate checkout when regenerating reference JSON, mixed
+weights, or `quality-inputs.json`; use the current native harness below to evaluate
+the current implementation. Keep checkpoint and fixture identities identical.
+
+With the pinned FP32 checkpoint prepared at `.cache/bge-validation/fp32`:
+
 ```sh
-python3.11 -m venv .cache/bge-reference
-.cache/bge-reference/bin/pip install -r scripts/rerank/bge/requirements.txt
-.cache/bge-reference/bin/python scripts/rerank/bge/prepare.py .cache/bge-validation
 yarn build
 node scripts/rerank/bge/convert.mjs .cache/bge-validation/fp32 .cache/bge-validation
 ```
@@ -20,36 +27,31 @@ the FP32 reference and the converted checkpoints.
 
 ## Independent numerical references
 
-The Torch chain executes the official Transformers architecture in FP32. The
-functional Python MLX chain reads tensors directly and implements XLM-R without
+The archived Torch chain executes the official Transformers architecture in FP32. The
+archived functional Python MLX chain reads tensors directly and implements XLM-R without
 importing the addon, native loader or native inference. Dense projections use
 explicit matmul followed by bias; GELU uses standard compiled `mlx.nn.gelu`.
 Packed projection boundaries restore the activation dtype. These conventions
 fix low-precision evaluation order; thresholds remain frozen in the manifest.
 
+After generating the matching reference artifacts with the archived tools:
+
 ```sh
-.cache/bge-reference/bin/python scripts/rerank/bge/reference.py torch \
-  .cache/bge-validation/fp32 .cache/bge-validation/fp32-reference.json
-.cache/bge-reference/bin/python scripts/rerank/bge/reference.py mlx \
-  .cache/bge-validation/fp16 .cache/bge-validation/fp16-reference.json
 MLX_BGE_GOLDEN_MODEL="$PWD/.cache/bge-validation/fp16" \
 MLX_BGE_GOLDEN_REFERENCE="$PWD/.cache/bge-validation/fp16-reference.json" \
   cargo test -p mlx-core --lib golden_checkpoint_logits -- --ignored --nocapture --test-threads=1
 ```
 
-Repeat for FP32/Torch and BF16, affine, MXFP4/MLX. Use `--cases
+Repeat for FP32/Torch and BF16, affine, MXFP4/MLX. For reference generation in the archived checkout, use `--cases
 fixtures/rerank/bge/long-cases.json` and set `MLX_BGE_GOLDEN_CASES` to the same
 file for 512/2048/8192-token cases. The harness compares exact token IDs,
 positions, masks, usage and truncation; records per-layer CLS differences; then
 enforces both internal-logit and public-sigmoid thresholds and ranking margins.
 Internal logits exist only in these offline reference files and test output.
 
-For mixed weights and a quantized classifier:
-
-```sh
-.cache/bge-reference/bin/python scripts/rerank/bge/mixed-fixture.py \
-  .cache/bge-validation/affine .cache/bge-validation/mixed
-```
+Generate mixed weights and a quantized classifier using the archived procedure,
+then place the checkpoint at `.cache/bge-validation/mixed` alongside its matching
+independent reference.
 
 Golden-test environment paths must be absolute because Cargo runs tests from the
 crate directory. Run the same MLX/reference test for `mixed`. To verify the compiler-disabled
@@ -58,9 +60,10 @@ and use a separate reference output. This does not alter production defaults.
 
 ## Fixed-subset quality
 
+Prepare `.cache/bge-validation/quality-inputs.json` with the archived dataset-selection
+procedure and the current pinned manifest before running:
+
 ```sh
-.cache/bge-reference/bin/python scripts/rerank/bge/quality-inputs.py \
-  .cache/bge-validation/fp32 .cache/bge-validation/datasets .cache/bge-validation/quality-inputs.json
 node scripts/rerank/bge/quality.mjs .cache/bge-validation/fp32 \
   .cache/bge-validation/quality-inputs.json .cache/bge-validation/quality-fp32.json
 node scripts/rerank/bge/quality.mjs .cache/bge-validation/affine \
@@ -83,7 +86,7 @@ actual quantization format and policy, binds the FP32 baseline report, addon,
 Metal library and execution environment, and recomputes metrics from all candidate
 indices. Schema-3 journals cannot resume older evidence missing that identity.
 `MLX_DISABLE_COMPILE` must be absent. `quality-summary.mjs ROOT` verifies evidence
-without importing the addon; `report.py` uses this verification and leaves missing,
+without importing the addon and leaves missing,
 partial, wrong-revision or inconsistent results unaccepted.
 
 Run the CPU evidence-contract regression tests with:
@@ -149,12 +152,10 @@ scenario misses the throughput target; other precisions report measurements with
 that target explicitly marked not applicable. The surface test uses real weights through SDK, HTTP and
 CLI and checks identical normalized results and BGE-only service startup.
 
-```sh
-python3 scripts/rerank/bge/report.py .cache/bge-validation docs/validation/bge-results.json
-```
-
-The compact report records checkpoint/tokenizer, reference and addon SHA-256
-hashes. It deliberately keeps missing or partial gates pending. Raw per-query
+The checked-in compact report is historical evidence bound to its recorded
+checkpoint/tokenizer, reference and addon SHA-256 hashes. Its Python aggregation
+tool is retained in the archived revision only; do not relabel the old report as
+validation of a new build. Missing or partial gates remain pending. Raw per-query
 quality rankings, timings and stage references remain in the validation folder.
 
 The report at `docs/validation/bge-rerank.md` distinguishes completed gates,
@@ -177,7 +178,7 @@ including repeated disposal. Explicit unload must return to the process's initia
 active-memory level; allocator cache is reported separately. This complements
 the benchmark's timed cancellation, which may interrupt tokenization.
 
-Keep failed control runs when investigating a regression. The evidence generator
+Keep failed control runs when investigating a regression. The archived evidence generator
 reads `regression-comparison-initial.json` and `regression-comparison-repeat.json`
 under its root, together with the corresponding `regression-current.json` and
 `regression-current-repeat.json` coexistence reports. A later passing run does not

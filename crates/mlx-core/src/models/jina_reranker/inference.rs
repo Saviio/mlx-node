@@ -644,7 +644,7 @@ mod golden_tests {
     use super::*;
     /// This opt-in check compares intermediate features, not just final ordering.
     #[test]
-    #[ignore = "requires pinned local checkpoints and scripts/rerank/reference.py outputs"]
+    #[ignore = "requires pinned local checkpoints and independent reference artifacts; see scripts/rerank/README.md"]
     fn golden_checkpoint_features() {
         let path = std::env::var("MLX_RERANK_GOLDEN_MODEL").expect("model directory");
         let reference = std::env::var("MLX_RERANK_GOLDEN_REFERENCE").expect("reference JSON");

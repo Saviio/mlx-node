@@ -1,7 +1,0 @@
-transformers==4.38.1
-tokenizers==0.15.2
-torch==2.7.1
-mlx==0.32.4
-numpy==2.2.5
-safetensors==0.7.0
-pyarrow==20.0.0
