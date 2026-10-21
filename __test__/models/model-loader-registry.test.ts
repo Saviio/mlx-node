@@ -17,6 +17,7 @@ const RAW_MODEL_TYPE_ALIASES = {
   clef: ['clef'],
   harrier: ['harrier'],
   jina_reranker: ['jina_reranker'],
+  xlm_roberta_reranker: [],
   gemma4: ['gemma4', 'gemma4_text', 'gemma4_unified'],
   muse_glimmer: ['muse_glimmer', 'muse_glimmer_text'],
   qwen3: ['qwen3'],

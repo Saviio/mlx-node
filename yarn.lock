@@ -1101,6 +1101,7 @@ __metadata:
   resolution: "@mlx-node/lm@workspace:packages/lm"
   dependencies:
     "@mlx-node/core": "workspace:*"
+    "@mlx-node/rerank": "workspace:*"
     "@types/node": "npm:^26.4.0"
   languageName: unknown
   linkType: soft

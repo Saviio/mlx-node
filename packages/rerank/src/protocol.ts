@@ -1,4 +1,4 @@
-import type { RerankerPolicy, RerankRequest, RerankResponse } from './types.js';
+import type { RerankerFamily, RerankerFamilyOptions, RerankerPolicy, RerankRequest, RerankResponse } from './types.js';
 
 export class RerankError extends Error {
   constructor(
@@ -10,27 +10,51 @@ export class RerankError extends Error {
     this.name = 'RerankError';
   }
 }
-const policyKeys = new Set<keyof RerankerPolicy>([
-  'maxBlockTokens',
-  'maxDocumentsPerBlock',
-  'prefillChunkSize',
-  'maxQueryTokens',
-  'maxDocumentTokens',
-  'maxDocuments',
-  'maxInputTokens',
-]);
+const commonPolicyKeys = ['maxQueryTokens', 'maxDocumentTokens', 'maxDocuments', 'maxInputTokens'];
+const familyPolicyKeys: Record<RerankerFamily, ReadonlySet<string>> = {
+  jina_reranker: new Set([...commonPolicyKeys, 'maxBlockTokens', 'maxDocumentsPerBlock', 'prefillChunkSize']),
+  xlm_roberta_reranker: new Set([...commonPolicyKeys, 'maxPairTokens', 'maxBatchSize', 'maxBatchTokens']),
+};
 /** Native-free validation shared by SDK and service startup. Defaults are resolved by the model profile. */
-export function validateRerankerPolicy(value: unknown): Partial<RerankerPolicy> {
+export function validateRerankerPolicy(
+  value: unknown,
+  family: RerankerFamily = 'jina_reranker',
+): Partial<RerankerPolicy> {
   if (value === undefined) return {};
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new RerankError('invalid_request', 'policy must be an object');
   for (const [key, limit] of Object.entries(value)) {
-    if (!policyKeys.has(key as keyof RerankerPolicy))
-      throw new RerankError('invalid_request', `Unknown rerank policy: ${key}`);
+    if (!familyPolicyKeys[family].has(key)) throw new RerankError('invalid_request', `Unknown rerank policy: ${key}`);
     if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1)
       throw new RerankError('invalid_request', `${key} must be a positive integer`);
   }
   return { ...value };
+}
+/** Validate all startup policies before any model mutation or loading. */
+export function validateRerankerFamilies(value: RerankerFamilyOptions = {}): RerankerFamilyOptions {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new RerankError('invalid_request', 'Invalid reranker configuration');
+  for (const key of Object.keys(value))
+    if (!['policy', 'families'].includes(key))
+      throw new RerankError('invalid_request', `Unknown reranker configuration: ${key}`);
+  validateRerankerPolicy(value.policy, 'jina_reranker');
+  if (value.families !== undefined) {
+    if (!value.families || typeof value.families !== 'object' || Array.isArray(value.families))
+      throw new RerankError('invalid_request', 'families must be an object');
+    if (value.policy !== undefined && value.families.jina_reranker !== undefined)
+      throw new RerankError('invalid_request', 'Jina policy specified twice');
+    for (const [family, options] of Object.entries(value.families)) {
+      if (!Object.hasOwn(familyPolicyKeys, family) || !options || typeof options !== 'object' || Array.isArray(options))
+        throw new RerankError('invalid_request', `Invalid reranker family: ${family}`);
+      for (const key of Object.keys(options))
+        if (key !== 'policy') throw new RerankError('invalid_request', `Unknown family option: ${key}`);
+      validateRerankerPolicy(options.policy, family as RerankerFamily);
+    }
+  }
+  return value;
+}
+export function familyLoadOptions(value: RerankerFamilyOptions | undefined, family: RerankerFamily) {
+  return value?.families?.[family] ?? (family === 'jina_reranker' ? { policy: value?.policy } : {});
 }
 export function normalizeRequest(request: RerankRequest): {
   query: string;
@@ -83,11 +107,23 @@ export function rerankWireResponse(model: string, value: RerankResponse) {
     })),
     usage: { input_tokens: value.usage.inputTokens, prompt_tokens: value.usage.promptTokens },
     meta: {
-      profile: value.meta.profile,
-      blocks: value.meta.blocks,
       processed_documents: value.meta.processedDocuments,
-      max_block_tokens: value.meta.maxBlockTokens,
-      max_documents_per_block: value.meta.maxDocumentsPerBlock,
+      ...(value.meta.profile === 'xlmr-cross-encoder-v1'
+        ? {
+            profile: value.meta.profile,
+            batches: value.meta.batches,
+            max_pair_tokens: value.meta.maxPairTokens,
+            max_batch_size: value.meta.maxBatchSize,
+            max_batch_tokens: value.meta.maxBatchTokens,
+            padded_tokens: value.meta.paddedTokens,
+            padding_tokens: value.meta.paddingTokens,
+          }
+        : {
+            profile: value.meta.profile,
+            blocks: value.meta.blocks,
+            max_block_tokens: value.meta.maxBlockTokens,
+            max_documents_per_block: value.meta.maxDocumentsPerBlock,
+          }),
       truncated_query: value.meta.truncatedQuery,
       truncated_document_indices: value.meta.truncatedDocumentIndices,
     },

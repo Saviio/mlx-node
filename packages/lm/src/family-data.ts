@@ -2,13 +2,14 @@
  * Native-free per-family registration rows plus the pure `matchFamily`
  * detection they drive.
  *
- * This module must stay free of runtime imports (`import type` only): it is
+ * This module must stay free of native runtime imports: it is
  * re-exported through the native-free `@mlx-node/agent/catalog` subpath to the
  * dashboard viewer process, which must never dlopen the Metal addon.
  * `packages/agent/__test__/catalog-native-free.test.ts` gates that contract.
  */
 
 import type { ChatConfig } from '@mlx-node/core';
+import { rerankerFamilies } from '@mlx-node/rerank/families';
 
 export type ModelFamilyKind = 'trainable' | 'loadable' | 'embedding' | 'vlm' | 'decision' | 'rerank';
 
@@ -374,14 +375,14 @@ export const MODEL_FAMILY_DATA = [
       maxOutputTokens: 16384,
     },
   },
-  {
-    id: 'jina_reranker',
-    kind: 'rerank',
+  ...rerankerFamilies.map(({ family, architecture }) => ({
+    id: family,
+    kind: 'rerank' as const,
     match: {
-      rawModelTypes: ['jina_reranker'],
-      architectureProbe: ({ architectures }) => architectures.has('JinaForRanking'),
+      rawModelTypes: family === 'jina_reranker' ? [family] : [],
+      architectureProbe: ({ architectures }: ModelConfigMatchContext) => architectures.has(architecture),
     },
-  },
+  })),
   {
     id: 'harrier',
     kind: 'embedding',

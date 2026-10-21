@@ -8,6 +8,8 @@ function model(): RerankerModel & { dispose: ReturnType<typeof vi.fn<RerankerMod
   return {
     info: {
       family: 'jina_reranker',
+      execution: 'listwise',
+      scoreType: 'cosine',
       profile: 'jina-v3',
       contextWindow: 131072,
       quantized: false,

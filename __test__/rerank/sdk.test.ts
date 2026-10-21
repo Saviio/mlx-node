@@ -49,13 +49,13 @@ describe('rerank SDK contract', () => {
   });
   it('returns original text only when requested and disposes once', async () => {
     const native = {
-      infoJson: JSON.stringify({ policy: { maxDocumentsPerBlock: 17 }, profile: 'jina-v3' }),
+      infoJson: JSON.stringify({ family: 'jina_reranker', policy: { maxDocumentsPerBlock: 17 }, profile: 'jina-v3' }),
       startRerank: vi.fn(() => ({ cancel: vi.fn(), result: async () => JSON.stringify(response) })),
       dispose: vi.fn(async () => {}),
     };
     const model = wrapReranker(native);
     const result = await model.rerank({ query: 'q', documents: ['original a', 'original b'], returnDocuments: true });
-    expect(rerankWireResponse('m', result).meta.max_documents_per_block).toBe(17);
+    expect(rerankWireResponse('m', result).meta).toHaveProperty('max_documents_per_block', 17);
     expect(rerankWireResponse('m', result).results[0]).toEqual({
       index: 1,
       relevance_score: 0.8,

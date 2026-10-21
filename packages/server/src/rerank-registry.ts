@@ -71,7 +71,7 @@ export class RerankRegistry {
       owned_by: 'mlx-node',
       modality: 'text',
       task: 'rerank',
-      model_family: 'jina_reranker',
+      model_family: this.entries.get(id)!.model.info.family,
       capabilities: rerankCapabilities,
     }));
   }

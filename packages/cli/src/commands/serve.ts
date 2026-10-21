@@ -43,7 +43,7 @@ Options:
                       directory name under --models-dir. Defaults to
                       ANTHROPIC_MODEL env, else the first discovered model.
   --model-residency <mode>  capability (default) or single
-  --rerank-config <file>    JSON { policy?, service? } for rerank limits
+  --rerank-config <file>    JSON { policy?, families?, service? } for rerank limits
   --auth-token <tok>  Require this secret on every route except /health,
                       as \`x-api-key\` or \`authorization: Bearer\`. Also
                       readable from MLX_SERVER_AUTH_TOKEN.
@@ -231,9 +231,12 @@ async function readRerankConfig(
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid rerank configuration');
   const config = value as Record<string, unknown>;
   for (const key of Object.keys(config))
-    if (!['policy', 'service'].includes(key)) throw new Error(`Unknown rerank config key: ${key}`);
+    if (!['policy', 'families', 'service'].includes(key)) throw new Error(`Unknown rerank config key: ${key}`);
   return {
-    reranker: { policy: config.policy as import('@mlx-node/rerank/types').LoadRerankerOptions['policy'] },
+    reranker: {
+      policy: config.policy as import('@mlx-node/rerank/types').RerankerFamilyOptions['policy'],
+      families: config.families as import('@mlx-node/rerank/types').RerankerFamilyOptions['families'],
+    },
     rerank: config.service as import('@mlx-node/server').RerankServiceOptions,
   };
 }

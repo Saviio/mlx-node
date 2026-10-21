@@ -6,12 +6,18 @@ import { expect, it, vi } from 'vite-plus/test';
 
 import type { RerankerModel } from '../../../packages/rerank/src/types.js';
 import { createInferenceHost } from '../../../packages/server/src/host/index.js';
-it('starts with only rerank models and never logs input or returned documents', async () => {
+it.each([
+  ['jina_reranker', 'JinaForRanking', 'jina-v3'],
+  ['xlm_roberta_reranker', 'XLMRobertaForSequenceClassification', 'xlmr-cross-encoder-v1'],
+] as const)('starts with only %s and never logs input or returned documents', async (family, architecture, profile) => {
   const root = await mkdtemp(join(tmpdir(), 'rerank-host-'));
   const path = join(root, 'rank');
   await mkdir(path);
   for (const [file, content] of Object.entries({
-    'config.json': JSON.stringify({ model_type: 'qwen3', architectures: ['JinaForRanking'] }),
+    'config.json': JSON.stringify({
+      model_type: family === 'jina_reranker' ? 'qwen3' : 'xlm-roberta',
+      architectures: [architecture],
+    }),
     'tokenizer.json': '{}',
     'tokenizer_config.json': '{}',
     'model.safetensors': 'fixture',
@@ -21,17 +27,24 @@ it('starts with only rerank models and never logs input or returned documents', 
   const load = vi.fn(
     async () =>
       ({
-        info: { family: 'jina_reranker', profile: 'jina-v3', quantized: false, policy: {} },
+        info: { family, profile, quantized: false, policy: {} },
         dispose,
         rerank: async () => ({
           results: [{ index: 0, relevanceScore: 0.9, document: { text: 'SECRET_DOCUMENT' } }],
           usage: { inputTokens: 5, promptTokens: 25 },
           meta: {
-            profile: 'jina-v3',
-            blocks: 1,
+            profile,
+            ...(family === 'jina_reranker'
+              ? { blocks: 1, maxBlockTokens: 32768, maxDocumentsPerBlock: 125 }
+              : {
+                  batches: 1,
+                  maxPairTokens: 8192,
+                  maxBatchSize: 8,
+                  maxBatchTokens: 8192,
+                  paddedTokens: 25,
+                  paddingTokens: 0,
+                }),
             processedDocuments: 1,
-            maxBlockTokens: 32768,
-            maxDocumentsPerBlock: 125,
             truncatedQuery: false,
             truncatedDocumentIndices: [],
           },
@@ -60,7 +73,12 @@ it('starts with only rerank models and never logs input or returned documents', 
       }),
     });
     expect(result.status).toBe(200);
-    await result.text();
+    const response = await result.json();
+    expect(response.results[0].relevance_score).toBe(0.9);
+    expect(response.meta.profile).toBe(profile);
+    expect(JSON.stringify(response)).not.toMatch(/logit/i);
+    const models = await (await fetch(host.url + '/v1/models')).json();
+    expect(models.data.find((m: { id: string }) => m.id === 'rank').model_family).toBe(family);
     expect(load).toHaveBeenCalledTimes(1);
     expect(
       (

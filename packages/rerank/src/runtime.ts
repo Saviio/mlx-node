@@ -31,7 +31,8 @@ export function wrapReranker(native: NativeReranker): RerankerModel {
       try {
         const result = JSON.parse(await task.result()) as RerankResponse;
         request.signal?.throwIfAborted();
-        result.meta.maxDocumentsPerBlock = info.policy.maxDocumentsPerBlock;
+        if (info.family === 'jina_reranker' && result.meta.profile !== 'xlmr-cross-encoder-v1')
+          result.meta.maxDocumentsPerBlock = info.policy.maxDocumentsPerBlock;
         if (request.returnDocuments)
           for (const item of result.results) item.document = { text: input.documents[item.index] };
         return result;

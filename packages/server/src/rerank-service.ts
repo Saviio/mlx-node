@@ -52,6 +52,8 @@ export interface RerankMetrics {
   weightFormats?: readonly string[];
   documents?: number;
   blocks?: number;
+  batches?: number;
+  paddingTokens?: number;
   promptTokens?: number;
   truncatedDocuments?: number;
 }
@@ -110,7 +112,10 @@ export class RerankService {
         const result = await this.run(model, request, signal, record);
         signal.throwIfAborted();
         record.state = 'completed';
-        record.blocks = result.meta.blocks;
+        if (result.meta.profile === 'xlmr-cross-encoder-v1') {
+          record.batches = result.meta.batches;
+          record.paddingTokens = result.meta.paddingTokens;
+        } else record.blocks = result.meta.blocks;
         record.promptTokens = result.usage.promptTokens;
         record.truncatedDocuments = result.meta.truncatedDocumentIndices.length;
         res.writeHead(200, { 'Content-Type': 'application/json' });

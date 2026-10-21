@@ -8,6 +8,7 @@ import {
   ggufArchitecture,
   HarrierModel,
   JinaRerankerModel,
+  XlmRobertaRerankerModel,
   K2HorizonModel as NativeK2HorizonModel,
   Lfm2Model as NativeLfm2Model,
   MuseGlimmerModel as NativeMuseGlimmerModel,
@@ -97,6 +98,10 @@ interface LoaderBinding {
  * compile.
  */
 const LOADER_BINDINGS = {
+  xlm_roberta_reranker: {
+    load: (path: string) => XlmRobertaRerankerModel.load(path),
+    nativeModelClass: XlmRobertaRerankerModel,
+  },
   jina_reranker: { load: (path: string) => JinaRerankerModel.load(path), nativeModelClass: JinaRerankerModel },
   clef: { load: (path: string) => ClefModel.load(path), nativeModelClass: ClefModel },
   gemma4: {

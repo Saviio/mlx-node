@@ -50,8 +50,8 @@ import {
 } from '@mlx-node/lm';
 import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
 import { discoverRerankers, type DiscoveredReranker } from '@mlx-node/rerank/catalog';
-import { validateRerankerPolicy } from '@mlx-node/rerank/protocol';
-import type { LoadRerankerOptions, RerankerModel } from '@mlx-node/rerank/types';
+import { validateRerankerFamilies, familyLoadOptions } from '@mlx-node/rerank/protocol';
+import type { RerankerFamilyOptions, RerankerModel } from '@mlx-node/rerank/types';
 
 import type { AudioModel } from '../audio-registry.js';
 import type { AudioServiceOptions } from '../audio-service.js';
@@ -125,7 +125,7 @@ export interface InferenceHostOptions {
   modelResidency?: 'capability' | 'single';
   audio?: AudioServiceOptions;
   rerank?: RerankServiceOptions;
-  reranker?: LoadRerankerOptions;
+  reranker?: RerankerFamilyOptions;
   loadRerankModel?: (entry: DiscoveredReranker) => Promise<RerankerModel>;
   loadAudioModel?: (entry: DiscoveredAudioModel) => Promise<AudioModel>;
   /**
@@ -252,7 +252,7 @@ export interface InferenceHost {
  * render those into their own messages.
  */
 export async function createInferenceHost(opts: InferenceHostOptions = {}): Promise<InferenceHost> {
-  validateRerankerPolicy(opts.reranker?.policy);
+  validateRerankerFamilies(opts.reranker);
   const host = opts.host ?? '127.0.0.1';
   // BEFORE the engine policy, the temp sweep and discovery — all of which
   // mutate state outside this function — so a refused start leaves nothing
@@ -382,7 +382,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       rerankCapability(
         rerankModels,
         server.registry,
-        opts.loadRerankModel ?? ((entry) => loadRerankModel(entry, opts.reranker)),
+        opts.loadRerankModel ?? ((entry) => loadRerankModel(entry, familyLoadOptions(opts.reranker, entry.modelType))),
       ),
     ],
     opts.modelResidency ?? 'capability',

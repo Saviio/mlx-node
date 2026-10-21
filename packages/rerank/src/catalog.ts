@@ -1,20 +1,18 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+
+import { rerankerFamily } from './families.js';
+import type { RerankerFamily } from './types.js';
+export { rerankerFamilies, rerankerFamily } from './families.js';
 export const rerankCapabilities = Object.freeze({ rerank: true, text: true, streaming: false });
 export interface DiscoveredReranker {
   name: string;
   path: string;
-  modelType: 'jina_reranker';
+  modelType: RerankerFamily;
   kind: 'rerank';
 }
 export function isRerankerConfig(config: unknown): boolean {
-  return (
-    !!config &&
-    typeof config === 'object' &&
-    'architectures' in config &&
-    Array.isArray(config.architectures) &&
-    config.architectures.includes('JinaForRanking')
-  );
+  return rerankerFamily(config) !== undefined;
 }
 export async function discoverRerankers(
   root: string,
@@ -33,7 +31,8 @@ export async function discoverRerankers(
     const path = join(root, entry.name);
     try {
       const config = JSON.parse(await readFile(join(path, 'config.json'), 'utf8'));
-      if (!isRerankerConfig(config)) continue;
+      const family = rerankerFamily(config);
+      if (!family) continue;
       const files = await Promise.all(['tokenizer.json', 'tokenizer_config.json'].map((f) => stat(join(path, f))));
       if (files.some((f) => !f.isFile())) throw new Error(`Invalid reranker tokenizer files: ${path}`);
       const weights = await Promise.all(
@@ -47,7 +46,7 @@ export async function discoverRerankers(
         }),
       );
       if (!weights.some(Boolean)) throw new Error(`Missing reranker checkpoint: ${path}`);
-      found.push({ name: entry.name, path, modelType: 'jina_reranker', kind: 'rerank' });
+      found.push({ name: entry.name, path, modelType: family, kind: 'rerank' });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') onFailure?.(error);
     }

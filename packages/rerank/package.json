@@ -1,7 +1,7 @@
 {
   "name": "@mlx-node/rerank",
   "version": "0.0.16",
-  "description": "Native listwise reranking on Apple Silicon",
+  "description": "Native reranking on Apple Silicon",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -36,6 +36,11 @@
       "@mlx-node/source": "./src/protocol.ts",
       "types": "./dist/protocol.d.ts",
       "import": "./dist/protocol.js"
+    },
+    "./families": {
+      "@mlx-node/source": "./src/families.ts",
+      "types": "./dist/families.d.ts",
+      "import": "./dist/families.js"
     }
   },
   "scripts": {

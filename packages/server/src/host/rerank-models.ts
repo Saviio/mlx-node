@@ -26,7 +26,7 @@ export function rerankCapability(
         owned_by: 'mlx-node',
         modality: 'text',
         task: 'rerank',
-        model_family: 'jina_reranker',
+        model_family: e.modelType,
         capabilities: rerankCapabilities,
       })),
     hasResident: (name) => !!registry.rerank.get(name),
@@ -38,7 +38,7 @@ export function rerankCapability(
       await registry.rerank.disposeAll();
       const model = await loader(entry);
       try {
-        if (model.info.family !== 'jina_reranker') throw new Error('Loader returned an incompatible reranker');
+        if (model.info.family !== entry.modelType) throw new Error('Loader returned an incompatible reranker');
         registry.rerank.register(name, model);
       } catch (error) {
         await model.dispose();
