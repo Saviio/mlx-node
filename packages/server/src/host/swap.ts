@@ -17,6 +17,7 @@ import type { DiscoveredModel } from './discover.js';
 export interface SwapController {
   resolveModel: (name: string) => Promise<void>;
   listModels: () => PublicModelEntry[];
+  disposeAll?: () => Promise<void>;
 }
 
 /**
@@ -204,5 +205,13 @@ export function makeSwapController(
     }));
   }
 
-  return { resolveModel, listModels };
+  async function disposeAll(): Promise<void> {
+    await currentOp;
+    const sessions = registry.listSessionRegistries();
+    for (const entry of registry.list()) if (registry.getAny(entry.id)) registry.unregister(entry.id);
+    resident = null;
+    aliases.clear();
+    await Promise.all(sessions.map((session) => session.flushPendingDisposals()));
+  }
+  return { resolveModel, listModels, disposeAll };
 }

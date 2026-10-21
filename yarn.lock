@@ -1130,6 +1130,7 @@ __metadata:
     "@mlx-node/asr": "workspace:*"
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
+    "@mlx-node/rerank": "workspace:*"
     "@mlx-node/tts": "workspace:*"
     "@types/node": "catalog:"
   languageName: unknown
