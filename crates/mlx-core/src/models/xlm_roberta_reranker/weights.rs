@@ -119,6 +119,19 @@ pub(crate) fn read_weights(dir: &Path) -> Result<HashMap<String, MxArray>> {
     }
     Ok(out)
 }
+fn validate_quantization(q: PerLayerQuant, context: &str) -> Result<()> {
+    if q.bits != 4
+        || !matches!(q.mode, PerLayerMode::Affine | PerLayerMode::Mxfp4)
+        || q.input_amax.is_some()
+        || q.layout != KQuantLayout::RowMajor
+        || q.group_size <= 0
+        || (q.mode == PerLayerMode::Mxfp4 && q.group_size != 32)
+    {
+        return Err(invalid(format!("unsupported quantization for {context}")));
+    }
+    Ok(())
+}
+
 pub(crate) struct Weights {
     pub tensors: HashMap<String, MxArray>,
     overrides: HashMap<String, PerLayerQuant>,
@@ -145,16 +158,23 @@ impl Weights {
         }
         let (bits, group_size, mode, overrides) =
             quant_dispatch::parse_quant_settings(block, 4, 64)?;
+        let default = PerLayerQuant {
+            bits,
+            group_size,
+            mode: mode.unwrap_or(PerLayerMode::Affine),
+            input_amax: None,
+            layout: KQuantLayout::RowMajor,
+        };
+        // Declared formats are part of this backend's contract even for modules
+        // retained as dense. Do not silently accept another family's format.
+        validate_quantization(default, "default quantization")?;
+        for (name, quant) in &overrides {
+            validate_quantization(*quant, name)?;
+        }
         Ok(Self {
             tensors,
             overrides,
-            default: PerLayerQuant {
-                bits,
-                group_size,
-                mode: mode.unwrap_or(PerLayerMode::Affine),
-                input_amax: None,
-                layout: KQuantLayout::RowMajor,
-            },
+            default,
             has_quant_config: block.is_some(),
         })
     }
@@ -181,18 +201,8 @@ impl Weights {
                 ));
             }
             let q = quant_dispatch::effective_plq_for(base, &self.overrides, self.default, None);
-            if q.bits != 4
-                || !matches!(q.mode, PerLayerMode::Affine | PerLayerMode::Mxfp4)
-                || q.input_amax.is_some()
-                || q.layout != KQuantLayout::RowMajor
-            {
-                return Err(invalid(format!("unsupported quantization for {base}")));
-            }
-            if q.group_size <= 0
-                || columns % i64::from(q.group_size) != 0
-                || columns % 8 != 0
-                || (q.mode == PerLayerMode::Mxfp4 && q.group_size != 32)
-            {
+            validate_quantization(q, base)?;
+            if columns % i64::from(q.group_size) != 0 || columns % 8 != 0 {
                 return Err(invalid(format!("invalid quantization geometry for {base}")));
             }
             if shape.as_ref() != [rows, columns / 8] || w.dtype()? != DType::Uint32 {
@@ -423,6 +433,35 @@ impl Weights {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unsupported_declarations_are_rejected_without_packed_tensors() {
+        for quantization in [
+            serde_json::json!({"mode":"mxfp8","bits":8,"group_size":32}),
+            serde_json::json!({"mode":"affine","bits":8,"group_size":64}),
+            serde_json::json!({"classifier.dense":{"mode":"mxfp8","bits":8,"group_size":32}}),
+        ] {
+            assert!(
+                Weights::from_tensors(
+                    HashMap::new(),
+                    &serde_json::json!({"quantization":quantization})
+                )
+                .is_err()
+            );
+        }
+        for quantization in [
+            serde_json::json!({"mode":"affine","bits":4,"group_size":64}),
+            serde_json::json!({"mode":"mxfp4","bits":4,"group_size":32}),
+        ] {
+            assert!(
+                Weights::from_tensors(
+                    HashMap::new(),
+                    &serde_json::json!({"quantization":quantization})
+                )
+                .is_ok()
+            );
+        }
+    }
+
     #[test]
     fn duplicate_header_and_index_keys_are_rejected() {
         assert!(serde_json::from_str::<UniqueMap<Value>>(r#"{"x":{},"x":{}}"#).is_err());

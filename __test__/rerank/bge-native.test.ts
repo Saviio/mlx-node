@@ -229,21 +229,31 @@ it.each([NaN, Infinity, -Infinity])('rejects nonfinite logits before sigmoid: %s
     await model.dispose();
   }
 });
-it.each(['missing-bias', 'wrong-position', 'wrong-head', 'orphan-sidecar', 'wrong-profile', 'decoder', 'activation'])(
-  'fails closed on invalid %s',
-  async (kind) => {
-    const path = await fixture(kind, (t, c) => {
-      if (kind === 'missing-bias') delete t['roberta.encoder.layer.0.attention.self.query.bias'];
-      if (kind === 'wrong-position') c.max_position_embeddings = 65;
-      if (kind === 'wrong-head') t['classifier.out_proj.weight'] = { shape: [2, 64], data: new Float32Array(128) };
-      if (kind === 'orphan-sidecar') t['classifier.dense.biases'] = { shape: [64, 1], data: new Float32Array(64) };
-      if (kind === 'wrong-profile') c.reranker = { version: 1, profile: 'jina-v3' };
-      if (kind === 'decoder') c.is_decoder = true;
-      if (kind === 'activation') c.hidden_act = 'gelu_new';
-    });
-    await expect(loadReranker(path)).rejects.toThrow();
-  },
-);
+it.each([
+  'missing-bias',
+  'wrong-position',
+  'wrong-head',
+  'orphan-sidecar',
+  'wrong-profile',
+  'decoder',
+  'activation',
+  'unsupported-dense-quantization',
+  'unsupported-dense-override',
+])('fails closed on invalid %s', async (kind) => {
+  const path = await fixture(kind, (t, c) => {
+    if (kind === 'missing-bias') delete t['roberta.encoder.layer.0.attention.self.query.bias'];
+    if (kind === 'wrong-position') c.max_position_embeddings = 65;
+    if (kind === 'wrong-head') t['classifier.out_proj.weight'] = { shape: [2, 64], data: new Float32Array(128) };
+    if (kind === 'orphan-sidecar') t['classifier.dense.biases'] = { shape: [64, 1], data: new Float32Array(64) };
+    if (kind === 'wrong-profile') c.reranker = { version: 1, profile: 'jina-v3' };
+    if (kind === 'decoder') c.is_decoder = true;
+    if (kind === 'activation') c.hidden_act = 'gelu_new';
+    if (kind === 'unsupported-dense-quantization') c.quantization = { mode: 'mxfp8', bits: 8, group_size: 32 };
+    if (kind === 'unsupported-dense-override')
+      c.quantization = { 'classifier.dense': { mode: 'mxfp8', bits: 8, group_size: 32 } };
+  });
+  await expect(loadReranker(path)).rejects.toThrow();
+});
 it.each([
   ['f16', 'float16'],
   ['bf16', 'bfloat16'],
