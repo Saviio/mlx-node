@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -38,28 +39,12 @@ for path in sorted((args.root / "logs").glob("*-golden.log")):
         "cases": rows,
     }
 
-quality = {}
-for dtype in ["fp32", "affine", "mxfp4"]:
-    raw = optional(f"quality-{dtype}.json")
-    if raw is None:
-        quality[dtype] = {"complete": False}
-        continue
-    quality[dtype] = {
-        "complete": len(raw["datasets"]) == len(manifest["datasets"])
-        and all(
-            len(d["queries"]) == manifest["qualitySelection"]["queriesPerDataset"]
-            for d in raw["datasets"]
-        ),
-        "inputSha256": raw["inputSha256"],
-        "addonSha256": raw["addonSha256"],
-        "datasets": [
-            {
-                **{k: v for k, v in d.items() if k != "queries"},
-                "queryCount": len(d["queries"]),
-            }
-            for d in raw["datasets"]
-        ],
-    }
+quality = json.loads(
+    subprocess.check_output(
+        ["node", str(repo / "scripts/rerank/bge/quality-summary.mjs"), str(args.root)],
+        text=True,
+    )
+)
 
 checkpoints = {}
 for dtype in ["fp32", "fp16", "bf16", "affine", "mxfp4", "mixed"]:
@@ -87,9 +72,15 @@ report = {
                 ),
                 repo / "crates/mlx-core/src/models/rerank_runtime.rs",
                 repo / "crates/mlx-core/src/convert.rs",
-                repo / "scripts/rerank/bge/reference.py",
+                *(repo / "scripts/rerank/bge").glob("*.py"),
+                *(repo / "scripts/rerank/bge").glob("*.mjs"),
             ]
         )
+    },
+    "fixtureChecksums": {
+        str(p.relative_to(repo)): sha256(p)
+        for p in sorted((repo / "fixtures/rerank/bge").iterdir())
+        if p.is_file()
     },
     "checkpoints": checkpoints,
     "referenceChecksums": {

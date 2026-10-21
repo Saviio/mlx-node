@@ -76,6 +76,21 @@ match. The recovery key includes the dataset and original sample index, so
 repeated query text with different candidates remains distinct. A changed artifact
 requires a new output path.
 
+Quality acceptance pins the official FP32 file hashes in
+[`fp32-checksums.json`](../../../fixtures/rerank/bge/fp32-checksums.json). It checks
+actual quantization format and policy, binds the FP32 baseline report, addon,
+Metal library and execution environment, and recomputes metrics from all candidate
+indices. Schema-3 journals cannot resume older evidence missing that identity.
+`MLX_DISABLE_COMPILE` must be absent. `quality-summary.mjs ROOT` verifies evidence
+without importing the addon; `report.py` uses this verification and leaves missing,
+partial, wrong-revision or inconsistent results unaccepted.
+
+Run the CPU evidence-contract regression tests with:
+
+```sh
+node --test scripts/rerank/bge/quality-contract.test.mjs
+```
+
 ## Performance and regression
 
 ```sh

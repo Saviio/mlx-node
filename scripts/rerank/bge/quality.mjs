@@ -1,13 +1,25 @@
+import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readFile, writeFile, appendFile, readdir } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 
 import { XlmRobertaRerankerModel } from '../../../packages/core/index.cjs';
+import {
+  rankingMetrics,
+  validateQualityInput,
+  validateQualityDatasets,
+  validateQualityBaseline,
+  validateQualityFormat,
+  validateQualityPolicy,
+} from './quality-contract.mjs';
 const [modelPath, inputPath, outputPath, baselinePath] = process.argv.slice(2);
 if (!outputPath) throw Error('Usage: node quality.mjs MODEL INPUT OUTPUT [BASELINE]');
 const manifest = JSON.parse(
   await readFile(new URL('../../../fixtures/rerank/bge/manifest.json', import.meta.url), 'utf8'),
+);
+manifest.model.fp32Checksums = JSON.parse(
+  await readFile(new URL('../../../fixtures/rerank/bge/fp32-checksums.json', import.meta.url), 'utf8'),
 );
 const hashFile = async (path) => {
   const hash = createHash('sha256');
@@ -15,23 +27,37 @@ const hashFile = async (path) => {
   return hash.digest('hex');
 };
 const input = JSON.parse(await readFile(inputPath, 'utf8'));
+validateQualityInput(input, manifest);
+assert.ok(!Object.hasOwn(process.env, 'MLX_DISABLE_COMPILE'), 'Quality acceptance requires MLX compilation');
 const baseline = baselinePath ? JSON.parse(await readFile(baselinePath, 'utf8')) : undefined;
+const config = JSON.parse(await readFile(join(modelPath, 'config.json'), 'utf8'));
 const checksums = {};
 for (const name of (await readdir(modelPath)).sort()) {
   if (name.endsWith('.json') || name.endsWith('.safetensors')) checksums[name] = await hashFile(join(modelPath, name));
 }
+const addonPath = process.env.NAPI_RS_NATIVE_LIBRARY_PATH ?? resolve('packages/core/mlx-core.darwin-arm64.node');
 const identity = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   model: resolve(modelPath),
   checksums,
   inputSha256: await hashFile(inputPath),
-  addonSha256: await hashFile(
-    process.env.NAPI_RS_NATIVE_LIBRARY_PATH ??
-      new URL('../../../packages/core/mlx-core.darwin-arm64.node', import.meta.url),
-  ),
+  addonPath: resolve(addonPath),
+  addonSha256: await hashFile(addonPath),
+  metalSha256: await hashFile(join(dirname(addonPath), 'mlx.metallib')),
+  executionEnvironmentSha256: createHash('sha256')
+    .update(
+      JSON.stringify(
+        Object.entries(process.env)
+          .filter(([key]) => /^(MLX_|MTL_|METAL_|DYLD_|OMP_|VECLIB_|OPENBLAS_|ACCELERATE_|NODE_OPTIONS$)/.test(key))
+          .sort(([a], [b]) => a.localeCompare(b)),
+      ),
+    )
+    .digest('hex'),
 };
-if (baseline && baseline.inputSha256 !== identity.inputSha256)
-  throw Error('Quality baseline input identity differs (queries, candidates, labels, or dataset revision)');
+if (baseline) {
+  validateQualityBaseline(baseline, identity, input, manifest);
+  assert.equal(config.reranker?.sourceRevision, manifest.model.revision, 'Quantized checkpoint source differs');
+}
 const progressPath = outputPath + '.progress.jsonl';
 let completed = [];
 try {
@@ -52,9 +78,24 @@ async function rerank(request) {
     task.cancel();
   } // Retain task ownership until completion, including GC during long runs.
 }
-const report = { ...identity, info: JSON.parse(model.infoJson), datasets: [] };
-const dcg = (labels) => labels.reduce((sum, rel, i) => sum + rel / Math.log2(i + 2), 0);
+const report = {
+  ...identity,
+  computeDtype: config.reranker?.computeDtype ?? config.torch_dtype,
+  baselineSha256: baselinePath ? await hashFile(baselinePath) : null,
+  info: JSON.parse(model.infoJson),
+  complete: false,
+  datasets: [],
+};
 try {
+  validateQualityPolicy(report.info.policy);
+  if (baseline) {
+    validateQualityFormat(report.info, config);
+    assert.deepEqual(report.info.policy, baseline.info.policy, 'Quality policies differ');
+  } else {
+    assert.equal(report.computeDtype, 'float32', 'A non-FP32 evaluation needs a pinned FP32 baseline');
+    assert.equal(report.info.quantized, false);
+    assert.deepEqual(checksums, manifest.model.fp32Checksums);
+  }
   for (const dataset of input.datasets) {
     const rows = [];
     for (const [queryIndex, query] of dataset.queries.entries()) {
@@ -68,10 +109,7 @@ try {
       const started = performance.now();
       const r = await rerank({ query: query.query, documents: query.documents, truncate: true });
       const ranking = r.results.map((v) => v.index);
-      const ideal = dcg(query.labels.toSorted((a, b) => b - a).slice(0, 10));
-      const ndcg10 = dcg(ranking.slice(0, 10).map((i) => query.labels[i])) / ideal;
-      const first = ranking.slice(0, 10).findIndex((i) => query.labels[i] > 0);
-      const mrr10 = first < 0 ? 0 : 1 / (first + 1);
+      const { ndcg10, mrr10 } = rankingMetrics(ranking, query.labels);
       const row = {
         queryIndex,
         sha256: query.sha256,
@@ -122,6 +160,9 @@ try {
       }),
     );
   }
+  validateQualityDatasets(report, input, manifest);
+  report.complete = true;
+  await writeFile(outputPath, JSON.stringify(report, null, 2) + '\n');
 } finally {
   await model.dispose();
 }
