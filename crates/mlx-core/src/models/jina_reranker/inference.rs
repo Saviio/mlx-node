@@ -160,6 +160,7 @@ impl Model {
             .unwrap_or(config.max_position_embeddings);
         let policy = Policy::resolve(options, profile, context)?;
         let weights = Weights::new(path, &raw)?;
+        weights.validate_config(&config)?;
         let embedding = weights.embedding(config.vocab_size, config.hidden_size)?;
         let h = config.hidden_size;
         let d = config.head_dim;

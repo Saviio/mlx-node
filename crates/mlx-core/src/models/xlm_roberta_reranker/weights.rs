@@ -4,63 +4,18 @@ use crate::{
     models::{
         quant_dispatch::{self, KQuantLayout, PerLayerMode, PerLayerQuant},
         quantized_linear::{LinearProj, QuantizedLinear},
+        rerank_checkpoint::{UniqueMap, validate_header},
     },
     nn::{Embedding, LayerNorm, Linear},
     utils::safetensors::load_safetensors_lazy,
 };
 use napi::Result;
-use serde::{
-    Deserialize, Deserializer,
-    de::{Error as _, MapAccess, Visitor},
-};
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap},
     path::Path,
 };
-use std::{fmt, io::Read, marker::PhantomData};
-
-// serde's default maps accept repeated JSON keys. Check before MLX's lazy
-// reader so duplicate tensors cannot silently select the last occurrence.
-struct UniqueMap<V>(HashMap<String, V>);
-impl<'de, V: Deserialize<'de>> Deserialize<'de> for UniqueMap<V> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        struct MapVisitor<V>(PhantomData<V>);
-        impl<'de, V: Deserialize<'de>> Visitor<'de> for MapVisitor<V> {
-            type Value = UniqueMap<V>;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a map with unique keys")
-            }
-            fn visit_map<M: MapAccess<'de>>(
-                self,
-                mut map: M,
-            ) -> std::result::Result<Self::Value, M::Error> {
-                let mut out = HashMap::new();
-                while let Some((key, value)) = map.next_entry::<String, V>()? {
-                    if out.insert(key.clone(), value).is_some() {
-                        return Err(M::Error::custom(format!("duplicate key {key}")));
-                    }
-                }
-                Ok(UniqueMap(out))
-            }
-        }
-        deserializer.deserialize_map(MapVisitor(PhantomData))
-    }
-}
-fn validate_header(path: &Path) -> Result<()> {
-    let mut file = std::fs::File::open(path).map_err(invalid)?;
-    let mut size = [0u8; 8];
-    file.read_exact(&mut size).map_err(invalid)?;
-    let size = u64::from_le_bytes(size);
-    // The safetensors specification's header limit, independent of model size.
-    if size > 100_000_000 || size > file.metadata().map_err(invalid)?.len().saturating_sub(8) {
-        return Err(invalid("invalid safetensors header length"));
-    }
-    let mut bytes = vec![0; size as usize];
-    file.read_exact(&mut bytes).map_err(invalid)?;
-    serde_json::from_slice::<UniqueMap<Value>>(&bytes).map_err(invalid)?;
-    Ok(())
-}
 
 pub(crate) fn read_weights(dir: &Path) -> Result<HashMap<String, MxArray>> {
     let index_path = dir.join("model.safetensors.index.json");
@@ -147,9 +102,14 @@ impl Weights {
         let mut declared = BTreeSet::new();
         if let Some(object) = block.and_then(Value::as_object) {
             for (name, value) in object {
-                if value.is_object()
-                    && !declared.insert(quant_dispatch::normalize_per_layer_key(name))
-                {
+                let module = quant_dispatch::normalize_per_layer_key(name);
+                let is_module = module.starts_with("roberta.") || module.starts_with("classifier.");
+                if is_module && !value.as_object().is_some_and(|v| v.contains_key("bits")) {
+                    return Err(invalid(format!(
+                        "invalid quantization declaration for {module}: expected an object with bits"
+                    )));
+                }
+                if value.is_object() && !declared.insert(module) {
                     return Err(invalid(format!(
                         "duplicate quantization declaration {name}"
                     )));
@@ -439,6 +399,10 @@ mod tests {
             serde_json::json!({"mode":"mxfp8","bits":8,"group_size":32}),
             serde_json::json!({"mode":"affine","bits":8,"group_size":64}),
             serde_json::json!({"classifier.dense":{"mode":"mxfp8","bits":8,"group_size":32}}),
+            serde_json::json!({"classifier.dense":{}}),
+            serde_json::json!({"classifier.dense":false}),
+            serde_json::json!({"roberta.embeddings.word_embeddings":{}}),
+            serde_json::json!({"roberta.encoder.layer.0.attention.self.query":false}),
         ] {
             assert!(
                 Weights::from_tensors(
@@ -462,11 +426,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn duplicate_header_and_index_keys_are_rejected() {
-        assert!(serde_json::from_str::<UniqueMap<Value>>(r#"{"x":{},"x":{}}"#).is_err());
-        assert!(serde_json::from_str::<UniqueMap<String>>(r#"{"x":"a","x":"b"}"#).is_err());
-    }
     #[test]
     fn packed_linear_keeps_additive_bias_including_single_output_head() {
         for mode in [PerLayerMode::Affine, PerLayerMode::Mxfp4] {

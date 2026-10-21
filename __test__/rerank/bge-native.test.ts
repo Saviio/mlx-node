@@ -8,7 +8,11 @@ import { beforeAll, afterAll, expect, it } from 'vite-plus/test';
 import { loadSession } from '../../packages/lm/src/models/model-loader.js';
 import { loadReranker } from '../../packages/rerank/src/index.js';
 
-type Tensor = { shape: number[]; data: Float32Array };
+type Tensor = {
+  shape: number[];
+  data: Float32Array | Int32Array | Int16Array | Uint8Array;
+  dtype?: 'F32' | 'I32' | 'I16' | 'BOOL';
+};
 let root: string;
 const config = {
   architectures: ['XLMRobertaForSequenceClassification'],
@@ -65,7 +69,7 @@ async function save(path: string, tensors: Record<string, Tensor>) {
   let offset = 0;
   const header: Record<string, unknown> = {};
   const buffers = Object.entries(tensors).map(([key, t]) => {
-    header[key] = { dtype: 'F32', shape: t.shape, data_offsets: [offset, offset + t.data.byteLength] };
+    header[key] = { dtype: t.dtype ?? 'F32', shape: t.shape, data_offsets: [offset, offset + t.data.byteLength] };
     offset += t.data.byteLength;
     return Buffer.from(t.data.buffer);
   });
@@ -239,6 +243,10 @@ it.each([
   'activation',
   'unsupported-dense-quantization',
   'unsupported-dense-override',
+  'empty-head-override',
+  'scalar-head-override',
+  'empty-embedding-override',
+  'scalar-attention-override',
 ])('fails closed on invalid %s', async (kind) => {
   const path = await fixture(kind, (t, c) => {
     if (kind === 'missing-bias') delete t['roberta.encoder.layer.0.attention.self.query.bias'];
@@ -251,8 +259,32 @@ it.each([
     if (kind === 'unsupported-dense-quantization') c.quantization = { mode: 'mxfp8', bits: 8, group_size: 32 };
     if (kind === 'unsupported-dense-override')
       c.quantization = { 'classifier.dense': { mode: 'mxfp8', bits: 8, group_size: 32 } };
+    if (kind === 'empty-head-override') c.quantization = { 'classifier.dense': {} };
+    if (kind === 'scalar-head-override') c.quantization = { 'classifier.dense': false };
+    if (kind === 'empty-embedding-override') c.quantization = { 'roberta.embeddings.word_embeddings': {} };
+    if (kind === 'scalar-attention-override')
+      c.quantization = { 'roberta.encoder.layer.0.attention.self.query': false };
   });
   await expect(loadReranker(path)).rejects.toThrow();
+});
+it.each([
+  ['I32', 'classifier.dense.weight'],
+  ['BOOL', 'classifier.out_proj.bias'],
+  ['I16', 'roberta.embeddings.position_embeddings.weight'],
+] as const)('rejects %s source storage for %s before conversion casts', async (dtype, key) => {
+  const inputDir = await fixture(`invalid-source-dtype-${dtype}`, (t) => {
+    const original = t[key];
+    const count = original.shape.reduce((a, b) => a * b, 1);
+    t[key] = {
+      shape: original.shape,
+      dtype,
+      data: dtype === 'I32' ? new Int32Array(count) : dtype === 'I16' ? new Int16Array(count) : new Uint8Array(count),
+    };
+  });
+  await expect(loadReranker(inputDir)).rejects.toThrow(/dtype|floating/);
+  await expect(
+    convertModel({ inputDir, outputDir: join(root, `invalid-source-converted-${dtype}`), dtype: 'bfloat16' }),
+  ).rejects.toThrow(/dtype|floating/);
 });
 it.each([
   ['f16', 'float16'],

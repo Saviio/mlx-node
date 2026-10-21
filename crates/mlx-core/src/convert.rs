@@ -2938,20 +2938,11 @@ pub(crate) mod recipe {
             _tied: bool,
             _verbose: bool,
         ) -> Result<HashMap<String, MxArray>> {
-            crate::models::jina_reranker::config::Config::parse(config)?;
-            let mut out = HashMap::new();
-            for (name, weight) in weights {
-                let key = crate::models::jina_reranker::weights::canonical_key(&name);
-                if key.starts_with("lm_head.") {
-                    continue;
-                }
-                if out.insert(key.clone(), weight).is_some() {
-                    return Err(Error::from_reason(format!(
-                        "Conflicting reranker tensor {key}"
-                    )));
-                }
-            }
-            Ok(out)
+            let (c, _) = crate::models::jina_reranker::config::Config::parse(config)?;
+            let adapter =
+                crate::models::jina_reranker::weights::Weights::from_tensors(weights, config)?;
+            adapter.validate_config(&c)?;
+            Ok(adapter.tensors)
         }
     }
 
@@ -3967,9 +3958,19 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
     if is_reranker {
         tensors = if is_jina_reranker {
-            crate::models::jina_reranker::weights::read_weights(&input_dir)?
+            let (c, _) = crate::models::jina_reranker::config::Config::parse(&config)?;
+            let weights = crate::models::jina_reranker::weights::Weights::new(&input_dir, &config)?;
+            // Validate source storage before dtype casts can disguise an invalid
+            // tensor. The recipe validates the canonical tensors again before output.
+            weights.validate_config(&c)?;
+            weights.tensors
         } else {
-            crate::models::xlm_roberta_reranker::weights::read_weights(&input_dir)?
+            let c = crate::models::xlm_roberta_reranker::config::Config::parse(&config)?;
+            let weights =
+                crate::models::xlm_roberta_reranker::weights::Weights::new(&input_dir, &config)?;
+            weights.validate_config(&c)?;
+            weights.compute_dtype(&config)?;
+            weights.tensors
         };
         num_tensors = tensors.len();
         num_parameters = tensors.values().try_fold(0usize, |n, tensor| {

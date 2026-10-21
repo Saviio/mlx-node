@@ -7,7 +7,7 @@ import { afterAll, beforeAll, expect, it } from 'vite-plus/test';
 
 import { loadReranker } from '../../packages/rerank/src/index.js';
 
-type Tensor = { shape: number[]; data: Float32Array };
+type Tensor = { shape: number[]; data: Float32Array | Int32Array; dtype?: 'F32' | 'I32' };
 let root: string;
 const config = {
   architectures: ['JinaForRanking'],
@@ -62,7 +62,7 @@ async function save(path: string, tensors: Record<string, Tensor>): Promise<void
   let offset = 0;
   const metadata: Record<string, unknown> = {};
   const buffers = Object.entries(tensors).map(([name, t]) => {
-    metadata[name] = { dtype: 'F32', shape: t.shape, data_offsets: [offset, offset + t.data.byteLength] };
+    metadata[name] = { dtype: t.dtype ?? 'F32', shape: t.shape, data_offsets: [offset, offset + t.data.byteLength] };
     offset += t.data.byteLength;
     return Buffer.from(t.data.buffer);
   });
@@ -294,6 +294,112 @@ it.each(['missing', 'dimension', 'metadata', 'bias', 'projector-conflict', 'zero
     } else await expect(loadReranker(path)).rejects.toThrow();
   },
 );
+it.each([
+  'missing-projector',
+  'projector-shape',
+  'projector-bias',
+  'unknown-tensor',
+  'extra-layer',
+  'extra-projector',
+  'integer-projector',
+])('loading and conversion reject the same invalid Jina tensor contract: %s', async (problem) => {
+  const path = await fixture(`contract-${problem}`, {
+    edit(t) {
+      if (problem === 'missing-projector') delete t['projector.2.weight'];
+      if (problem === 'projector-shape') t['projector.2.weight'] = { shape: [32, 32], data: new Float32Array(32 * 32) };
+      if (problem === 'projector-bias') t['projector.0.bias'] = { shape: [64], data: new Float32Array(64) };
+      if (problem === 'unknown-tensor') t['layers.0.self_attn.misspelled.weight'] = t['projector.0.weight'];
+      if (problem === 'extra-layer') t['layers.2.self_attn.q_proj.weight'] = t['projector.0.weight'];
+      if (problem === 'extra-projector') t['projector.1.weight'] = t['projector.0.weight'];
+      if (problem === 'integer-projector')
+        t['projector.0.weight'] = { shape: [64, 64], dtype: 'I32', data: new Int32Array(64 * 64) };
+    },
+  });
+  const reason =
+    problem === 'integer-projector'
+      ? /non-float dtype/
+      : /missing tensor|invalid dense shape|unsupported bias tensor|unexpected tensor/;
+  await expect(loadReranker(path)).rejects.toThrow(reason);
+  await expect(
+    convertModel({ inputDir: path, outputDir: join(root, `converted-contract-${problem}`), dtype: 'bfloat16' }),
+  ).rejects.toThrow(reason);
+});
+it.each(['wrong-shard', 'unindexed-tensor', 'index-alias', 'duplicate-index-key', 'duplicate-header-key'])(
+  'loading and conversion reject an inconsistent Jina index/header: %s',
+  async (problem) => {
+    const path = await fixture(`index-${problem}`, { shard: true });
+    const indexPath = join(path, 'model.safetensors.index.json');
+    const index = JSON.parse(await readFile(indexPath, 'utf8')) as { weight_map: Record<string, string> };
+    const key = 'embed_tokens.weight';
+    if (problem === 'wrong-shard') index.weight_map[key] = 'model-1.safetensors';
+    if (problem === 'unindexed-tensor') delete index.weight_map[key];
+    if (problem === 'index-alias') index.weight_map[`model.${key}`] = index.weight_map[key];
+    if (problem === 'duplicate-index-key') {
+      const text = JSON.stringify(index);
+      await writeFile(
+        indexPath,
+        text.replace('"weight_map":{', `"weight_map":{${JSON.stringify(key)}:"model-0.safetensors",`),
+      );
+    } else await writeFile(indexPath, JSON.stringify(index));
+    if (problem === 'duplicate-header-key') {
+      const shard = join(path, 'model-0.safetensors');
+      const bytes = await readFile(shard);
+      const oldLength = Number(bytes.readBigUInt64LE());
+      const header = JSON.parse(bytes.subarray(8, 8 + oldLength).toString()) as Record<string, unknown>;
+      const text = JSON.stringify(header).replace('{', `{${JSON.stringify(key)}:${JSON.stringify(header[key])},`);
+      const encoded = Buffer.from(text.padEnd(Math.ceil(Buffer.byteLength(text) / 8) * 8, ' '));
+      const length = Buffer.alloc(8);
+      length.writeBigUInt64LE(BigInt(encoded.length));
+      await writeFile(shard, Buffer.concat([length, encoded, bytes.subarray(8 + oldLength)]));
+    }
+    await expect(loadReranker(path)).rejects.toThrow(/duplicate|shard index/);
+    await expect(
+      convertModel({ inputDir: path, outputDir: join(root, `converted-index-${problem}`), dtype: 'bfloat16' }),
+    ).rejects.toThrow(/duplicate|shard index/);
+  },
+);
+it.each(['unsupported-default', 'unsupported-projector', 'unknown-module', 'empty-projector', 'scalar-projector'])(
+  'rejects invalid quantization declarations on dense Jina weights: %s',
+  async (problem) => {
+    const path = await fixture(`quant-contract-${problem}`, {
+      edit(_t, c) {
+        const unsupported = { mode: 'mxfp8', bits: 8, group_size: 32 };
+        const affine = { mode: 'affine', bits: 4, group_size: 64 };
+        c.quantization =
+          problem === 'unsupported-default'
+            ? unsupported
+            : problem === 'unsupported-projector'
+              ? { 'projector.0': unsupported }
+              : problem === 'unknown-module'
+                ? { 'layers.99.self_attn.q_proj': affine }
+                : { 'projector.0': problem === 'empty-projector' ? {} : false };
+      },
+    });
+    await expect(loadReranker(path)).rejects.toThrow(/quantization/);
+  },
+);
+it('ignores an unused LM head and its valid foreign quantization override', async () => {
+  const path = await fixture('ignored-lm-head', {
+    edit(t, c) {
+      t['model.lm_head.weight'] = t['embed_tokens.weight'];
+      // The vocabulary head is outside ranking, even when it declares a format
+      // that would be unsupported for an actual ranking projection.
+      c.quantization = {
+        bits: 4,
+        group_size: 64,
+        mode: 'affine',
+        'model.lm_head': { mode: 'mxfp8', bits: 8, group_size: 32 },
+      };
+    },
+  });
+  const model = await loadReranker(path);
+  try {
+    expect(model.info.quantized).toBe(false);
+    expect(model.info.weightFormats).toEqual(['dense']);
+  } finally {
+    await model.dispose();
+  }
+});
 it('cancels queued and running native jobs, drains repeated dispose and releases active allocations', async () => {
   const path = await fixture('lifecycle');
   const before = Number(getMemorySnapshot().activeBytes);
