@@ -73,14 +73,14 @@ function fixture() {
   return { baseline, identity: structuredClone(baseline), input, manifest };
 }
 
-test('duplicate query text retains distinct candidate rankings by sample index', () => {
+void test('duplicate query text retains distinct candidate rankings by sample index', () => {
   const { baseline, identity, input, manifest } = fixture();
   validateQualityBaseline(baseline, identity, input, manifest);
   baseline.datasets[0].queries[1] = baseline.datasets[0].queries[0];
   assert.throws(() => validateQualityDatasets(baseline, input, manifest));
 });
 
-test('quantized self-reference and changed native execution cannot pass as FP32', () => {
+void test('quantized self-reference and changed native execution cannot pass as FP32', () => {
   for (const mutate of [
     (b) => {
       b.info.quantized = true;
@@ -131,7 +131,7 @@ test('quantized self-reference and changed native execution cannot pass as FP32'
   }
 });
 
-test('dense checkpoints and other formats cannot stand in for a quantization target', () => {
+void test('dense checkpoints and other formats cannot stand in for a quantization target', () => {
   const affine = { quantization: { mode: 'affine', bits: 4, group_size: 64 } };
   const info = { quantized: true, weightFormats: ['dense', 'affine-4bit'] };
   assert.equal(validateQualityFormat(info, affine, 'affine'), 'affine');
@@ -145,7 +145,7 @@ test('dense checkpoints and other formats cannot stand in for a quantization tar
   );
 });
 
-test('matching counts do not hide missing datasets, revisions, or changed metrics', () => {
+void test('matching counts do not hide missing datasets, revisions, or changed metrics', () => {
   for (const mutate of [
     (b) => {
       b.datasets[1] = b.datasets[0];
@@ -169,7 +169,7 @@ test('matching counts do not hide missing datasets, revisions, or changed metric
   }
 });
 
-test('ranking validation rejects omitted and repeated candidates', () => {
+void test('ranking validation rejects omitted and repeated candidates', () => {
   assert.throws(() => rankingMetrics([0], [1, 0]));
   assert.throws(() => rankingMetrics([0, 0], [1, 0]));
   assert.throws(() => rankingMetrics([0, 1], [0, 0]));

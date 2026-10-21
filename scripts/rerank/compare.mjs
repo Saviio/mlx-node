@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 
 import { JinaRerankerModel, getMemorySnapshot } from '../../packages/core/index.cjs';
 const [modelPath, referencePath, reportPath] = process.argv.slice(2);
 if (!reportPath) throw new Error('Usage: node scripts/rerank/compare.mjs MODEL REFERENCE REPORT');
+assert.notEqual(resolve(reportPath), resolve(referencePath), 'Report must not overwrite the reference');
+// This script does not resume: a failed rerun must not retain an old passing report.
+await rm(reportPath, { force: true });
 const cases = JSON.parse(await readFile(new URL('./cases.json', import.meta.url), 'utf8'));
 const references = JSON.parse(await readFile(referencePath, 'utf8'));
 assert.equal(references.length, cases.length, 'reference case count');
@@ -16,7 +20,13 @@ for (const [i, test] of cases.entries()) {
   try {
     const started = performance.now();
     const task = model.startRerank(JSON.stringify({ query: test.query, documents: test.documents }));
-    const result = JSON.parse(await task.result());
+    let result;
+    try {
+      result = JSON.parse(await task.result());
+    } finally {
+      // Keep the native task owner alive until its worker has finished.
+      task.cancel();
+    }
     const scores = result.results.toSorted((a, b) => a.index - b.index).map((r) => r.relevanceScore);
     const expected = references[i];
     assert.equal(expected.name, test.name, 'reference case identity');

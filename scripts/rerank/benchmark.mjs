@@ -1,10 +1,12 @@
 /** Real hardware benchmark; no downloads. One process per checkpoint. */
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
 
 import { JinaRerankerModel, getMemorySnapshot, resetPeakMemory } from '../../packages/core/index.cjs';
 const [modelPath, output, mode] = process.argv.slice(2);
 if (!output) throw new Error('Usage: node scripts/rerank/benchmark.mjs MODEL REPORT [long]');
+// A failed fresh run must not leave an earlier successful measurement at this path.
+await rm(output, { force: true });
 const memory = () =>
   Object.fromEntries(Object.entries(getMemorySnapshot()).map(([k, v]) => [k, typeof v === 'bigint' ? Number(v) : v]));
 const loadAt = performance.now();
@@ -35,7 +37,13 @@ try {
       resetPeakMemory();
       const started = performance.now();
       const task = model.startRerank(JSON.stringify(request(count, repeat)));
-      const response = JSON.parse(await task.result());
+      let response;
+      try {
+        response = JSON.parse(await task.result());
+      } finally {
+        // Keep the native task owner alive until its worker has finished.
+        task.cancel();
+      }
       assert.equal(response.results.length, count);
       const row = {
         count,
@@ -66,7 +74,11 @@ try {
   const active = [];
   for (let i = 0; i < 6; i++) {
     const t = model.startRerank(JSON.stringify(request(3, 1)));
-    await t.result();
+    try {
+      await t.result();
+    } finally {
+      t.cancel();
+    }
     active.push(memory().activeBytes);
   }
   assert.ok(Math.max(...active.slice(1)) - Math.min(...active.slice(1)) < 1024 * 1024, 'active resources keep growing');

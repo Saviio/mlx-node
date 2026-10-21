@@ -70,11 +70,11 @@ async function compare(change) {
     await rm(root, { recursive: true, force: true });
   }
 }
-test('accepts unchanged workloads and active-memory baseline', async () => {
+void test('accepts unchanged workloads and active-memory baseline', async () => {
   const result = await compare(() => {});
   assert.equal(result.status, 0, result.stderr);
 });
-test('blocks three consecutive latency regressions without widening the threshold', async () => {
+void test('blocks three consecutive latency regressions without widening the threshold', async () => {
   const result = await compare((r) => {
     for (const round of r.rounds) {
       round.jina.values.fill(106);
@@ -110,4 +110,4 @@ for (const [name, change] of [
     },
   ],
 ])
-  test(`rejects ${String(name)}`, async () => assert.notEqual((await compare(change)).status, 0));
+  void test(`rejects ${String(name)}`, async () => assert.notEqual((await compare(change)).status, 0));
