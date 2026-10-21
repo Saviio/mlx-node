@@ -41,6 +41,8 @@ export function wrapReranker(native: NativeReranker): RerankerModel {
         throw rerankError(error);
       } finally {
         request.signal?.removeEventListener('abort', abort);
+        // Keep the native owner live across await even when no signal is supplied.
+        task.cancel();
       }
     },
     dispose() {
