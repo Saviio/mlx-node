@@ -137,7 +137,7 @@ MLX_BGE_ADDON_PATH=/absolute/baseline/mlx-core.darwin-arm64.node \
   yarn exec oxnode scripts/rerank/bge/regression.ts CHAT_MODEL JINA_MODEL baseline.json
 MLX_BGE_ADDON_PATH=/absolute/current/mlx-core.darwin-arm64.node \
   yarn exec oxnode scripts/rerank/bge/regression.ts CHAT_MODEL JINA_MODEL current.json BGE_MODEL
-node scripts/rerank/bge/compare-regression.mjs baseline.json current.json comparison.json
+node scripts/rerank/bge/compare-regression.mjs baseline.json current.json regression-comparison-initial.json
 yarn exec oxnode scripts/rerank/bge/surfaces.ts BGE_MODEL surfaces.json
 ```
 
@@ -176,3 +176,11 @@ Eight cycles and simultaneous active/queued shutdown test completion ownership,
 including repeated disposal. Explicit unload must return to the process's initial
 active-memory level; allocator cache is reported separately. This complements
 the benchmark's timed cancellation, which may interrupt tokenization.
+
+Keep failed control runs when investigating a regression. The evidence generator
+reads `regression-comparison-initial.json` and `regression-comparison-repeat.json`
+under its root, together with the corresponding `regression-current.json` and
+`regression-current-repeat.json` coexistence reports. A later passing run does not
+resolve an earlier failure automatically. The comparator also requires post-close
+active memory to match the baseline; allocator cache is excluded from that check.
+Run its CPU negative tests with `node --test scripts/rerank/bge/compare-regression.test.mjs`.

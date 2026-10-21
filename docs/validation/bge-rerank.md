@@ -8,7 +8,7 @@ not accepted support claims.
 The [manifest](../../fixtures/rerank/bge/manifest.json) freezes the checkpoint,
 dataset revisions, reference packages and thresholds. The
 [reproduction guide](../../scripts/rerank/bge/README.md) describes each command.
-The compact evidence file records model/tokenizer, reference and addon hashes;
+The [compact evidence file](bge-results.json) records model/tokenizer, reference and addon hashes;
 full stage tensors, rankings and raw timing samples stay in `.cache/bge-validation`.
 
 ## Numerical correctness
@@ -50,7 +50,17 @@ references, including community affine/MXFP4 layouts. Jina remains cosine-scored
 
 ## Quantization quality
 
-In progress. T2Reranking and AskUbuntu each use 256 queries ordered by query
+An initial FP32 run completed both subsets with the results below. Its earliest
+233 samples did not record the full compilation environment. That report is
+retained as historical evidence; final acceptance reruns all three formats with
+schema-3 execution identity rather than inferring missing history.
+
+| Historical subset | Queries | FP32 nDCG@10 | FP32 MRR@10 |
+| ----------------- | ------: | -----------: | ----------: |
+| T2Reranking       |     256 |     0.712752 |    0.748692 |
+| AskUbuntu         |     256 |     0.707763 |    0.794361 |
+
+T2Reranking and AskUbuntu each use 256 queries ordered by query
 SHA-256 with all original candidates retained. The selected subsets contain
 4,131 and 5,120 candidates respectively. T2 selection records eight rejected
 samples; AskUbuntu records none. Inputs and labels are hashed, and baseline
@@ -67,28 +77,82 @@ Jina/BGE, and synthetic native loading/conversion/cancellation cases. The comple
 pure-TS suite passed: 2,115 tests in 108 files, run serially after parallel timing
 failures in existing supervisor/coordinator tests. TypeScript and clippy pass.
 
-The first full Rust core run passed 3,989 tests, ignored 161, and failed two: an
-expected conversion-registry list was updated for the new family; the existing
-Qwen3.5 segmented-attention calibration exceeded its 100 ms timing bound under
-concurrent build load. The latter also exceeded its bound on an immediate retest.
-It remains unresolved until a quiet-machine retest; unchanged source alone does
-not establish a baseline pass. Full final native/integration checks remain pending.
+The final Rust core run passed 3,995 tests with zero failures and 161 ignored.
+An expected conversion-registry list was updated for the new family. The existing
+Qwen3.5 segmented-attention calibration, which had exceeded its 100 ms timing
+bound under concurrent load, passed in the quiet final run without changing its
+threshold. Native release build, Metal packaging checks and final clippy pass.
+The remaining Rust integration binaries, other-crate unit tests and doc tests
+also pass. The full addon lane initially passed 1,773 tests with two failures in
+expected family/native-free path lists. Updating those lists for BGE and explicitly
+tracking the rerank addon root made both affected files pass all 27 tests. This
+was a test-contract correction; it did not change the production implementation.
+
+Real FP16 SDK, HTTP and CLI responses are identical, expose only sigmoid scores,
+and serve successfully with only a BGE model discovered. The chat endpoint rejects
+that model with `400/model_capability_mismatch` before loading it as chat.
+FP16/BF16/affine/MXFP4 each pass eight cancellation/recovery cycles after observing
+forward activation allocation, active-plus-queued shutdown, and repeated disposal.
+Every recovery returns active memory to its prior baseline; final disposal returns
+to zero active bytes. Allocation observation does not prove a GPU kernel had
+started; the test separately awaits the native task and disposal to completion.
 
 Independent pair audit found and corrected incomplete-download revision provenance,
 quality-baseline input identity and performance-script failure signaling. Partial
 download markers invalidate older config/Hugging Face revision hints; unknown
 provenance remains null. Explicit document policies exceeding effective context
-are rejected. Audit is evidence of review, not a guarantee of no defects.
+are rejected. A later audit also closed unsupported quantization declarations on
+dense modules and strengthened full-source baseline/input identity checks. The
+AskUbuntu subset contains 256 rows but 255 unique query texts; recovery therefore
+uses sample indices. Historical rows were backed up and checked before resuming an earlier run;
+that legacy run is excluded from the final schema-3 acceptance evidence. A final evidence audit tightened FP32 baseline, actual quantization format,
+required policy, dataset revision and complete-sample validation. Reports bind
+checkpoint, addon, Metal, execution-environment and baseline-report hashes;
+metrics are recomputed from complete candidate rankings. CPU negative tests
+reject a quantized self-reference, a wrong format, missing policy, duplicate
+datasets and changed execution identity. Audit is evidence of review, not a
+guarantee of no defects.
 
 ## Performance and acceptance
 
-Pending. Performance runs must execute without simultaneous builds or other
+**FP16 batching throughput gate failed on this M4.** All six 512-token precheck
+cases completed with the frozen three warmups and ten measurements. The required
+125/200-candidate results are:
+
+| Candidates | Batch 1 median | Batch 8 median | Throughput change | Required |
+| ---------: | -------------: | -------------: | ----------------: | -------: |
+|        125 |   22,819.04 ms |   22,799.62 ms |           +0.085% |     ≥20% |
+|        200 |   36,571.23 ms |   36,943.53 ms |           −1.008% |     ≥20% |
+
+The precheck deliberately leaves `complete: false` and stops before the longer
+performance matrix. Completed measurements, timestamps and artifact identity are
+retained. Neither the threshold nor batch-1 behavior was changed to obtain a pass.
+An exploratory Python MLX layer profile did not establish a sufficient benefit
+from QKV concatenation or whole-layer compilation; it is not an acceptance
+benchmark or a substitute for measuring a changed native implementation.
+
+Performance runs execute without simultaneous builds or other
 inference jobs. The frozen matrix uses three warmups and ten measurements, with
 median/P95, padding, active/cache/peak memory, cancellation and unload checks.
 Required FP16 125/200-candidate, approximately 512-token cases must improve
 throughput by at least 20% with default batching.
 
-Separate baseline/current chat and Jina runs enforce the three-round 5% regression
-rule. BGE unloaded, idle resident and concurrently executing are measured separately
-so resource contention is not described as zero overhead. Until quality, lifecycle,
-regression and performance gates finish, this branch is not ready for merge.
+Separate full-source baseline/current runs use the same checkpoints and actual
+chat output-token counts. The initial Jina comparison failed the three-round 5%
+rule (+31.65%, +47.76%, +35.76%). Repeating both runs without changing production
+code passed that rule: Jina changes were −1.04%, −0.08%, +4.46%. Chat passed both
+attempts. Both reports are retained. **The first Jina regression was not stably
+reproduced, and its cause remains undetermined**; machine-state variation is a
+hypothesis, not a demonstrated explanation. This is an unresolved acceptance item.
+
+BGE unloaded, idle resident and concurrent inference are measured separately.
+In the initial coexistence run, chat median latency was 117.76 ms with idle BGE
+and 426.30 ms during concurrent BGE inference; standalone BGE median was 1,193.12 ms
+for the frozen 50-passage workload. These are contention measurements, not a
+claim of zero overhead. Both original and repeat host shutdowns return to the
+same 1,192,099,896 active bytes observed after baseline chat/Jina shutdown; the
+existing chat allocation remains in both implementations, while BGE adds no
+retained active allocation. Standalone BGE disposal returns to zero as above.
+
+The batching target is unmet, the initial Jina performance failure is unresolved,
+and the remaining matrix is incomplete. This branch is **not ready for merge**.

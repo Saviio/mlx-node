@@ -7,6 +7,11 @@ checkpoint is `BAAI/bge-reranker-v2-m3` revision
 fields and validates the encoder, tokenizer and weights; directory names do not
 select the backend. Ordinary XLM-R embedding models are not rerankers.
 
+This branch has passed numerical and lifecycle checks but has **not passed all
+acceptance gates**. The M4 batching throughput target failed, and an initial Jina
+latency regression did not reproduce consistently. See the [acceptance report](validation/bge-rerank.md)
+for evidence and remaining limits before considering a merge or release.
+
 BGE returns **sigmoid scores between 0 and 1**. Sigmoid runs once in the native
 backend. SDK, HTTP and CLI share those scores; there is no raw-logit option.
 Scores need not sum to one across candidates and are not calibrated relevance
