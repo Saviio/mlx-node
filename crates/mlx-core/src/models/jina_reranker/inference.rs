@@ -2,6 +2,7 @@ use super::{
     config::{Config, Options, Policy, Profile, invalid},
     weights::Weights,
 };
+use crate::models::rerank_runtime::Request;
 use crate::{
     array::{
         self, DType, MxArray,
@@ -13,7 +14,7 @@ use crate::{
     transformer::{KVCache, RotatingKVCache},
 };
 use napi::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     path::Path,
@@ -69,15 +70,6 @@ pub(super) struct Model {
     query_token: u32,
     pub info: Value,
     _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct Request {
-    pub query: String,
-    pub documents: Vec<String>,
-    pub top_n: Option<usize>,
-    #[serde(default)]
-    pub truncate: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -206,7 +198,7 @@ impl Model {
         let norm = weights.norm("norm", h, config.rms_norm_eps)?;
         let rope = RoPE::new(d as i32, Some(false), Some(config.rope_theta), None);
         let quantized = weights.tensors.keys().any(|k| k.ends_with(".scales"));
-        let info = json!({"family":"jina_reranker","profile":profile,"contextWindow":context,"policy":policy,"quantized":quantized,"weightFormats":weights.formats()});
+        let info = json!({"family":"jina_reranker","profile":profile,"execution":"listwise","scoreType":"cosine","contextWindow":context,"policy":policy,"quantized":quantized,"weightFormats":weights.formats()});
         // Count checkpoint-owned bytes, never a process-wide before/after
         // allocation delta: chat/audio may be active in the same process.
         let weight_bytes = weights.tensors.values().map(|w| w.nbytes() as u64).sum();

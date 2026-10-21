@@ -33,3 +33,4 @@ pub mod qwen3_5_moe;
 pub mod qwen3_asr;
 pub mod qwen3_tts;
 pub mod qwen4_exp;
+pub(crate) mod rerank_runtime;
