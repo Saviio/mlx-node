@@ -109,8 +109,14 @@ report = {
         dtype: optional(f"performance-{dtype}.json")
         for dtype in ["fp16", "bf16", "affine", "mxfp4"]
     },
-    "regression": optional("regression-comparison.json"),
-    "coexistence": optional("regression-current.json"),
+    "regression": {
+        attempt: optional(f"regression-comparison-{attempt}.json")
+        for attempt in ["initial", "repeat"]
+    },
+    "coexistence": {
+        "initial": optional("regression-current.json"),
+        "repeat": optional("regression-current-repeat.json"),
+    },
     "logChecksums": {
         p.name: sha256(p) for p in sorted((args.root / "logs").glob("*.log"))
     },

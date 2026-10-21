@@ -59,6 +59,14 @@ for (const report of [baseline, current]) {
     }
   }
 }
+for (const run of [baseline, current]) {
+  assert.ok(Number.isSafeInteger(run.afterClose?.activeBytes) && run.afterClose.activeBytes >= 0);
+}
+assert.equal(
+  current.afterClose.activeBytes,
+  baseline.afterClose.activeBytes,
+  'BGE coexistence must return to the existing chat/Jina active-memory baseline after close',
+);
 const threshold = manifest.thresholds.baselineMaxMedianLatencyRegression;
 const families = ['chat', 'jina'].map((family) => {
   const medianLatencyChanges = current.rounds.map(
@@ -74,6 +82,7 @@ const report = {
   baselineAddonSha256: baseline.addonSha256,
   currentAddonSha256: current.addonSha256,
   threshold,
+  afterCloseActiveBytes: { baseline: baseline.afterClose.activeBytes, current: current.afterClose.activeBytes },
   families,
   passed: families.every((f) => f.passed),
 };
