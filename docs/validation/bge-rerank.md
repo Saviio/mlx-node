@@ -2,7 +2,7 @@
 
 This report accompanies the `feat/rerank` implementation based on `1fc3baee`.
 The machine is an Apple M4 (Mac16,12), 32 GiB unified memory. No merge or release
-is authorized by a successful build alone. Gates still in progress below are
+is authorized by a successful build alone. Failed or incomplete gates below are
 not accepted support claims.
 
 The [manifest](../../fixtures/rerank/bge/manifest.json) freezes the checkpoint,
@@ -50,15 +50,25 @@ references, including community affine/MXFP4 layouts. Jina remains cosine-scored
 
 ## Quantization quality
 
-An initial FP32 run completed both subsets with the results below. Its earliest
-233 samples did not record the full compilation environment. That report is
-retained as historical evidence; final acceptance reruns all three formats with
-schema-3 execution identity rather than inferring missing history.
+The final schema-3 runs completed all 256 queries in each subset for FP32,
+affine 4-bit and MXFP4. Offline verification checked checkpoint, addon, Metal,
+execution-environment, input and baseline-report identity, and recomputed metrics
+from every complete candidate ranking. Both 4-bit formats pass the frozen
+maximum `0.02` nDCG@10 drop on **each** dataset.
 
-| Historical subset | Queries | FP32 nDCG@10 | FP32 MRR@10 |
-| ----------------- | ------: | -----------: | ----------: |
-| T2Reranking       |     256 |     0.712752 |    0.748692 |
-| AskUbuntu         |     256 |     0.707763 |    0.794361 |
+| Subset      | Format       |  nDCG@10 |   MRR@10 | nDCG drop vs FP32 | MRR change vs FP32 | Changed rankings |
+| ----------- | ------------ | -------: | -------: | ----------------: | -----------------: | ---------------: |
+| T2Reranking | FP32         | 0.712752 | 0.748692 |                 — |                  — |                — |
+| T2Reranking | affine 4-bit | 0.711401 | 0.747394 |          0.001351 |          −0.001297 |          253/256 |
+| T2Reranking | MXFP4        | 0.718310 | 0.751376 |         −0.005558 |          +0.002685 |          254/256 |
+| AskUbuntu   | FP32         | 0.707763 | 0.794361 |                 — |                  — |                — |
+| AskUbuntu   | affine 4-bit | 0.692540 | 0.774141 |          0.015223 |          −0.020219 |          256/256 |
+| AskUbuntu   | MXFP4        | 0.697801 | 0.778551 |          0.009962 |          −0.015809 |          256/256 |
+
+A negative nDCG drop means a higher score on this fixed subset; it does not
+establish a general improvement. Changed rankings count any difference in the
+full candidate order. MRR changes are reported independently: passing the frozen
+nDCG gate does not mean quantization preserves every metric or candidate order.
 
 T2Reranking and AskUbuntu each use 256 queries ordered by query
 SHA-256 with all original candidates retained. The selected subsets contain
@@ -66,8 +76,10 @@ SHA-256 with all original candidates retained. The selected subsets contain
 samples; AskUbuntu records none. Inputs and labels are hashed, and baseline
 comparison rejects any input-identity mismatch before loading a model.
 
-Both 4-bit formats must pass the maximum `0.02` nDCG@10 drop independently on
-each dataset. No partial result is treated as a pass or as a full MTEB score.
+An earlier schema-2 FP32 run lacked complete compilation-environment identity
+for its first 233 samples. It remains historical evidence only; no missing
+history was inferred or reused in these final runs. These are fixed-subset
+quality results, not full MTEB scores or a substitute for the performance gates.
 
 ## Lifecycle, interfaces and regressions
 
@@ -127,9 +139,14 @@ cases completed with the frozen three warmups and ten measurements. The required
 The precheck deliberately leaves `complete: false` and stops before the longer
 performance matrix. Completed measurements, timestamps and artifact identity are
 retained. Neither the threshold nor batch-1 behavior was changed to obtain a pass.
+The 125/200-candidate default runs actually executed 16/25 batches, with zero
+padding; the result is not caused by silently falling back to one document per batch.
 An exploratory Python MLX layer profile did not establish a sufficient benefit
 from QKV concatenation or whole-layer compilation; it is not an acceptance
 benchmark or a substitute for measuring a changed native implementation.
+An independent code review found no demonstrated implementation defect explaining
+this result. Operator-shape and hardware-utilization limits remain hypotheses;
+the profile does not include hardware counters or native full-model attribution.
 
 Performance runs execute without simultaneous builds or other
 inference jobs. The frozen matrix uses three warmups and ten measurements, with

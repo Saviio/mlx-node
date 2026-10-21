@@ -1039,19 +1039,209 @@
   },
   "quality": {
     "fp32": {
-      "complete": false,
-      "accepted": false,
-      "reason": "ENOENT: no such file or directory, open '.cache/bge-validation/quality-fp32.json'"
+      "complete": true,
+      "accepted": true,
+      "reportSha256": "e6fd76e7ba708e5003fe9ffdc651c47083d85c85d06290ee7a55caeb73e74df3",
+      "inputSha256": "8775a4b8aecc785f1d26081b074f37afd95ca0f747f43b4fd329453262ebffc0",
+      "addonSha256": "57aef8b4120ceeb991cf710cc3f6d55344ae2a30e01f05fbd924173817608d68",
+      "metalSha256": "4f39d6b98d2ef179bebe498b57d89816fa0097c5ef37ab9c777c1826ead308f9",
+      "executionEnvironmentSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "baselineSha256": null,
+      "datasets": [
+        {
+          "repository": "C-MTEB/T2Reranking",
+          "revision": "76631901a18387f85eaa53e5450019b87ad58ef9",
+          "fileSha256": "ceaf1ba1a4777dbb7aecad86fb8aa9cae7a678af6d711d5529c238e89bb6adff",
+          "skipped": [
+            {
+              "sha256": "02f170f171c93628637ec0f5f39034b7b0a5b2fca1d32cff6bef5930beb2f974",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "038d054923d3e28a5b9e3d1b2d23bd16861150451eeea2fce41671de2b240fe2",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "04f7724f25ef9ab8b2c4cc521b3511f5efd892d084ff08e421317e7cefbfbcd9",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "0506b1db129c74c61b5091bfc42204e828ca3550016832e9a0fe50427cd4b86d",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "050b1760ca7a883f01483e945715fcd812d93ad9874f2c0fe99e2e1bb9fa055e",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "05f91e9a777b42a912c9473c4c795ffd6d3419733f6f4c57f4528584f7f6f543",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "08384fb43d102fe0ac620528ef6d82358966865f359a1f24a265e10551856784",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "0a14946a0bbddbffc3214b3559bdff66885f82245b25c9aef4494c13bfe14979",
+              "reason": "empty query, positives or candidates"
+            }
+          ],
+          "ndcg10": 0.7127517535576333,
+          "mrr10": 0.7486917162698414,
+          "queryCount": 256
+        },
+        {
+          "repository": "mteb/askubuntudupquestions-reranking",
+          "revision": "4d853f94cd57d85ec13805aeeac3ae3e5eb4c49c",
+          "fileSha256": "949cb300af6b6adfd4e5d0fa9160af36eacb3da2b41a076aed09cb66ba7da01c",
+          "skipped": [],
+          "ndcg10": 0.7077631969115336,
+          "mrr10": 0.7943607390873015,
+          "queryCount": 256
+        }
+      ]
     },
     "affine": {
-      "complete": false,
-      "accepted": false,
-      "reason": "ENOENT: no such file or directory, open '.cache/bge-validation/quality-affine.json'"
+      "complete": true,
+      "accepted": true,
+      "reportSha256": "eb99b6f29bda4b467d921ee7c951404c36df373a0ed9376daf26851843c30676",
+      "inputSha256": "8775a4b8aecc785f1d26081b074f37afd95ca0f747f43b4fd329453262ebffc0",
+      "addonSha256": "57aef8b4120ceeb991cf710cc3f6d55344ae2a30e01f05fbd924173817608d68",
+      "metalSha256": "4f39d6b98d2ef179bebe498b57d89816fa0097c5ef37ab9c777c1826ead308f9",
+      "executionEnvironmentSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "baselineSha256": "e6fd76e7ba708e5003fe9ffdc651c47083d85c85d06290ee7a55caeb73e74df3",
+      "datasets": [
+        {
+          "repository": "C-MTEB/T2Reranking",
+          "revision": "76631901a18387f85eaa53e5450019b87ad58ef9",
+          "fileSha256": "ceaf1ba1a4777dbb7aecad86fb8aa9cae7a678af6d711d5529c238e89bb6adff",
+          "skipped": [
+            {
+              "sha256": "02f170f171c93628637ec0f5f39034b7b0a5b2fca1d32cff6bef5930beb2f974",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "038d054923d3e28a5b9e3d1b2d23bd16861150451eeea2fce41671de2b240fe2",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "04f7724f25ef9ab8b2c4cc521b3511f5efd892d084ff08e421317e7cefbfbcd9",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "0506b1db129c74c61b5091bfc42204e828ca3550016832e9a0fe50427cd4b86d",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "050b1760ca7a883f01483e945715fcd812d93ad9874f2c0fe99e2e1bb9fa055e",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "05f91e9a777b42a912c9473c4c795ffd6d3419733f6f4c57f4528584f7f6f543",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "08384fb43d102fe0ac620528ef6d82358966865f359a1f24a265e10551856784",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "0a14946a0bbddbffc3214b3559bdff66885f82245b25c9aef4494c13bfe14979",
+              "reason": "empty query, positives or candidates"
+            }
+          ],
+          "ndcg10": 0.7114005229437714,
+          "mrr10": 0.7473942832341273,
+          "ndcg10Drop": 0.0013512306138618868,
+          "mrr10Change": -0.0012974330357141683,
+          "changedRankings": 253,
+          "passed": true,
+          "queryCount": 256
+        },
+        {
+          "repository": "mteb/askubuntudupquestions-reranking",
+          "revision": "4d853f94cd57d85ec13805aeeac3ae3e5eb4c49c",
+          "fileSha256": "949cb300af6b6adfd4e5d0fa9160af36eacb3da2b41a076aed09cb66ba7da01c",
+          "skipped": [],
+          "ndcg10": 0.6925404512943076,
+          "mrr10": 0.7741412450396824,
+          "ndcg10Drop": 0.015222745617225919,
+          "mrr10Change": -0.020219494047619135,
+          "changedRankings": 256,
+          "passed": true,
+          "queryCount": 256
+        }
+      ]
     },
     "mxfp4": {
-      "complete": false,
-      "accepted": false,
-      "reason": "ENOENT: no such file or directory, open '.cache/bge-validation/quality-mxfp4.json'"
+      "complete": true,
+      "accepted": true,
+      "reportSha256": "4d1829662a91409fce00af0319b8efdd434df7f22773fc1f620b6272ed2cbddc",
+      "inputSha256": "8775a4b8aecc785f1d26081b074f37afd95ca0f747f43b4fd329453262ebffc0",
+      "addonSha256": "57aef8b4120ceeb991cf710cc3f6d55344ae2a30e01f05fbd924173817608d68",
+      "metalSha256": "4f39d6b98d2ef179bebe498b57d89816fa0097c5ef37ab9c777c1826ead308f9",
+      "executionEnvironmentSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "baselineSha256": "e6fd76e7ba708e5003fe9ffdc651c47083d85c85d06290ee7a55caeb73e74df3",
+      "datasets": [
+        {
+          "repository": "C-MTEB/T2Reranking",
+          "revision": "76631901a18387f85eaa53e5450019b87ad58ef9",
+          "fileSha256": "ceaf1ba1a4777dbb7aecad86fb8aa9cae7a678af6d711d5529c238e89bb6adff",
+          "skipped": [
+            {
+              "sha256": "02f170f171c93628637ec0f5f39034b7b0a5b2fca1d32cff6bef5930beb2f974",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "038d054923d3e28a5b9e3d1b2d23bd16861150451eeea2fce41671de2b240fe2",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "04f7724f25ef9ab8b2c4cc521b3511f5efd892d084ff08e421317e7cefbfbcd9",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "0506b1db129c74c61b5091bfc42204e828ca3550016832e9a0fe50427cd4b86d",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "050b1760ca7a883f01483e945715fcd812d93ad9874f2c0fe99e2e1bb9fa055e",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "05f91e9a777b42a912c9473c4c795ffd6d3419733f6f4c57f4528584f7f6f543",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "08384fb43d102fe0ac620528ef6d82358966865f359a1f24a265e10551856784",
+              "reason": "empty query, positives or candidates"
+            },
+            {
+              "sha256": "0a14946a0bbddbffc3214b3559bdff66885f82245b25c9aef4494c13bfe14979",
+              "reason": "empty query, positives or candidates"
+            }
+          ],
+          "ndcg10": 0.7183097276371104,
+          "mrr10": 0.7513764880952379,
+          "ndcg10Drop": -0.005557974079477113,
+          "mrr10Change": 0.0026847718253965036,
+          "changedRankings": 254,
+          "passed": true,
+          "queryCount": 256
+        },
+        {
+          "repository": "mteb/askubuntudupquestions-reranking",
+          "revision": "4d853f94cd57d85ec13805aeeac3ae3e5eb4c49c",
+          "fileSha256": "949cb300af6b6adfd4e5d0fa9160af36eacb3da2b41a076aed09cb66ba7da01c",
+          "skipped": [],
+          "ndcg10": 0.6978008649297583,
+          "mrr10": 0.7785512772817459,
+          "ndcg10Drop": 0.009962331981775208,
+          "mrr10Change": -0.015809461805555647,
+          "changedRankings": 256,
+          "passed": true,
+          "queryCount": 256
+        }
+      ]
     }
   },
   "batchConsistency": {
@@ -2801,6 +2991,29 @@
       "check": "regression-current-repeat",
       "state": "completed",
       "exitCode": 0
+    },
+    {
+      "check": "quality-fp32",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "quality-affine",
+      "state": "started"
+    },
+    {
+      "check": "quality-affine",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "quality-mxfp4",
+      "state": "started"
+    },
+    {
+      "check": "quality-mxfp4",
+      "state": "completed",
+      "exitCode": 0
     }
   ],
   "performance": {
@@ -3376,6 +3589,7 @@
     "convert.log": "5db65dcb0feb70a843c6b84e391707f07226c486d18f96d0325de89aa70329a9",
     "dataset-download.log": "591f6104f168c2ef6d93fdd56ffcc69ad47412cd83e4413e380a028c31d8cfe3",
     "docs-final-format.log": "26a938e285eeffd81dfa90d0b43b8c0b7615c075792d9b27c3ffffea69b9457f",
+    "evidence-format.log": "5e13f52d1602b9b944430b18a47aa5c54a15051c39a0a6d4e85402c973c4924f",
     "evidence-report.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "final-format.log": "2e4769ab0a14641fa9fbfacc80946911a4eb1fc5074ff969e1e080c08e99a96c",
     "format.log": "63bb7b0326c40ff6ca03cd2590363756b02bd3ffcc45f1bb240e30753874536d",
@@ -3434,11 +3648,12 @@
     "pure-ts-serial.log": "bdbef258d0d11185db6d232b693e8d813bd345bcf1c50c6ee91e536ff2b83282",
     "python-format-install.log": "255b2ab32db72a38944d44636270b927759ec2098f4d4ad325a901e93c9c9f54",
     "python-format.log": "c78d4bc341e5cfb6cba20095bbb680bc8471adaac200271c9ee2cc1424564efe",
-    "quality-affine.log": "4e24e7fe798390d9266a87ad2187b3bd8b9628bef8ddc1a4f214058cd7138e6c",
+    "quality-affine.log": "98d4684fcfab8888b786523d8556bec7e0e19cc17412f44a34c9ba48f2e94841",
     "quality-contract-final.log": "259d60243ee0e8b34bd0e9f818f7520a38f35ddd3d2d7a61fbe0eceec56e9d19",
     "quality-contract.log": "6577300c1c46d4ad2f62fc57965d1e5779dfb6fbe0e632824fb2c08b0b05920b",
-    "quality-fp32.log": "4e24e7fe798390d9266a87ad2187b3bd8b9628bef8ddc1a4f214058cd7138e6c",
+    "quality-fp32.log": "0e5f003a17775e40b1c2387c7f180ad71c62272f3a1b69194a3ad53d8743a04a",
     "quality-inputs.log": "4b8a754c6139d60730c8546868c613370c3d4ce98946de98fe2ad29c17cc3d8d",
+    "quality-mxfp4.log": "caefab5d9f54533c71e53f7b7ab55d08940cafd073c6d631c4f3d6f84832bccb",
     "quality-resume-synthetic.log": "b5b25165b999e4f5c1ebe03b55a577a2f3105fa0ab441369d055955255481f98",
     "reference-install.log": "f9f20c1c37d86450f0667cdcc49f62f8aa6c5b0127523abf96343abfef249241",
     "references-revised.log": "8166ae4448145a0720153a582c5570eb4edec97e7199194686af14a2bef4c4fb",

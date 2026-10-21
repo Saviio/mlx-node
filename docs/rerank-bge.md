@@ -134,11 +134,24 @@ Fused SDPA receives a broadcast key mask. Each layer is evaluated before checkin
 cancellation; the shared runtime synchronizes completed GPU work before releasing
 the request, permit or model.
 
-Supported storage contracts are FP32, FP16, BF16, MLX affine 4-bit and MXFP4.
+Implemented storage contracts are FP32, FP16, BF16, MLX affine 4-bit and MXFP4.
 Packed word embeddings gather and dequantize only requested rows. Conversion
 quantizes word embeddings and encoder matrices; classifier, position/type
 embeddings, LayerNorm and additive biases remain dense. Quantized classifiers
 can also load. Affine `.biases` and additive linear `.bias` are distinct.
+
+| Format                  | Numerical verification                  | Fixed-subset 4-bit quality gate |
+| ----------------------- | --------------------------------------- | ------------------------------- |
+| FP32                    | Pass against official Transformers      | Reference baseline              |
+| FP16                    | Pass against same-checkpoint Python MLX | Not required by this gate       |
+| BF16                    | Pass against same-checkpoint Python MLX | Not required by this gate       |
+| affine 4-bit / group 64 | Pass against same-checkpoint Python MLX | Pass on both datasets           |
+| MXFP4 / group 32        | Pass against same-checkpoint Python MLX | Pass on both datasets           |
+
+These columns describe individual checks. Overall acceptance remains blocked by
+the failed batching target and unresolved initial Jina performance regression;
+the full performance matrix is incomplete. Exact quality changes, including MRR
+decreases, are recorded in the [acceptance report](validation/bge-rerank.md).
 
 Dense modules use one compute dtype. Packed embedding rows convert to that dtype;
 affine projections restore it at each projection boundary even when sidecars
