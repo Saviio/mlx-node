@@ -1,0 +1,15 @@
+mlx-node reranking implementation
+
+The runtime implementation is part of mlx-node under its project license.
+It does not bundle model weights or execute Python from model repositories.
+
+Jina Reranker v3 and v3.5 checkpoints and their model-specific prompt protocol
+are provided by Jina AI. Their model cards declare CC BY-NC 4.0:
+https://huggingface.co/jinaai/jina-reranker-v3-mlx
+https://huggingface.co/jinaai/jina-reranker-v3.5-mlx
+https://creativecommons.org/licenses/by-nc/4.0/
+
+Model-specific prompt text is reproduced to preserve inference compatibility.
+This notice does not relicense model weights or grant commercial model rights.
+Downloaded and converted model directories retain upstream attribution files.
+See the source model's license for terms applicable to a particular checkpoint.
