@@ -27,6 +27,9 @@ export function validateRerankerPolicy(
     if (!familyPolicyKeys[family].has(key)) throw new RerankError('invalid_request', `Unknown rerank policy: ${key}`);
     if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1)
       throw new RerankError('invalid_request', `${key} must be a positive integer`);
+    // Match the backend's shape/index range before startup can evict a resident model.
+    if (family === 'xlm_roberta_reranker' && limit > 2 ** 31 - 1)
+      throw new RerankError('invalid_request', `${key} exceeds the XLM-R 32-bit policy range`);
   }
   return { ...value };
 }

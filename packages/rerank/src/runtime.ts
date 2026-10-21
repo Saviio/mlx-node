@@ -18,7 +18,8 @@ export function wrapReranker(native: NativeReranker): RerankerModel {
     async rerank(request: RerankRequest): Promise<RerankResponse> {
       if (disposed) throw new RerankError('closed', 'Reranker is disposed', 503);
       const input = normalizeRequest(request);
-      request.signal?.throwIfAborted();
+      const { signal, returnDocuments } = request;
+      signal?.throwIfAborted();
       let task: ReturnType<NativeReranker['startRerank']>;
       try {
         task = native.startRerank(JSON.stringify(input));
@@ -26,21 +27,20 @@ export function wrapReranker(native: NativeReranker): RerankerModel {
         throw rerankError(error);
       }
       const abort = () => task.cancel();
-      request.signal?.addEventListener('abort', abort, { once: true });
-      if (request.signal?.aborted) abort();
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
       try {
         const result = JSON.parse(await task.result()) as RerankResponse;
-        request.signal?.throwIfAborted();
+        signal?.throwIfAborted();
         if (info.family === 'jina_reranker' && result.meta.profile !== 'xlmr-cross-encoder-v1')
           result.meta.maxDocumentsPerBlock = info.policy.maxDocumentsPerBlock;
-        if (request.returnDocuments)
-          for (const item of result.results) item.document = { text: input.documents[item.index] };
+        if (returnDocuments) for (const item of result.results) item.document = { text: input.documents[item.index] };
         return result;
       } catch (error) {
-        request.signal?.throwIfAborted();
+        signal?.throwIfAborted();
         throw rerankError(error);
       } finally {
-        request.signal?.removeEventListener('abort', abort);
+        signal?.removeEventListener('abort', abort);
         // Keep the native owner live across await even when no signal is supplied.
         task.cancel();
       }

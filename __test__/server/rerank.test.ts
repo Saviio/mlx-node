@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import type { RerankerModel } from '../../packages/rerank/src/types.js';
 import { withCapabilityModels, type CapabilityAdapter } from '../../packages/server/src/host/capability-models.js';
 import { RerankRegistry } from '../../packages/server/src/rerank-registry.js';
+import { resolveRerankLimits } from '../../packages/server/src/rerank-service.js';
 import { createServer } from '../../packages/server/src/server.js';
 function model(): RerankerModel & { dispose: ReturnType<typeof vi.fn<RerankerModel['dispose']>> } {
   return {
@@ -62,6 +63,10 @@ async function post(s: Awaited<ReturnType<typeof createServer>>, body: unknown, 
   });
 }
 describe('rerank service', () => {
+  it('rejects deadlines that Node would silently reduce to one millisecond', () => {
+    expect(resolveRerankLimits({ timeoutMs: 2 ** 31 - 1 }).timeoutMs).toBe(2 ** 31 - 1);
+    expect(() => resolveRerankLimits({ timeoutMs: 2 ** 31 })).toThrow('timer range');
+  });
   it('serves registered models, keeps indices and advertises capability', async () => {
     const s = await server();
     const m = model();

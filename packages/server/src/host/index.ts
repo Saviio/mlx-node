@@ -56,7 +56,7 @@ import type { RerankerFamilyOptions, RerankerModel } from '@mlx-node/rerank/type
 import type { AudioModel } from '../audio-registry.js';
 import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
-import type { RerankServiceOptions } from '../rerank-service.js';
+import { resolveRerankLimits, type RerankServiceOptions } from '../rerank-service.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
 import { discoverAudioModels, loadAudioModel, audioCapabilities, type DiscoveredAudioModel } from './audio-models.js';
 import { chatCapability, withCapabilityModels } from './capability-models.js';
@@ -253,6 +253,7 @@ export interface InferenceHost {
  */
 export async function createInferenceHost(opts: InferenceHostOptions = {}): Promise<InferenceHost> {
   validateRerankerFamilies(opts.reranker);
+  resolveRerankLimits(opts.rerank);
   const host = opts.host ?? '127.0.0.1';
   // BEFORE the engine policy, the temp sweep and discovery — all of which
   // mutate state outside this function — so a refused start leaves nothing

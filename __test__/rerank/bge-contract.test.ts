@@ -36,6 +36,24 @@ it('validates family-specific policy without changing the Jina compatibility ent
     policy: { maxDocuments: 10 },
   });
 });
+it.each([
+  'maxPairTokens',
+  'maxQueryTokens',
+  'maxDocumentTokens',
+  'maxBatchSize',
+  'maxBatchTokens',
+  'maxDocuments',
+  'maxInputTokens',
+])('rejects an out-of-range BGE %s during native-free startup validation', (key) => {
+  expect(() =>
+    validateRerankerFamilies({
+      families: {
+        xlm_roberta_reranker: { policy: { [key]: 2 ** 31 } },
+      },
+    }),
+  ).toThrow('32-bit');
+  expect(validateRerankerPolicy({ [key]: 2 ** 31 - 1 }, 'xlm_roberta_reranker')).toEqual({ [key]: 2 ** 31 - 1 });
+});
 it('passes BGE scores exactly once through SDK and HTTP without Jina block metadata', async () => {
   const info: RerankerInfo = {
     family: 'xlm_roberta_reranker',

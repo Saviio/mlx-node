@@ -8,7 +8,7 @@ import {
   validateRerankerPolicy,
 } from '../../packages/rerank/src/protocol.js';
 import { wrapReranker } from '../../packages/rerank/src/runtime.js';
-import type { RerankResponse } from '../../packages/rerank/src/types.js';
+import type { RerankRequest, RerankResponse } from '../../packages/rerank/src/types.js';
 const response: RerankResponse = {
   results: [
     { index: 1, relevanceScore: 0.8 },
@@ -90,4 +90,36 @@ describe('rerank SDK contract', () => {
     finish(JSON.stringify(response));
     await rejected;
   });
+  it.each([false, true])(
+    'keeps the original signal and cleans it up when request options are reused (abort=%s)',
+    async (abort) => {
+      const original = new AbortController();
+      const replacement = new AbortController();
+      const remove = vi.spyOn(original.signal, 'removeEventListener');
+      let finish!: (value: string) => void;
+      const done = new Promise<string>((resolve) => {
+        finish = resolve;
+      });
+      const model = wrapReranker({
+        infoJson: JSON.stringify({ policy: {} }),
+        startRerank: () => ({ cancel: vi.fn(), result: () => done }),
+        dispose: async () => {},
+      });
+      const request: RerankRequest = {
+        query: 'q',
+        documents: ['a', 'b'],
+        signal: original.signal,
+        returnDocuments: true,
+      };
+      const pending = model.rerank(request);
+      request.signal = replacement.signal;
+      request.returnDocuments = false;
+      if (abort) original.abort(new Error('original cancellation'));
+      else replacement.abort(new Error('unrelated cancellation'));
+      finish(JSON.stringify(response));
+      if (abort) await expect(pending).rejects.toThrow('original cancellation');
+      else expect((await pending).results[0].document).toEqual({ text: 'b' });
+      expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+    },
+  );
 });

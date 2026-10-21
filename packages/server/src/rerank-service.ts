@@ -29,6 +29,8 @@ export function resolveRerankLimits(options: RerankServiceOptions = {}): Require
   };
   for (const [key, value] of Object.entries(limits))
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Invalid rerank ${key}`);
+  // Node clamps larger delays to 1 ms, which would immediately expire every request.
+  if (limits.timeoutMs > 2 ** 31 - 1) throw new Error('Rerank timeoutMs exceeds the Node timer range');
   return limits;
 }
 interface Dependencies {
