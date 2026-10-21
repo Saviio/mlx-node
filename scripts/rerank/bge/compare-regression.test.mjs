@@ -49,7 +49,8 @@ async function compare(change) {
     change(current);
     await writeFile(join(root, 'baseline.json'), JSON.stringify(baseline));
     await writeFile(join(root, 'current.json'), JSON.stringify(current));
-    return spawnSync(
+    await writeFile(join(root, 'report.json'), JSON.stringify({ passed: true, stale: true }));
+    const result = spawnSync(
       process.execPath,
       [
         fileURLToPath(new URL('./compare-regression.mjs', import.meta.url)),
@@ -59,6 +60,12 @@ async function compare(change) {
       ],
       { encoding: 'utf8' },
     );
+    const persisted = await readFile(join(root, 'report.json'), 'utf8').then(JSON.parse, (error) => {
+      if (error.code !== 'ENOENT') throw error;
+      return undefined;
+    });
+    assert.ok(!persisted?.stale, 'A failed comparison left an earlier passing report');
+    return result;
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -103,4 +110,4 @@ for (const [name, change] of [
     },
   ],
 ])
-  test(`rejects ${name}`, async () => assert.notEqual((await compare(change)).status, 0));
+  test(`rejects ${String(name)}`, async () => assert.notEqual((await compare(change)).status, 0));

@@ -1,9 +1,16 @@
 /** Compare separately collected, quiet-machine control runs. */
 import assert from 'node:assert/strict';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 
 const [baselinePath, currentPath, output] = process.argv.slice(2);
 if (!output) throw Error('Usage: node compare-regression.mjs BASELINE CURRENT REPORT');
+assert.ok(
+  ![baselinePath, currentPath].some((path) => resolve(path) === resolve(output)),
+  'Output must not overwrite an input',
+);
+// A failed rerun must not leave an earlier passing result at the requested path.
+await rm(output, { force: true });
 const read = async (path) => JSON.parse(await readFile(path, 'utf8'));
 const [baseline, current, manifest] = await Promise.all([
   read(baselinePath),
