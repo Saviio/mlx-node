@@ -35,6 +35,10 @@ for (const [name, url] of Object.entries(modulePaths)) {
     `Workspace dependency ${name} escaped source root`,
   );
 }
+// Select MLX only after the TypeScript loader's own N-API addon initialized.
+// Exporting the generic N-API override to oxnode would load MLX as its compiler.
+const addon = resolve(process.env.MLX_BGE_ADDON_PATH ?? join(sourceRoot, 'packages/core/mlx-core.darwin-arm64.node'));
+process.env.NAPI_RS_NATIVE_LIBRARY_PATH = addon;
 const { getMemorySnapshot, resetPeakMemory } = (await import(
   pathToFileURL(join(sourceRoot, 'packages/core/index.cjs')).href
 )) as typeof import('@mlx-node/core');
@@ -69,7 +73,6 @@ if (!output) throw Error('Usage: oxnode regression.ts CHAT JINA REPORT [BGE]');
 const manifest = JSON.parse(
   await readFile(new URL('../../../fixtures/rerank/bge/manifest.json', import.meta.url), 'utf8'),
 );
-const addon = process.env.NAPI_RS_NATIVE_LIBRARY_PATH ?? join(sourceRoot, 'packages/core/mlx-core.darwin-arm64.node');
 const identity = {
   node: process.version,
   execArgv: process.execArgv,
@@ -80,7 +83,7 @@ const identity = {
           .filter(
             ([key]) =>
               /^(MLX_|MTL_|METAL_|DYLD_|OMP_|VECLIB_|OPENBLAS_|ACCELERATE_|NODE_OPTIONS$)/.test(key) &&
-              key !== 'MLX_BGE_SOURCE_ROOT',
+              !['MLX_BGE_SOURCE_ROOT', 'MLX_BGE_ADDON_PATH'].includes(key),
           )
           .sort(([a], [b]) => a.localeCompare(b)),
       ),

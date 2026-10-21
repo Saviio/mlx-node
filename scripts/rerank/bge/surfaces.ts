@@ -45,11 +45,12 @@ try {
   assert.equal(response.status, 200);
   const http = await response.json();
   assert.deepEqual(http, expected);
-  const wrong = await fetch(host.url + '/v1/chat/completions', {
+  const wrong = await fetch(host.url + '/v1/responses', {
     method: 'POST',
-    body: JSON.stringify({ model: 'bge', messages: [{ role: 'user', content: 'hello' }] }),
+    body: JSON.stringify({ model: 'bge', input: 'hello' }),
   });
   assert.equal(wrong.status, 400);
+  assert.equal((await wrong.json()).error.code, 'model_capability_mismatch');
 } finally {
   await host.close();
 }

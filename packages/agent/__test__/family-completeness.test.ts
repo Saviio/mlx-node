@@ -73,6 +73,7 @@ describe('family-data completeness', () => {
       'internvl_chat',
       'jina_reranker',
       'qianfan-ocr',
+      'xlm_roberta_reranker',
     ]);
   });
 });
