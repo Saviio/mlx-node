@@ -81,6 +81,7 @@ try {
     assert.ok(scenarios.some((s) => s.pairTokens === row.pairTokens && s.documents === row.documents));
     assert.equal(row.times.length, manifest.performance.iterations);
     assert.ok(row.times.every((v) => Number.isFinite(v) && v > 0));
+    assert.deepEqual({ medianMs: row.medianMs, p95Ms: row.p95Ms }, stats(row.times));
   }
   assert.ok(report.completedBatchSizes.every((v) => [1, 8].includes(v)));
   assert.equal(new Set(report.completedBatchSizes).size, report.completedBatchSizes.length);
@@ -103,6 +104,7 @@ try {
     activeCycles: [],
     loads: [],
     completedBatchSizes: [],
+    complete: false,
   };
 }
 const save = async () => {
@@ -110,8 +112,45 @@ const save = async () => {
   await writeFile(temporary, JSON.stringify(report, null, 2) + '\n');
   await rename(temporary, output);
 };
-for (const maxBatchSize of [1, 8]) {
+function batchingPrecheck() {
+  const gains = [125, 200].map((documents) => {
+    const rows = [1, 8].map((batch) =>
+      report.cases.find((r) => r.maxBatchSize === batch && r.pairTokens === 512 && r.documents === documents),
+    );
+    return rows.every(Boolean) ? { documents, throughputGain: rows[0].medianMs / rows[1].medianMs - 1 } : undefined;
+  });
+  if (!gains.every(Boolean)) return;
+  const applicable = report.computeDtype === 'float16' && !report.modelInfo.quantized;
+  report.batchingPrecheck = {
+    applicable,
+    gains,
+    passed: applicable ? gains.every((r) => r.throughputGain >= manifest.thresholds.batchingMinThroughputGain) : null,
+  };
+}
+batchingPrecheck();
+if (report.batchingPrecheck?.passed === false)
+  throw Error('Batching target failed; use a new artifact/report for optimization');
+// Establish the required batching gain before the longer matrix; every case
+// still receives its own three warmups and ten samples after each model load.
+for (const [maxBatchSize, phase] of [
+  [1, 'acceptance'],
+  [8, 'acceptance'],
+  [1, 'remaining'],
+  [8, 'remaining'],
+]) {
   if (report.completedBatchSizes.includes(maxBatchSize)) continue;
+  const phaseScenarios = scenarios.filter((s) =>
+    phase === 'acceptance' ? s.pairTokens === 512 : s.pairTokens !== 512,
+  );
+  if (
+    phase === 'acceptance' &&
+    phaseScenarios.every((s) =>
+      report.cases.some(
+        (r) => r.maxBatchSize === maxBatchSize && r.pairTokens === s.pairTokens && r.documents === s.documents,
+      ),
+    )
+  )
+    continue;
   // Completed measurements survive interruption. Cancellation cycles restart as one set.
   report.cancellation = report.cancellation.filter((r) => r.maxBatchSize !== maxBatchSize);
   report.activeCycles = report.activeCycles.filter((r) => r.maxBatchSize !== maxBatchSize);
@@ -122,7 +161,7 @@ for (const maxBatchSize of [1, 8]) {
   const load = { maxBatchSize, loadedMs, startedAt: new Date().toISOString(), before };
   report.loads.push(load);
   try {
-    for (const scenario of scenarios) {
+    for (const scenario of phaseScenarios) {
       if (
         report.cases.some(
           (r) =>
@@ -189,8 +228,12 @@ for (const maxBatchSize of [1, 8]) {
   }
   load.afterDispose = memory();
   assert.equal(load.afterDispose.activeBytes, before.activeBytes, 'model-owned resources must be released');
-  report.completedBatchSizes.push(maxBatchSize);
+  if (report.cases.filter((r) => r.maxBatchSize === maxBatchSize).length === scenarios.length)
+    report.completedBatchSizes.push(maxBatchSize);
+  batchingPrecheck();
   await save();
+  if (report.batchingPrecheck?.passed === false)
+    throw Error('Batching target failed before the remaining performance matrix');
 }
 report.afterDispose = memory();
 report.batching = report.cases
@@ -214,6 +257,7 @@ report.targetApplicable = report.computeDtype === 'float16' && !report.modelInfo
 report.targetPassed = report.targetApplicable
   ? acceptance.every((r) => r.throughputGain >= manifest.thresholds.batchingMinThroughputGain)
   : null;
+report.complete = true;
 await save();
 console.log(JSON.stringify({ batching: report.batching, targetPassed: report.targetPassed }));
 

@@ -83,7 +83,11 @@ node scripts/rerank/bge/benchmark.mjs .cache/bge-validation/fp16 .cache/bge-vali
 ```
 
 Run performance jobs alone, without builds or other inference jobs. Each case
-warms up three times and measures ten times; reports contain all samples,
+warms up three times and measures ten times. The required 512-token cases run
+first for both batch sizes; a failed dense FP16 throughput target stops before
+the longer matrix and leaves the report incomplete. Passing that precheck does
+not replace the full matrix or resource checks. Completed reports set `complete`
+only after all scenarios and checks finish; reports contain all samples,
 median/P95, padded workload, active/cache/peak memory and cancellation cycles.
 Each completed scenario is saved atomically. Repeating the same command resumes
 only when the model, tokenizer, addon, Metal library, script, manifest and host
@@ -92,7 +96,9 @@ requires compilation enabled (`MLX_DISABLE_COMPILE` must be absent, including an
 empty value). Interrupted cancellation cycles restart; completed timing samples
 retain their timestamps. The optional final argument `512` runs only the batching
 acceptance scenarios and needs a separate output path.
-Do not infer speed from memory reduction. Keep baseline-addon comparisons and
+Cold-model figures include loading and the first request; integrity hashing warms
+the filesystem cache, so they are not cold-storage measurements. Do not infer
+speed from memory reduction. Keep baseline-addon comparisons and
 unloaded/idle/concurrent measurements separate from numerical tests.
 
 Freeze a copy of the baseline native addon **before** building this branch, with
