@@ -32,8 +32,8 @@ fix low-precision evaluation order; thresholds remain frozen in the manifest.
   .cache/bge-validation/fp32 .cache/bge-validation/fp32-reference.json
 .cache/bge-reference/bin/python scripts/rerank/bge/reference.py mlx \
   .cache/bge-validation/fp16 .cache/bge-validation/fp16-reference.json
-MLX_BGE_GOLDEN_MODEL=.cache/bge-validation/fp16 \
-MLX_BGE_GOLDEN_REFERENCE=.cache/bge-validation/fp16-reference.json \
+MLX_BGE_GOLDEN_MODEL="$PWD/.cache/bge-validation/fp16" \
+MLX_BGE_GOLDEN_REFERENCE="$PWD/.cache/bge-validation/fp16-reference.json" \
   cargo test -p mlx-core --lib golden_checkpoint_logits -- --ignored --nocapture --test-threads=1
 ```
 
@@ -51,7 +51,8 @@ For mixed weights and a quantized classifier:
   .cache/bge-validation/affine .cache/bge-validation/mixed
 ```
 
-Run the same MLX/reference test for `mixed`. To verify the compiler-disabled
+Golden-test environment paths must be absolute because Cargo runs tests from the
+crate directory. Run the same MLX/reference test for `mixed`. To verify the compiler-disabled
 execution mode, set `MLX_DISABLE_COMPILE=1` in **both** independent processes
 and use a separate reference output. This does not alter production defaults.
 
@@ -158,3 +159,20 @@ quality rankings, timings and stage references remain in the validation folder.
 
 The report at `docs/validation/bge-rerank.md` distinguishes completed gates,
 baseline failures, resource contention and any remaining acceptance work.
+
+## Cancellation during forward evaluation
+
+```sh
+node scripts/rerank/bge/cancellation.mjs .cache/bge-validation/fp16 \
+  .cache/bge-validation/cancellation-fp16.json
+```
+
+Repeat for BF16, affine and MXFP4. The harness waits until active allocations
+exceed already-materialized resident weights and the bounded input-array size.
+This observes forward activation allocation; it does not claim that a Metal
+kernel has already started. It then cancels and awaits the native result, runs
+a recovery request, and requires active memory to return to the prior baseline.
+Eight cycles and simultaneous active/queued shutdown test completion ownership,
+including repeated disposal. Explicit unload must return to the process's initial
+active-memory level; allocator cache is reported separately. This complements
+the benchmark's timed cancellation, which may interrupt tokenization.

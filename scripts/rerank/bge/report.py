@@ -74,6 +74,7 @@ report = {
                 repo / "crates/mlx-core/src/convert.rs",
                 *(repo / "scripts/rerank/bge").glob("*.py"),
                 *(repo / "scripts/rerank/bge").glob("*.mjs"),
+                *(repo / "scripts/rerank/bge").glob("*.ts"),
             ]
         )
     },
@@ -94,6 +95,16 @@ report = {
     "quality": quality,
     "batchConsistency": optional("batch-consistency.json"),
     "surfaces": optional("surfaces.json"),
+    "forwardCancellation": {
+        dtype: optional(f"cancellation-{dtype}.json")
+        for dtype in ["fp16", "bf16", "affine", "mxfp4"]
+    },
+    "performancePrecheck": optional("performance-fp16-precheck.json"),
+    "verificationRuns": [
+        json.loads(line)
+        for line in (args.root / "final-checks.jsonl").read_text().splitlines()
+        if line.strip()
+    ] if (args.root / "final-checks.jsonl").exists() else [],
     "performance": {
         dtype: optional(f"performance-{dtype}.json")
         for dtype in ["fp16", "bf16", "affine", "mxfp4"]
